@@ -2,7 +2,7 @@
  * cam_grab.c — 从 PH1P100 PCIe EP 的 BAR0 抓一帧 640x480 灰度图，写成 PGM
  *
  * 本文件是对原手写草稿的重写：抓帧时序、寄存器语义、状态字判据全部按工程内 RTL
- * 实现（逐条标 file:line），访问方式遵守 doc/panic_risk_audit.md §3 的规约。
+ * 实现（逐条标 file:line），访问方式遵守本文件「五、访问规约」一节所列各条。
  *
  * --------------------------------------------------------------------------
  * 一、寄存器语义（依据 fpga/rtl/ep_side/img/ep_bar_win.v 的读 mux :215-241）
@@ -86,7 +86,7 @@
  *       0x98={r_pwr_cnt2,8'd0,w_a_i2c_busy}（bit0=I2C 忙）
  *
  * --------------------------------------------------------------------------
- * 五、访问规约（doc/panic_risk_audit.md §3，逐条落实）
+ * 五、访问规约（逐条落实）
  * --------------------------------------------------------------------------
  *   A-1 :201 只碰寄存器表登记过的 offset → off_rd_ok()/off_wr_ok() 白名单，
  *             DATA 口 0x60 只能经 data_rd() 访问（读了就动 PTR，不能随手读）
@@ -145,7 +145,7 @@
 #define DEF_OUT    "frame.pgm"
 #define DEF_TIMEOUT_MS 3000u
 
-#define BAR_WIN_BYTES  4096u        /* 规约 D-14：mmap 只取 4KB（帧数据走 0x60 口搬运） */
+#define BAR_WIN_BYTES  4096u        /* mmap 只取 4KB（帧数据走 0x60 口搬运） */
 #define MAGIC_EXPECT   0x50434946u  /* ep_bar_win.v:216 + 参数 :43 */
 #define VAL_ALLF       0xffffffffu
 #define VAL_DEADBEEF   0xdeadbeefu  /* ep_bar_win.v:240 default 分支 */
@@ -188,7 +188,7 @@
 #define STATUS_READY   (1u << 0)
 #define STATUS_BUSY    (1u << 1)
 
-#define POLL_MS        10u     /* 规约 E-16：轮询间隔 ≥ 1ms */
+#define POLL_MS        10u     /* 轮询间隔 ≥ 1ms */
 #define RETRIGGER_MS   100u    /* 测试图源重发 trigger 的最小间隔（IDLE_CYCLE≈16ms@62MHz）*/
 
 enum exit_code {
@@ -247,22 +247,21 @@ static int off_wr_ok(uint32_t off) { return off_in_list(k_wr_ok, sizeof k_wr_ok 
 
 /* ---------------------------------------------------------------- MMIO */
 
-/* 读一个登记过的寄存器：32 位对齐、单 dw（规约 C-7）。
- * 0xffffffff → 熔断（规约 B-5）；0xDEADBEEF → 说明打到了未译码地址（:240）。 */
+/* 读一个登记过的寄存器：32 位对齐、单 dw。
+ * 0xffffffff → 熔断；0xDEADBEEF → 说明打到了未译码地址（:240）。 */
 static int reg_rd(uint32_t off, uint32_t *out)
 {
     uint32_t v;
 
     if (!off_rd_ok(off)) {
-        fprintf(stderr, "!! 程序内部错误：试图读未登记的 offset 0x%02x（规约 A-1，"
-                        "doc/panic_risk_audit.md:201）\n", (unsigned)off);
+        fprintf(stderr, "!! 程序内部错误：试图读未登记的 offset 0x%02x\n", (unsigned)off);
         return EX_DEV;
     }
     v = g_bar[off >> 2];
     if (v == VAL_ALLF) {
         g_allf++;
         fprintf(stderr, "!! 读 0x%02x 得到 0xffffffff：设备已不可用，立即停止，"
-                        "不再发任何 MMIO（规约 B-5，doc/panic_risk_audit.md:208）\n",
+                        "不再发任何 MMIO\n",
                 (unsigned)off);
         return EX_DEV;
     }
@@ -278,8 +277,7 @@ static int reg_rd(uint32_t off, uint32_t *out)
 static int reg_wr(uint32_t off, uint32_t v)
 {
     if (!off_wr_ok(off)) {
-        fprintf(stderr, "!! 程序内部错误：试图写未登记的 offset 0x%02x（规约 A-2，"
-                        "doc/panic_risk_audit.md:202）\n", (unsigned)off);
+        fprintf(stderr, "!! 程序内部错误：试图写未登记的 offset 0x%02x\n", (unsigned)off);
         return EX_DEV;
     }
     g_bar[off >> 2] = v;
@@ -288,23 +286,22 @@ static int reg_wr(uint32_t off, uint32_t v)
 }
 
 /* 读 0x60 数据口：返回当前 PTR 处一个 dw，PTR 自动 +4（ep_bar_win.v:111/:152/:175-181）。
- * 只用单 dw：① 规约 C-7 单次 ≤ 4dw；② 预取 4 拍轮转是给「访问间隔远大于 4 拍」设计的
- * （ep_bar_win.v:186-203），一次 MRd 往返远大于此；③ 同地址不同值（规约 C-9）。 */
+ * 只用单 dw：① 单次访问不得超过 4 个 dw；② 预取 4 拍轮转是给「访问间隔远大于 4 拍」设计的
+ * （ep_bar_win.v:186-203），一次 MRd 往返远大于此；③ 同地址连续读不保证同值。 */
 static int data_rd(size_t idx, uint32_t *out)
 {
     uint32_t v = g_bar[R_DATA >> 2];
 
     if (v == VAL_ALLF) {
         g_allf++;
-        fprintf(stderr, "!! 读 0x60 数据口第 %zu 个字得到 0xffffffff：设备已不可用，"
-                        "立即停止（规约 B-5，doc/panic_risk_audit.md:208）\n", idx);
+        fprintf(stderr, "!! 读 0x60 数据口第 %zu 个字得到 0xffffffff：设备已不可用，立即停止\n", idx);
         return EX_DEV;
     }
     *out = v;
     return EX_OK;
 }
 
-/* 规约 B-4（doc/panic_risk_audit.md:207）：任何一轮访问之前先自检 MAGIC。
+/* 任何一轮访问之前先自检 MAGIC。
  * 读 0x40 不会动 PTR（只有 0x60 会），所以抓帧前后各查一次是安全的。 */
 static int magic_gate(const char *when)
 {
@@ -315,7 +312,7 @@ static int magic_gate(const char *when)
         return rc;
     if (m != MAGIC_EXPECT) {
         fprintf(stderr, "!! MAGIC=0x%08x ≠ 0x%08x（%s）：设备未就绪或链路已断，"
-                        "不继续碰任何寄存器、不写图（规约 B-4）\n",
+                        "不继续碰任何寄存器、不写图\n",
                 (unsigned)m, (unsigned)MAGIC_EXPECT, when);
         return EX_DEV;
     }
@@ -618,7 +615,7 @@ static void usage(const char *prog)
         "用法: %s [选项] [输出.pgm]\n"
         "\n"
         "从 PH1P100 PCIe EP 的 BAR0 寄存器表抓一帧 640x480 灰度图并存成 PGM。\n"
-        "访问严格按 doc/panic_risk_audit.md §3：先读 0x40 MAGIC 自检、只碰登记过的\n"
+        "访问规矩：先读 0x40 MAGIC 自检、只碰登记过的\n"
         "offset、单次单 dw、任一读拿到 0xffffffff 立即熔断退出。\n"
         "\n"
         "选项:\n"
@@ -754,7 +751,7 @@ int main(int argc, char **argv)
         return EX_OK;
     }
 
-    /* ---- 1. 打开并映射 BAR0 前 4KB（规约 D-14：offset=0、length ≤ 4KB） ---- */
+    /* ---- 1. 打开并映射 BAR0 前 4KB（offset=0、length ≤ 4KB） ---- */
     int fd, rc;
 
     /* 先认设备（纯 sysfs 只读），确认是 PH1P100 EP 才去 open/mmap 它的 BAR0 */
@@ -767,7 +764,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "   （需要 root，且驱动已 insmod、设备已枚举；确认 EP 的 BDF）\n");
         return EX_DEV;
     }
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {   /* 规约 E-17：一次只允许一个进程 */
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {   /* 一次只允许一个进程 */
         fprintf(stderr, "!! %s 已被其它进程占用（flock 失败：%s），先停掉它\n",
                 dev_path, strerror(errno));
         close(fd);
@@ -780,7 +777,7 @@ int main(int argc, char **argv)
         return EX_DEV;
     }
 
-    /* ---- 2. MAGIC 门禁（规约 B-4）---- */
+    /* ---- 2. MAGIC 门禁---- */
     rc = magic_gate("抓帧前");
     if (rc != EX_OK)
         return rc;
@@ -923,7 +920,7 @@ int main(int argc, char **argv)
     if ((rc = read_frame(&f_pre)) != EX_OK)
         return rc;
 
-    /* 规约 B-4：搬运整帧之前再自检一次 MAGIC（读 0x40 不影响 PTR） */
+    /* 搬运整帧之前再自检一次 MAGIC（读 0x40 不影响 PTR） */
     if ((rc = magic_gate("抓帧前（已就绪）")) != EX_OK)
         return rc;
 
@@ -943,7 +940,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "!! malloc %u 字节失败\n", (unsigned)FB_BYTES);
         return EX_OUTPUT;
     }
-    printf("=== 搬运整帧：%u 字 × 4B（逐 dw 读 0x60，PTR 自动 +4；规约 C-7/C-9）===\n",
+    printf("=== 搬运整帧：%u 字 × 4B（逐 dw 读 0x60，PTR 自动 +4）===\n",
            (unsigned)FB_WORDS);
     uint64_t t_dump0 = now_ms();
     for (size_t i = 0; i < FB_WORDS; i++) {

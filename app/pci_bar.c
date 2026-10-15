@@ -8,7 +8,7 @@
  *   ./pci_bar <bar_id 0..5> <offset> <wdata>    # 写
  *
  * BAR1/BAR3/BAR5 没有各自的映射（BAR1 是 I/O BAR，BAR3/BAR5 是 64 位 BAR 的高半），
- * 驱动里对应 hw->bar[] 为 NULL，这里直接拒掉（doc/panic_risk_audit.md 规约 15）。
+ * 驱动里对应 hw->bar[] 为 NULL，这里直接拒掉（ 规约 15）。
  */
 
 #include <stdint.h>
