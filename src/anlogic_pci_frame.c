@@ -17,11 +17,11 @@
  * 内存布局与握手约定写在 include/anlogic_pci_ioctl.h（驱动/用户态/FPGA 三方共用）。
  *
  * 与访问规约的关系：本层**完全不碰 BAR 寄存器**（不做任何 MMIO），只读写自己
- * 分配的普通内存，所以  §3 的 A/B/C 三条（白名单 offset、
- * MAGIC 门禁、单品 ≤4 dw）在这里没有可违反的地方。对 mailbox 的读用 READ_ONCE +
+ * 分配的普通内存，所以 BAR 访问的三条校验（偏移白名单、先验 MAGIC、
+ * 单笔不超过 4 个双字）在这里没有可违反的地方。对 mailbox 的读用 READ_ONCE +
  * dma_rmb()：先看到 FPGA 写的序号，再去看它写的帧数据。
- * 帧缓冲节点的 mmap 映射的是系统内存（不是 MMIO），但仍照规约 12 的口径做
- * 溢出安全的边界夹紧，并且只允许只读映射（不把 FPGA 的 MWr 目标交给用户态乱写）。
+ * 帧缓冲节点的 mmap 映射的是系统内存（不是 MMIO），但仍按既有的 mmap
+ * 溢出安全判据做边界夹紧，并且只允许只读映射（不把 FPGA 的 MWr 目标交给用户态乱写）。
  */
 #include <linux/build_bug.h>
 #include <linux/delay.h>

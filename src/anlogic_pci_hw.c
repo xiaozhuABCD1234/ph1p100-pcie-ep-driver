@@ -6,7 +6,7 @@
  * 分配收帧缓冲（anlogic_pci_frame.c）、登记中断、枚举 DMA 通道。
  *
  * 本层不接触任何用户态可控的地址；用户态可控的 MMIO 全在 anlogic_pci_ctrl.c
- * 的 ioctl / mmap 入口按  的规约逐项校验。
+ * 的 ioctl / mmap 入口统一逐项校验。
  */
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -257,7 +257,7 @@ static int anlogic_pci_irq_setup(struct anlogic_pci_hw *hw, struct pci_dev *pdev
 /*
  * MSI-X 通道中断处理：本 EP 没有 MSI-X 能力，这条路径实际不会走；
  * dev_id 是登记中断时传进来的 engine，由它取回 hw。
- * 保持“中断上下文里不做 MMIO”的约定（E16）。
+ * 保持“中断上下文里不做 MMIO”的约定。
  */
 static irqreturn_t anlogic_pci_channel_irq(int irq, void *dev_id)
 {

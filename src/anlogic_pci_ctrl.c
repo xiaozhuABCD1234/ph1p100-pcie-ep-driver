@@ -7,10 +7,10 @@
  * （收帧缓冲节点的 ioctl/mmap 在 anlogic_pci_frame.c；控制节点的 switch 里只是
  * 把两条收帧命令转发过去，方便只开一个节点也能问到缓冲物理地址与序号。）
  *
- * 本文件是所有“用户态可控 MMIO”的唯一入口，逐条实现 
- * 的访问规约（先验 MAGIC、单次 ≤4 dw、32 位对齐、全 F 熔断交给用户态、
- * ioctl 边界校验、mmap 溢出安全的边界判断、配置空间读写用
- * copy_from_user/copy_to_user）。这些校验一条都不允许删除或放宽。
+ * 本文件是所有“用户态可控 MMIO”的唯一入口，逐条实现下面这些访问规约（先验
+ * MAGIC、单次不超过 4 个双字、32 位对齐、全 F 熔断交给用户态、ioctl 边界校验、
+ * mmap 溢出安全的边界判断、配置空间读写用 copy_from_user/copy_to_user）。
+ * 这些校验一条都不允许删除或放宽。
  */
 #include <linux/ioctl.h>
 #include <linux/mm.h>

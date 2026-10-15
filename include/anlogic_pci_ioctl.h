@@ -5,8 +5,8 @@
  * 这里的结构体布局、字段类型与 ANLOGIC_IOC* 编号是板上用户态程序的 ABI：
  * 只允许增补，不允许改动已有编号、字段类型与顺序。
  *
- * 访问规约（先验 MAGIC、单次 ≤4 dw、32 位对齐、全 F 熔断、ioctl 边界校验）见
- * ，驱动侧逐条实现在 anlogic_pci_ctrl.c。
+ * 这些访问规约（先验 MAGIC、单次不超过 4 个双字、32 位对齐、全 F 熔断交给用户态、
+ * ioctl 边界校验）由 anlogic_pci_ctrl.c 逐条实现。
  */
 #ifndef ANLOGIC_PCI_IOCTL_H
 #define ANLOGIC_PCI_IOCTL_H
