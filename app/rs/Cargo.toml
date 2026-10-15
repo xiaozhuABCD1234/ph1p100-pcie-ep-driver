@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# PH1P100 PCIe EP（RK3588 主机侧）用户态工具，Rust 版（取代原先 app/*.c）。
+# 四个工具是四个 bin 目标：cam_grab / frame_grab / pci_bar / pcie_check。
+# 不依赖任何外部 crate（ioctl/mmap/flock 等少数 libc 入口在 src/sys.rs 里自己声明）。
+[package]
+name = "anlogic_pci_tools"
+version = "0.1.0"
+edition = "2021"
+description = "PH1P100 PCIe EP 主机侧用户态工具（cam_grab / frame_grab / pci_bar / pcie_check）"
+
+[[bin]]
+name = "cam_grab"
+path = "src/bin/cam_grab.rs"
+
+[[bin]]
+name = "frame_grab"
+path = "src/bin/frame_grab.rs"
+
+[[bin]]
+name = "pci_bar"
+path = "src/bin/pci_bar.rs"
+
+[[bin]]
+name = "pcie_check"
+path = "src/bin/pcie_check.rs"
+
+[profile.release]
+opt-level = 2

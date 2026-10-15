@@ -1,0 +1,5 @@
+# 交叉编译到板子（RK3588 / aarch64）用系统自带交叉工具链链接；
+# 原 C 版是 -static 链接，这里用 crt-static 保持同样的静态可执行文件。
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

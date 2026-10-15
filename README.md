@@ -18,7 +18,7 @@
 | `src/anlogic_pci_ctrl.c` | 控制与用户节点的 file_operations（ioctl、mmap） |
 | `src/anlogic_pci.h` | 驱动内部头（三层共用） |
 | `include/anlogic_pci_ioctl.h` | ioctl 协议，驱动与用户态共用的唯一一份 |
-| `app/` | 用户态：`cam_grab.c` 抓帧（PIO）、`frame_grab.c` 从收帧缓冲取帧、`pci_bar.c` 单 dw 读写、`pcie_check.c` 链路自检 |
+| `app/rs/` | 用户态（Rust，cargo 工程 `anlogic_pci_tools`，四个 bin）：`cam_grab` 抓帧（PIO）、`frame_grab` 从收帧缓冲取帧、`pci_bar` 单 dw 读写、`pcie_check` 链路自检 |
 | `` | 内核挂死风险审计与访问规约（只读参考） |
 
 厂商原始驱动不在本仓库（在 `~/Projects/.archive-ph1p-*/vendor_driver_original/`），
@@ -33,13 +33,13 @@ make -C ~/Projects/orangepi-5-max-bsp/third_party/linux \
      M=$PWD ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules
 ```
 
-用户态（板子上直接跑，静态链接）：
+用户态（Rust，四个 bin 目标；`.cargo/config.toml` 里指定 `linker = "aarch64-linux-gnu-gcc"`，
+静态链接，产物在 `app/rs/target/<target>/release/`）：
 
 ```sh
-aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o cam_grab  app/cam_grab.c
-aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o frame_grab app/frame_grab.c
-aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o pci_bar  app/pci_bar.c
-aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o pcie_check app/pcie_check.c
+cd app/rs
+cargo build --release --target aarch64-unknown-linux-gnu   # 交叉编译到板子（aarch64）
+cargo build --release                                      # 本机原生（冒烟测试用）
 ```
 
 ## 加载
@@ -70,6 +70,7 @@ mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `
 ## 最小用法
 
 ```sh
+# 先 cd 到构建产物目录：板子用 app/rs/target/aarch64-unknown-linux-gnu/release，本机用 app/rs/target/release
 ./pcie_check                     # 链路/枚举/BAR/节点自检，只读 sysfs，不需要 root
 ./pci_bar 0 0x40                 # 读 BAR0 + 0x40：MAGIC 应为 0x50434946（小端读回需 bswap）
 ./pci_bar 0 0x6C 0x12345678      # 往 BAR0 + 0x6C（SCRATCH）写

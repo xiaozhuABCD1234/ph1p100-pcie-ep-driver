@@ -12,10 +12,7 @@ modules.order
 *.symvers
 .tmp_versions/
 
-# 用户态示例产物
-/app/cam_grab
-/app/frame_grab
-/app/pci_bar
-/app/pcie_check
+# 用户态（Rust 工程 app/rs）构建目录
+/app/rs/target/
 
 *.zip
