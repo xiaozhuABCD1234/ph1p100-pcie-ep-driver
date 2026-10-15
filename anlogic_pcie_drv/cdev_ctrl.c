@@ -154,6 +154,45 @@ u32 XPCIe_WriteCfgReg(struct pci_dev * gDev,u32 byte, u32 val) {
    return 1;
 }
 
+/*
+ * Common entry check for every BAR ioctl (panic_risk_audit.md rule 10).
+ *   - bar_id must be < XDMA_BAR_NUM and the BAR must actually be mapped
+ *   - off (byte offset inside the BAR) must be 4-byte aligned
+ *   - off + len (bytes) must stay inside pci_resource_len(), using a 64-bit
+ *     addition so that a 32-bit wrap-around cannot pass the upper bound
+ * Returns -EINVAL on any violation, 0 when the access may proceed.
+ */
+static int ctrl_bar_range_check(struct anlogic_dev *xdev, unsigned int bar_id,
+        unsigned int off, u64 len)
+{
+    resource_size_t rsrc_len;
+
+    if (bar_id >= XDMA_BAR_NUM) {
+        pr_err("ioctl: bar_id %u >= XDMA_BAR_NUM %d.\n", bar_id, XDMA_BAR_NUM);
+        return -EINVAL;
+    }
+    if (!xdev->bar[bar_id]) {
+        pr_err("ioctl: bar_id %u is not mapped.\n", bar_id);
+        return -EINVAL;
+    }
+    if (off & 3) {
+        pr_err("ioctl: bar_offaddr 0x%x is not 4-byte aligned.\n", off);
+        return -EINVAL;
+    }
+    rsrc_len = pci_resource_len(xdev->pdev, bar_id);
+    if (!rsrc_len) {
+        pr_err("ioctl: bar_id %u resource length is 0.\n", bar_id);
+        return -EINVAL;
+    }
+    if ((u64)off + len > (u64)rsrc_len) {
+        pr_err("ioctl: bar%u [0x%x, +0x%llx) exceeds resource length 0x%llx.\n",
+            bar_id, off, (unsigned long long)len,
+            (unsigned long long)rsrc_len);
+        return -EINVAL;
+    }
+    return 0;
+}
+
 long char_ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
     struct anlogic_cdev *xcdev = (struct anlogic_cdev *)filp->private_data;
@@ -222,7 +261,12 @@ long char_ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             pr_err("copy_from_user failed.\n");
             return -EFAULT;
         }
-        //to check bar id is valid and size is suitable
+        //to check bar id is valid and size is suitable (rule 10)
+        rv = ctrl_bar_range_check(xdev, ioctl_bar.bar_id,
+                ioctl_bar.bar_offaddr, sizeof(u32));
+        if (rv < 0)
+            return rv;
+
         addr = xdev->bar[ioctl_bar.bar_id] + ioctl_bar.bar_offaddr;  //BAR 0 base addr (virtual addr),
          
         iowrite32(ioctl_bar.wdata, addr);
@@ -235,7 +279,12 @@ long char_ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             return -EFAULT;
         }
         
-        //to check bar id is valid and size is suitable
+        //to check bar id is valid and size is suitable (rule 10)
+        rv = ctrl_bar_range_check(xdev, ioctl_bar.bar_id,
+                ioctl_bar.bar_offaddr, sizeof(u32));
+        if (rv < 0)
+            return rv;
+
         addr = xdev->bar[ioctl_bar.bar_id] + ioctl_bar.bar_offaddr;  //BAR 0 base addr (virtual addr),
          
         ioctl_bar.rdata = ioread32(addr);
@@ -251,11 +300,23 @@ long char_ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             pr_err("copy_from_user failed.\n");
             return -EFAULT;
         }
-         //to check bar id is valid and size is suitable
+         //to check bar id is valid and size is suitable (rule 10)
+        if (ioctl_bar_bulk.bar_len > MAX_DATA_SIZE) {
+            pr_err("bar_len %u > MAX_DATA_SIZE %d.\n",
+                ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
+            return -EINVAL;
+        }
+        rv = ctrl_bar_range_check(xdev, ioctl_bar_bulk.bar_id,
+                ioctl_bar_bulk.bar_offaddr,
+                (u64)ioctl_bar_bulk.bar_len * sizeof(u32));
+        if (rv < 0)
+            return rv;
+
         addr = xdev->bar[ioctl_bar_bulk.bar_id] + ioctl_bar_bulk.bar_offaddr;  //BAR 0 base addr (virtual addr),
         
-        for (i= ioctl_bar_bulk.bar_offaddr; i< ioctl_bar_bulk.bar_len; i++) {
-            iowrite32(ioctl_bar_bulk.wdata[i], addr+ (i>>2));
+        /* rule 11: local index 0..len-1, bar_offaddr is used only once (in addr) */
+        for (i = 0; i < ioctl_bar_bulk.bar_len; i++) {
+            iowrite32(ioctl_bar_bulk.wdata[i], addr + (i << 2));
         }
  
         break;
@@ -265,11 +326,23 @@ long char_ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             pr_err("copy_from_user failed.\n");
             return -EFAULT;
         }
-         //to check bar id is valid and size is suitable
+         //to check bar id is valid and size is suitable (rule 10)
+        if (ioctl_bar_bulk.bar_len > MAX_DATA_SIZE) {
+            pr_err("bar_len %u > MAX_DATA_SIZE %d.\n",
+                ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
+            return -EINVAL;
+        }
+        rv = ctrl_bar_range_check(xdev, ioctl_bar_bulk.bar_id,
+                ioctl_bar_bulk.bar_offaddr,
+                (u64)ioctl_bar_bulk.bar_len * sizeof(u32));
+        if (rv < 0)
+            return rv;
+
         addr = xdev->bar[ioctl_bar_bulk.bar_id] + ioctl_bar_bulk.bar_offaddr;  //BAR 0 base addr (virtual addr),
         
-        for (i= ioctl_bar_bulk.bar_offaddr; i< ioctl_bar_bulk.bar_len; i++) {
-            ioctl_bar_bulk.rdata[i] = ioread32(addr+ (i>>2));
+        /* rule 11: local index 0..len-1, bar_offaddr is used only once (in addr) */
+        for (i = 0; i < ioctl_bar_bulk.bar_len; i++) {
+            ioctl_bar_bulk.rdata[i] = ioread32(addr + (i << 2));
         }        
         //ioctl_bar_bulk.rdata = ioread32(addr);
         if (copy_to_user((void __user *)arg, &ioctl_bar_bulk, sizeof(struct anlogic_ioc_bar_bulk))){
@@ -279,13 +352,45 @@ long char_ctrl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
          
         break;
    case ANLOGIC_IOCCFGW:  //PCI CFG WRITE
-        regx = XPCIe_WriteCfgReg(xdev->pdev,(*(cfgwr *)arg).reg,(*(cfgwr *)arg).value);
-        printk(KERN_WARNING"%d: Write Register.\n", (*(cfgwr *)arg).reg);
-        printk(KERN_WARNING"%d: Write Value\n", (*(cfgwr *)arg).value);
+        {
+            cfgwr cfg;
+
+            if (copy_from_user((void *)&cfg, (void __user *)arg,
+                 sizeof(cfg))) {
+                pr_err("copy_from_user failed.\n");
+                return -EFAULT;
+            }
+            /* rule 13: never dereference a user pointer; limit reg to the
+             * 4 KB config space and require 4-byte alignment */
+            if (cfg.reg < 0 || (cfg.reg & 3) || cfg.reg >= 0x1000) {
+                pr_err("bad config offset 0x%x.\n", cfg.reg);
+                return -EINVAL;
+            }
+            regx = XPCIe_WriteCfgReg(xdev->pdev, (u32)cfg.reg, (u32)cfg.value);
+            printk(KERN_WARNING"%d: Write Register.\n", cfg.reg);
+            printk(KERN_WARNING"%d: Write Value\n", cfg.value);
+        }
         break;
    case ANLOGIC_IOCCFGR:  //PCI CFG READ
-        regx = XPCIe_ReadCfgReg(xdev->pdev,*(uint32_t *)arg);  
-        *((uint32_t *)arg) = regx;
+        {
+            u32 cfg_off;
+
+            if (copy_from_user((void *)&cfg_off, (void __user *)arg,
+                 sizeof(cfg_off))) {
+                pr_err("copy_from_user failed.\n");
+                return -EFAULT;
+            }
+            /* rule 13: same range/alignment limit as the write path */
+            if ((cfg_off & 3) || cfg_off >= 0x1000) {
+                pr_err("bad config offset 0x%x.\n", cfg_off);
+                return -EINVAL;
+            }
+            regx = XPCIe_ReadCfgReg(xdev->pdev, cfg_off);
+            if (copy_to_user((void __user *)arg, &regx, sizeof(regx))) {
+                pr_err("copy_to_user failed.\n");
+                return -EFAULT;
+            }
+        }
       break;
     default:
         pr_err("UNKNOWN ioctl cmd 0x%x.\n", cmd);
@@ -302,7 +407,7 @@ int bridge_mmap(struct file *file, struct vm_area_struct *vma)
     unsigned long off;
     unsigned long phys;
     unsigned long vsize;
-    unsigned long psize;
+    resource_size_t rsrc_len;
     int rv;
 
     rv = xcdev_check(__func__, xcdev, 0);
@@ -311,12 +416,27 @@ int bridge_mmap(struct file *file, struct vm_area_struct *vma)
     xdev = xcdev->xdev;
 
     off = vma->vm_pgoff << PAGE_SHIFT;
+    if (xcdev->bar < 0 || xcdev->bar >= XDMA_BAR_NUM) {
+        pr_err("mmap(): bad bar %d.\n", xcdev->bar);
+        return -EINVAL;
+    }
+    /* rule 12: reject offsets at/after the BAR end before any subtraction */
+    rsrc_len = pci_resource_len(xdev->pdev, xcdev->bar);
+    if (!rsrc_len || off >= rsrc_len) {
+        pr_err("mmap(): off 0x%lx >= bar%d length 0x%llx.\n",
+            off, xcdev->bar, (unsigned long long)rsrc_len);
+        return -EINVAL;
+    }
+    vsize = vma->vm_end - vma->vm_start;
+    /* rule 12: overflow-safe comparison, no unsigned subtraction for the
+     * remaining length (off < rsrc_len is already guaranteed above) */
+    if ((u64)off + (u64)vsize > (u64)rsrc_len) {
+        pr_err("mmap(): vsize 0x%lx exceeds remaining 0x%llx of bar%d.\n",
+            vsize, (unsigned long long)(rsrc_len - off), xcdev->bar);
+        return -EINVAL;
+    }
     /* BAR physical address */
     phys = pci_resource_start(xdev->pdev, xcdev->bar) + off;
-    vsize = vma->vm_end - vma->vm_start;
-    /* complete resource */
-    psize = pci_resource_end(xdev->pdev, xcdev->bar) -
-        pci_resource_start(xdev->pdev, xcdev->bar) + 1 - off;
 
     dbg_sg("mmap(): xcdev = 0x%08lx\n", (unsigned long)xcdev);
     dbg_sg("mmap(): cdev->bar = %d\n", xcdev->bar);
@@ -329,8 +449,6 @@ int bridge_mmap(struct file *file, struct vm_area_struct *vma)
         xcdev->bar));
     dbg_sg("phys = 0x%lx\n", phys);
 
-    if (vsize > psize)
-        return -EINVAL;
     /*
      * pages must not be cached as this would result in cache line sized
      * accesses to the end point

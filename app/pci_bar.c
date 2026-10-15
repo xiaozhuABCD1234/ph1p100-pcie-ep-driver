@@ -82,8 +82,17 @@ int main(int argc, char **argv)
     
     bar_id =  strtoul(argv[1], 0, 0);
     
-	if (bar_id > 6) {
-		 printf("Invalid bar ID, must bellow 6.\n");
+	if (bar_id >= 6) {
+		 printf("Invalid bar ID, must be 0..5.\n");
+		 return -1;
+	}
+
+	/* BAR1/BAR3/BAR5 have no mapping of their own: BAR1 is the I/O BAR and
+	 * BAR3/BAR5 are the upper halves of the 64-bit BAR2/BAR4. The driver
+	 * leaves xdev->bar[] NULL for them, so refuse them here (audit rule 15). */
+	if (bar_id == 1 || bar_id == 3 || bar_id == 5) {
+		 printf("BAR%d is not independently mapped (no dedicated resource).\n",
+				bar_id);
 		 return -1;
 	}
 	 
