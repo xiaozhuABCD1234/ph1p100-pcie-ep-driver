@@ -1,9 +1,20 @@
+# 内核模块构建产物
 *.ko
 *.o
 *.mod
 *.mod.c
 .*.cmd
+*.cmd
 *.d
 Module.symvers
 modules.order
+*.order
+*.symvers
+.tmp_versions/
+
+# 用户态示例产物
+/app/cam_grab
+/app/pci_bar
+/app/pcie_check
+
 *.zip
