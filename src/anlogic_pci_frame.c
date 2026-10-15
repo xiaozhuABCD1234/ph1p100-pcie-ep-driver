@@ -16,7 +16,7 @@
  *
  * 内存布局与握手约定写在 include/anlogic_pci_ioctl.h（驱动/用户态/FPGA 三方共用）。
  *
- * 与访问规约的关系：本层**完全不碰 BAR 寄存器**（不做任何 MMIO），只读写自己
+ * 与 BAR 访问校验的关系：本层**完全不碰 BAR 寄存器**（不做任何 MMIO），只读写自己
  * 分配的普通内存，所以 BAR 访问的三条校验（偏移白名单、先验 MAGIC、
  * 单笔不超过 4 个双字）在这里没有可违反的地方。对 mailbox 的读用 READ_ONCE +
  * dma_rmb()：先看到 FPGA 写的序号，再去看它写的帧数据。
@@ -386,7 +386,7 @@ static int anlogic_pci_frame_mmap(struct file *file, struct vm_area_struct *vma)
      */
     vm_flags_clear(vma, VM_MAYWRITE);
 
-    /* 与 BAR 的 mmap 同样的溢出安全边界判断（规约 12） */
+    /* mmap 映射长度溢出检查：与 BAR 的 mmap 同样的溢出安全边界判断 */
     off = vma->vm_pgoff << PAGE_SHIFT;
     vsize = vma->vm_end - vma->vm_start;
     if (off >= hw->frame_size ||

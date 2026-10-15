@@ -7,7 +7,7 @@
  * （收帧缓冲节点的 ioctl/mmap 在 anlogic_pci_frame.c；控制节点的 switch 里只是
  * 把两条收帧命令转发过去，方便只开一个节点也能问到缓冲物理地址与序号。）
  *
- * 本文件是所有“用户态可控 MMIO”的唯一入口，逐条实现下面这些访问规约（先验
+ * 本文件是所有“用户态可控 MMIO”的唯一入口，逐条实现下面这些访问校验（先验
  * MAGIC、单次不超过 4 个双字、32 位对齐、全 F 熔断交给用户态、ioctl 边界校验、
  * mmap 溢出安全的边界判断、配置空间读写用 copy_from_user/copy_to_user）。
  * 这些校验一条都不允许删除或放宽。
@@ -176,7 +176,8 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
             pr_err("copy_from_user failed.\n");
             return -EFAULT;
         }
-        /* 校验 bar id 与范围是否合法（规约 10） */
+        /* 写入前先校验：bar id 合法、bar_offaddr 4 字节对齐、
+         * 这一个双字不越 BAR 边界 */
         rv = anlogic_pci_ctrl_bar_range_check(hw, ioctl_bar.bar_id,
                                               ioctl_bar.bar_offaddr,
                                               sizeof(u32));
@@ -193,7 +194,8 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
             pr_err("copy_from_user failed.\n");
             return -EFAULT;
         }
-        /* 校验 bar id 与范围是否合法（规约 10） */
+        /* 读取前先校验：bar id 合法、bar_offaddr 4 字节对齐、
+         * 这一个双字不越 BAR 边界 */
         rv = anlogic_pci_ctrl_bar_range_check(hw, ioctl_bar.bar_id,
                                               ioctl_bar.bar_offaddr,
                                               sizeof(u32));
@@ -215,7 +217,8 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
             pr_err("copy_from_user failed.\n");
             return -EFAULT;
         }
-        /* 校验 bar id 与范围是否合法（规约 10） */
+        /* 批量写前先校验：bar id 合法、bar_offaddr 4 字节对齐、
+         * 整段 bar_len 个双字不越 BAR 边界 */
         if (ioctl_bar_bulk.bar_len > MAX_DATA_SIZE) {
             pr_err("bar_len %u > MAX_DATA_SIZE %d.\n",
                    ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
@@ -230,7 +233,8 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
 
         addr = hw->bar[ioctl_bar_bulk.bar_id] + ioctl_bar_bulk.bar_offaddr;
 
-        /* 规约 11：局部索引 0..len-1，bar_offaddr 只在 addr 里用一次 */
+        /* 循环用局部下标 0..bar_len-1 逐双字推进，bar_offaddr 只在
+         * 算基址 addr 时用一次 */
         for (i = 0; i < ioctl_bar_bulk.bar_len; i++)
             iowrite32(ioctl_bar_bulk.wdata[i], addr + (i << 2));
         break;
@@ -241,7 +245,8 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
             pr_err("copy_from_user failed.\n");
             return -EFAULT;
         }
-        /* 校验 bar id 与范围是否合法（规约 10） */
+        /* 批量读前先校验：bar id 合法、bar_offaddr 4 字节对齐、
+         * 整段 bar_len 个双字不越 BAR 边界 */
         if (ioctl_bar_bulk.bar_len > MAX_DATA_SIZE) {
             pr_err("bar_len %u > MAX_DATA_SIZE %d.\n",
                    ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
@@ -256,7 +261,8 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
 
         addr = hw->bar[ioctl_bar_bulk.bar_id] + ioctl_bar_bulk.bar_offaddr;
 
-        /* 规约 11：局部索引 0..len-1，bar_offaddr 只在 addr 里用一次 */
+        /* 循环用局部下标 0..bar_len-1 逐双字推进，bar_offaddr 只在
+         * 算基址 addr 时用一次 */
         for (i = 0; i < ioctl_bar_bulk.bar_len; i++)
             ioctl_bar_bulk.rdata[i] = ioread32(addr + (i << 2));
 
@@ -277,8 +283,8 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
                 return -EFAULT;
             }
             /*
-             * 规约 13：绝不解引用用户指针；reg 限制在 4 KB 配置空间内
-             * 且必须 4 字节对齐。
+             * 配置空间写：reg 必须落在 4 KB 配置空间内且 4 字节对齐，
+             * 只把整数偏移交给 pci_write_config_dword，绝不解引用用户指针。
              */
             if (cfg.reg < 0 || (cfg.reg & 3) || cfg.reg >= 0x1000) {
                 pr_err("bad config offset 0x%x.\n", cfg.reg);
@@ -300,7 +306,7 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
                 pr_err("copy_from_user failed.\n");
                 return -EFAULT;
             }
-            /* 规约 13：与写路径同样的范围与对齐限制 */
+            /* 配置空间读：与写路径同样的范围与对齐限制 */
             if ((cfg_off & 3) || cfg_off >= 0x1000) {
                 pr_err("bad config offset 0x%x.\n", cfg_off);
                 return -EINVAL;
@@ -352,7 +358,7 @@ static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
         pr_err("mmap(): bad bar %d.\n", cdev->bar);
         return -EINVAL;
     }
-    /* 规约 12：先拒掉 off >= BAR 长度，再做任何减法 */
+    /* mmap 映射长度溢出检查：先拒掉 off >= BAR 长度，再做任何减法 */
     rsrc_len = pci_resource_len(hw->pdev, cdev->bar);
     if (!rsrc_len || off >= rsrc_len) {
         pr_err("mmap(): off 0x%lx >= bar%d length 0x%llx.\n",
@@ -361,8 +367,8 @@ static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
     }
     vsize = vma->vm_end - vma->vm_start;
     /*
-     * 规约 12：溢出安全的比较，不用无符号相减表示剩余长度
-     * （上面已保证 off < rsrc_len）。
+     * mmap 映射长度溢出检查：把 off 与 vsize 提升到 64 位后相加再比 BAR
+     * 长度，不用无符号相减表示剩余长度（上面已保证 off < rsrc_len）。
      */
     if ((u64)off + (u64)vsize > (u64)rsrc_len) {
         pr_err("mmap(): vsize 0x%lx exceeds remaining 0x%llx of bar%d.\n",

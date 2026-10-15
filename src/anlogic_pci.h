@@ -111,7 +111,7 @@ struct anlogic_pci_hw {
      * 收帧缓冲：一块 dma_alloc_coherent 分配的一致性内存，物理地址连续、页对齐，
      * 由 FPGA 用 MWr 写（见 include/anlogic_pci_ioctl.h 的布局说明）。
      * 主机侧只轮询 mailbox 的 seq/count 判「帧就绪」，不碰 BAR 寄存器 —— 收帧这条
-     * 路径与 MMIO 访问规约（§3）不交叉。
+     * 路径与 BAR 访问的那几条校验不交叉。
      * AER/槽位复位不重新分配它（是系统内存，不是设备状态），卸载时释放。
      */
     void *frame_virt;                         /* 缓冲起点 = 槽区起点 */
