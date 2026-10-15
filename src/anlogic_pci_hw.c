@@ -3,10 +3,10 @@
  * Anlogic PH1P100 PCIe 端点（RK3588 主机侧）驱动：资源与寄存器访问层。
  *
  * 负责打开/关闭一个 EP：使能设备、申请区间、映射全部 BAR、设置 DMA 掩码、
- * 登记中断、枚举 DMA 通道。
+ * 分配收帧缓冲（anlogic_pci_frame.c）、登记中断、枚举 DMA 通道。
  *
  * 本层不接触任何用户态可控的地址；用户态可控的 MMIO 全在 anlogic_pci_ctrl.c
- * 的 ioctl / mmap 入口按 doc/panic_risk_audit.md 的规约逐项校验。
+ * 的 ioctl / mmap 入口按  的规约逐项校验。
  */
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -257,7 +257,7 @@ static int anlogic_pci_irq_setup(struct anlogic_pci_hw *hw, struct pci_dev *pdev
 /*
  * MSI-X 通道中断处理：本 EP 没有 MSI-X 能力，这条路径实际不会走；
  * dev_id 是登记中断时传进来的 engine，由它取回 hw。
- * 保持“中断上下文里不做 MMIO”的约定（doc/panic_risk_audit.md E16）。
+ * 保持“中断上下文里不做 MMIO”的约定（E16）。
  */
 static irqreturn_t anlogic_pci_channel_irq(int irq, void *dev_id)
 {
@@ -596,6 +596,11 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev,
     if (rv)
         goto err_mask;
 
+    /* 收帧缓冲：必须在 DMA 掩码设好之后分配（FPGA 用它当 MWr 目标） */
+    rv = anlogic_pci_frame_alloc(hw);
+    if (rv)
+        goto err_frame;
+
     rv = anlogic_pci_probe_engines(hw);
     if (rv)
         goto err_engines;
@@ -621,6 +626,8 @@ err_enable_msix:
     anlogic_pci_disable_msi_msix(hw, pdev);
 err_engines:
     anlogic_pci_remove_engines(hw);
+err_frame:
+    anlogic_pci_frame_free(hw);
 err_mask:
     anlogic_pci_unmap_bars(hw, pdev);
 err_map:
@@ -649,6 +656,7 @@ void anlogic_pci_hw_close(struct pci_dev *pdev, void *dev_hndl)
     anlogic_pci_irq_teardown(hw);
     anlogic_pci_disable_msi_msix(hw, pdev);
     anlogic_pci_remove_engines(hw);
+    anlogic_pci_frame_free(hw);
     anlogic_pci_unmap_bars(hw, pdev);
 
     pci_release_regions(pdev);

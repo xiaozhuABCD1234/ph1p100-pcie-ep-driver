@@ -1,9 +1,11 @@
 # PH1P100 PCIe 端点（RK3588 主机侧）驱动
 
 安路 PH1P100 FPGA 作 PCIe EP、RK3588 作 RC 时，RC 侧的内核模块与用户态程序。
-由厂商 `anlogic_pci` 驱动移植而来，只做 PIO 寄存器访问（未走 DMA）。
+由厂商 `anlogic_pci` 驱动移植而来，原先只做 PIO 寄存器访问；现在另加了一层「收帧缓冲」
+（dma_alloc_coherent 分配、物理地址/序号经 ioctl 给用户态、FPGA 侧拿它当 MWr 目标），
+真正的收帧等 FPGA 接通后再验。
 所有用户态可控的 MMIO 都在 ioctl/mmap 入口逐项校验，访问规约见
-`doc/panic_risk_audit.md` —— 那些校验一条都不许放宽。
+`` —— 那些校验一条都不许放宽。
 
 ## 目录
 
@@ -11,12 +13,13 @@
 | --- | --- |
 | `src/anlogic_pci_main.c` | 模块与 PCI 驱动骨架（probe / remove / AER 错误处理） |
 | `src/anlogic_pci_hw.c` | 资源与寄存器访问层（BAR 映射、区间、DMA 掩码、中断、通道） |
+| `src/anlogic_pci_frame.c` | 收帧缓冲层（dma_alloc_coherent 分配/释放、帧就绪轮询、取帧节点的 ioctl 与只读 mmap） |
 | `src/anlogic_pci_chrdev.c` | 字符设备注册层（class / char 区域、节点创建与销毁） |
 | `src/anlogic_pci_ctrl.c` | 控制与用户节点的 file_operations（ioctl、mmap） |
 | `src/anlogic_pci.h` | 驱动内部头（三层共用） |
 | `include/anlogic_pci_ioctl.h` | ioctl 协议，驱动与用户态共用的唯一一份 |
-| `app/` | 用户态：`cam_grab.c` 抓帧、`pci_bar.c` 单 dw 读写、`pcie_check.c` 链路自检 |
-| `doc/panic_risk_audit.md` | 内核挂死风险审计与访问规约（只读参考） |
+| `app/` | 用户态：`cam_grab.c` 抓帧（PIO）、`frame_grab.c` 从收帧缓冲取帧、`pci_bar.c` 单 dw 读写、`pcie_check.c` 链路自检 |
+| `` | 内核挂死风险审计与访问规约（只读参考） |
 
 厂商原始驱动不在本仓库（在 `~/Projects/.archive-ph1p-*/vendor_driver_original/`），
 只在需要对照移植改动时取用，避免两份代码并存分叉。
@@ -34,6 +37,7 @@ make -C ~/Projects/orangepi-5-max-bsp/third_party/linux \
 
 ```sh
 aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o cam_grab  app/cam_grab.c
+aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o frame_grab app/frame_grab.c
 aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o pci_bar  app/pci_bar.c
 aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -Iinclude -o pcie_check app/pcie_check.c
 ```
@@ -45,7 +49,23 @@ insmod anlogic_pci.ko        # 中断方式：interrupt_mode={0 MSI-X | 1 MSI(�
 rmmod anlogic_pci
 ```
 
-节点：`/dev/ANLOGIC-PCI0_control`（控制/寄存器）、`/dev/ANLOGIC-PCI0_user`（用户 BAR 窗口，本板 = BAR2）。
+节点：`/dev/ANLOGIC-PCI0_control`（控制/寄存器）、`/dev/ANLOGIC-PCI0_user`（用户 BAR 窗口，本板 = BAR2）、
+`/dev/ANLOGIC-PCI0_frame`（收帧缓冲，只读 mmap + 帧就绪 ioctl）。
+
+## 收帧缓冲（DMA）
+
+驱动用 `dma_alloc_coherent` 分配一块物理连续、页对齐的缓冲给 FPGA 当 MWr 目标，内存布局、
+mailbox 字段与握手约定写在 `include/anlogic_pci_ioctl.h`（FPGA 侧必须按那份布局写）：
+每写完一帧先填槽头、最后更新 `mailbox.seq`（序号那笔 MWr 不能带 Relaxed Ordering）。
+主机侧只轮询序号判就绪（本 EP 只有 Legacy 中断，暂不做 MSI 唤醒）。
+
+缓冲区里槽区在前（槽 n 的 MWr 目标 = `phys_addr + stride*n`，槽头之后才是像素），
+mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `mb_off`，不要按常量猜。
+
+- 规模由 module param 定：`frame_width`（640）/`frame_height`（480）/`frame_slot_bytes`（0 = 宽×高 = 307200）/`frame_slots`（默认 4，多帧余量）；
+- ioctl：`ANLOGIC_IOCFRAMEINFO` 报物理地址、大小、几何、`mb_off` 与序号/计数；`ANLOGIC_IOCFRAMEWAIT` 等帧（`timeout_ms=0` 只查不等）；
+- 用户态：`./frame_grab --info` 只看缓冲参数，`./frame_grab -o f.pgm` 取最新一帧；
+- FPGA 还没接上时 `mailbox.seq` 恒 0，`frame_grab` 打印「无新帧」并以退出码 4 返回（不写文件）。
 
 ## 最小用法
 
@@ -53,7 +73,9 @@ rmmod anlogic_pci
 ./pcie_check                     # 链路/枚举/BAR/节点自检，只读 sysfs，不需要 root
 ./pci_bar 0 0x40                 # 读 BAR0 + 0x40：MAGIC 应为 0x50434946（小端读回需 bswap）
 ./pci_bar 0 0x6C 0x12345678      # 往 BAR0 + 0x6C（SCRATCH）写
-./cam_grab -s cam frame.pgm      # 抓一帧 640x480 灰度存 PGM
+./cam_grab -s cam frame.pgm      # 抓一帧 640x480 灰度存 PGM（走 BAR0 的 PIO，慢）
+./frame_grab --info              # 看收帧缓冲的物理地址/大小/几何/序号，不取帧
+./frame_grab -o dma_frame.pgm    # 从收帧缓冲取最新一帧存 PGM（FPGA 未接通时退出码 4 = 无新帧）
 ```
 
 ## 移植要点（适配内核 7.x 的 API 改动）

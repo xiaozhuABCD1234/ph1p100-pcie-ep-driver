@@ -3,8 +3,9 @@
  * Anlogic PH1P100 PCIe 端点（RK3588 主机侧）驱动：字符设备注册层。
  *
  * 负责 class/char 区域的申请与释放、按类型创建/销毁
- * /dev/ANLOGIC-PCI<n>_control（控制节点）与 /dev/ANLOGIC-PCI<n>_user（用户 BAR 窗口）。
- * 文件操作实现在 anlogic_pci_ctrl.c。
+ * /dev/ANLOGIC-PCI<n>_control（控制节点）、/dev/ANLOGIC-PCI<n>_user（用户 BAR 窗口）
+ * 与 /dev/ANLOGIC-PCI<n>_frame（收帧缓冲，只读 mmap + 帧就绪 ioctl）。
+ * 文件操作实现在 anlogic_pci_ctrl.c（前两个）与 anlogic_pci_frame.c（收帧缓冲）。
  */
 #include <linux/cdev.h>
 #include <linux/device.h>
@@ -18,6 +19,7 @@ static struct class *anlogic_pci_class;
 static const char * const anlogic_pci_node_names[ANLOGIC_PCI_CDEV_TYPE_NUM] = {
     [ANLOGIC_PCI_CDEV_USER] = ANLOGIC_PCI_NODE_NAME "%d_user",
     [ANLOGIC_PCI_CDEV_CTRL] = ANLOGIC_PCI_NODE_NAME "%d_control",
+    [ANLOGIC_PCI_CDEV_FRAME] = ANLOGIC_PCI_NODE_NAME "%d_frame",
 };
 
 static inline void anlogic_pci_card_flag_set(struct anlogic_pci_card *card,
@@ -194,11 +196,14 @@ static int anlogic_pci_cdev_create(struct anlogic_pci_card *card,
     if (rv < 0)
         return rv;
 
-    /* 非 SG DMA 节点用 type 当 minor：0 = _user，1 = _control */
+    /* 非 SG DMA 节点用 type 当 minor：0 = _user，1 = _control，2 = _frame */
     switch (type) {
     case ANLOGIC_PCI_CDEV_USER:
     case ANLOGIC_PCI_CDEV_CTRL:
         anlogic_pci_ctrl_init(cdev);
+        break;
+    case ANLOGIC_PCI_CDEV_FRAME:
+        anlogic_pci_frame_init(cdev);
         break;
     default:
         pr_info("type 0x%x NOT supported.\n", type);
@@ -253,6 +258,20 @@ int anlogic_pci_card_create_interfaces(struct anlogic_pci_card *card)
         anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_USER);
     }
 
+    /*
+     * 收帧缓冲节点（minor 2，节点名 _frame）：只用于帧缓冲的 ioctl 与只读 mmap，
+     * 不绑任何 BAR（bar = -1，所以 ctrl 那套 BAR mmap 路径用不到它）。
+     */
+    if (hw->frame_virt) {
+        rv = anlogic_pci_cdev_create(card, &card->frame_cdev, -1,
+                                     ANLOGIC_PCI_CDEV_FRAME);
+        if (rv < 0) {
+            pr_err("create_char(frame_cdev) failed\n");
+            goto fail;
+        }
+        anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_FRAME);
+    }
+
     return 0;
 
 fail:
@@ -274,6 +293,12 @@ void anlogic_pci_card_destroy_interfaces(struct anlogic_pci_card *card)
         rv = anlogic_pci_cdev_destroy(&card->user_cdev);
         if (rv < 0)
             pr_err("Failed to destroy cdev user, error 0x%x\n", rv);
+    }
+
+    if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_FRAME)) {
+        rv = anlogic_pci_cdev_destroy(&card->frame_cdev);
+        if (rv < 0)
+            pr_err("Failed to destroy cdev frame, error 0x%x\n", rv);
     }
 
     if (card->major)

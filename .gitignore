@@ -14,6 +14,7 @@ modules.order
 
 # 用户态示例产物
 /app/cam_grab
+/app/frame_grab
 /app/pci_bar
 /app/pcie_check
 

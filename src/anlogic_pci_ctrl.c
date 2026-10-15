@@ -4,8 +4,10 @@
  *
  * 控制节点与用户 BAR 窗口节点共用这里的 file_operations：ioctl 单 dw / 批量读写、
  * 配置空间读写，以及把 BAR 映射给用户态的 mmap。
+ * （收帧缓冲节点的 ioctl/mmap 在 anlogic_pci_frame.c；控制节点的 switch 里只是
+ * 把两条收帧命令转发过去，方便只开一个节点也能问到缓冲物理地址与序号。）
  *
- * 本文件是所有“用户态可控 MMIO”的唯一入口，逐条实现 doc/panic_risk_audit.md
+ * 本文件是所有“用户态可控 MMIO”的唯一入口，逐条实现 
  * 的访问规约（先验 MAGIC、单次 ≤4 dw、32 位对齐、全 F 熔断交给用户态、
  * ioctl 边界校验、mmap 溢出安全的边界判断、配置空间读写用
  * copy_from_user/copy_to_user）。这些校验一条都不允许删除或放宽。
@@ -68,7 +70,7 @@ static long anlogic_pci_version_ioctl(struct anlogic_pci_cdev *cdev,
 }
 
 /*
- * 所有 BAR ioctl 的公共入口校验（panic_risk_audit.md 规约 10）：
+ * 所有 BAR ioctl 的公共入口校验（本文件的公共校验）：
  *   - bar_id 必须 < ANLOGIC_PCI_BAR_NUM 且该 BAR 确实映射过；
  *   - off（BAR 内字节偏移）必须 4 字节对齐；
  *   - off + len（字节）必须落在 pci_resource_len() 以内，用 64 位加法，
@@ -310,6 +312,15 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
             }
         }
         break;
+
+    /*
+     * 收帧缓冲的命令也允许从控制节点发（两条命令的实现在 anlogic_pci_frame.c，
+     * 本节点只做转发；上面的类型/access_ok 校验照旧先跑一遍）。
+     * 帧数据本身在 /dev/ANLOGIC-PCI0_frame 上只读 mmap 取。
+     */
+    case ANLOGIC_IOCFRAMEINFO:
+    case ANLOGIC_IOCFRAMEWAIT:
+        return anlogic_pci_frame_ioctl(cdev, cmd, (void __user *)arg);
 
     default:
         pr_err("UNKNOWN ioctl cmd 0x%x.\n", cmd);

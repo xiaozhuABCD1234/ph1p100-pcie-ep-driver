@@ -51,10 +51,12 @@
 /* ANLOGIC_IOCINFO 上报的驱动版本号，沿用移植前的数值 */
 #define ANLOGIC_PCI_DRV_VERSION_NUMBER  20200821
 
-/* 控制节点与用户 BAR 窗口节点（两者共用同一套 file_operations） */
+/* 控制节点、用户 BAR 窗口节点（共用 ctrl 的 file_operations），
+ * 以及收帧缓冲节点（自己的 file_operations：ioctl + mmap） */
 enum anlogic_pci_cdev_type {
     ANLOGIC_PCI_CDEV_USER = 0,  /* minor 0 -> /dev/ANLOGIC-PCI<n>_user */
     ANLOGIC_PCI_CDEV_CTRL = 1,  /* minor 1 -> /dev/ANLOGIC-PCI<n>_control */
+    ANLOGIC_PCI_CDEV_FRAME = 2, /* minor 2 -> /dev/ANLOGIC-PCI<n>_frame */
     ANLOGIC_PCI_CDEV_TYPE_NUM
 };
 
@@ -62,6 +64,7 @@ enum anlogic_pci_cdev_type {
 enum anlogic_pci_card_flags {
     ANLOGIC_PCI_CARD_CDEV_USER,
     ANLOGIC_PCI_CARD_CDEV_CTRL,
+    ANLOGIC_PCI_CARD_CDEV_FRAME,
 };
 
 /* 一个 DMA 通道的登记信息（本 EP 没有 XDMA 配置 BAR，通道号是固定枚举出来的） */
@@ -103,6 +106,24 @@ struct anlogic_pci_hw {
     struct anlogic_pci_engine engine_c2h[ANLOGIC_PCI_MAX_CHANNELS];
 
     u64 feature_id;         /* ANLOGIC_IOCINFO 上报，本板恒 0 */
+
+    /*
+     * 收帧缓冲：一块 dma_alloc_coherent 分配的一致性内存，物理地址连续、页对齐，
+     * 由 FPGA 用 MWr 写（见 include/anlogic_pci_ioctl.h 的布局说明）。
+     * 主机侧只轮询 mailbox 的 seq/count 判「帧就绪」，不碰 BAR 寄存器 —— 收帧这条
+     * 路径与 MMIO 访问规约（§3）不交叉。
+     * AER/槽位复位不重新分配它（是系统内存，不是设备状态），卸载时释放。
+     */
+    void *frame_virt;                         /* 缓冲起点 = 槽区起点 */
+    dma_addr_t frame_phys;
+    size_t frame_size;
+    struct anlogic_frame_mailbox *frame_mb;   /* = frame_virt + stride*slots（槽区之后的页） */
+    unsigned int frame_stride;                /* 槽位步长（页对齐） */
+    unsigned int frame_slot_bytes;            /* 一帧像素字节数 */
+    unsigned int frame_hdr_bytes;             /* 槽头字节数 */
+    unsigned int frame_slots;                 /* 槽位数 */
+    unsigned int frame_width;
+    unsigned int frame_height;
 };
 
 /* 一个字符设备实例（控制节点或用户 BAR 窗口） */
@@ -128,6 +149,7 @@ struct anlogic_pci_card {
     unsigned int flags;
     struct anlogic_pci_cdev ctrl_cdev;
     struct anlogic_pci_cdev user_cdev;
+    struct anlogic_pci_cdev frame_cdev;
 };
 
 /* anlogic_pci_hw.c */
@@ -145,6 +167,13 @@ void anlogic_pci_card_destroy_interfaces(struct anlogic_pci_card *card);
 int anlogic_pci_cdev_check(const char *fname, struct anlogic_pci_cdev *cdev);
 int anlogic_pci_cdev_open(struct inode *inode, struct file *file);
 int anlogic_pci_cdev_close(struct inode *inode, struct file *file);
+
+/* anlogic_pci_frame.c（收帧缓冲层：分配/释放、帧就绪轮询、取帧节点的 ioctl 与 mmap） */
+int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw);
+void anlogic_pci_frame_free(struct anlogic_pci_hw *hw);
+long anlogic_pci_frame_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
+                             void __user *arg);
+void anlogic_pci_frame_init(struct anlogic_pci_cdev *cdev);
 
 /* anlogic_pci_ctrl.c */
 void anlogic_pci_ctrl_init(struct anlogic_pci_cdev *cdev);
