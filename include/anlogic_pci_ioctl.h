@@ -84,7 +84,9 @@ typedef struct cfgwrite {
  *   偏移 0 起 stride*slots   槽区：stride*i 处是 struct anlogic_frame_slot_hdr
  *                           （16 字节），其后是一帧像素；i = (seq-1) % slots
  *   偏移 mb_off（页对齐）       struct anlogic_frame_mailbox（64 字节，独占一页）
- * FPGA 侧的 MWr 目标 = phys_addr + stride * 槽位号（0..slots-1），像素从槽头之后开始；
+ * FPGA 侧的 MWr 目标 = phys_addr + stride * 槽位号 + hdr_bytes（= 该槽**像素区起点**，
+ * 槽头那 16 字节由驱动写，不能被推来的帧盖掉），像素从槽头之后开始；
+ * 本板推帧引擎不逐帧轮换目标地址，所以推来的帧永远落在槽 0。
  * ioctl 把 mb_off 一并报给用户态，用户态靠它定位 mailbox（不要自己按固定偏移猜）。
  *
  * 握手约定：

@@ -259,11 +259,16 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
         return rv;
 
     /*
-     * ① 推帧目标 = 收帧缓冲的 DMA 地址（裸帧整块落在缓冲起点）；
+     * ① 推帧目标 = 槽 0 的**像素区起点** = 槽基址 + 槽头字节数（16）。
+     *    槽基址那 16 字节由驱动写在看门铃时补的槽头（seq/len/flags）占用，
+     *    推帧引擎若从槽基址写起，帧的头 16 字节就会被槽头盖掉；而主机
+     *    （frame_grab）取像素的起点是 slot*stride + hdr_bytes，正好也是像素区
+     *    起点 —— 两边对上，帧既不会被槽头覆盖，也不会被整块搬移。
+     *    推帧引擎不逐帧轮换目标地址，所以推来的帧永远落在槽 0。
      *    门铃地址 = 缓冲内 mailbox 页里的门铃字（推帧引擎每推完一帧往那儿写
      *    本帧的已推帧数，驱动见它变大就补槽头与 mailbox.seq/count）。
      */
-    dst = (u64)hw->frame_phys;
+    dst = (u64)hw->frame_phys + (u64)hw->frame_hdr_bytes;
     db = (u64)hw->frame_phys + (u64)hw->frame_mb_off +
          (u64)offsetof(struct anlogic_frame_mailbox, push_dbell);
     dst_lo = (u32)dst;

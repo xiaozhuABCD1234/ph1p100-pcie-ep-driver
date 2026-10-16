@@ -66,7 +66,8 @@ mailbox 字段与握手约定写在 `include/anlogic_pci_ioctl.h`（FPGA 侧必�
 每写完一帧先填槽头、最后更新 `mailbox.seq`（序号那笔 MWr 不能带 Relaxed Ordering）。
 主机侧只轮询序号判就绪（本 EP 只有 Legacy 中断，暂不做 MSI 唤醒）。
 
-缓冲区里槽区在前（槽 n 的 MWr 目标 = `phys_addr + stride*n`，槽头之后才是像素），
+缓冲区里槽区在前（槽 n 的 MWr 目标 = `phys_addr + stride*n + hdr_bytes`，即槽头之后的像素区起点；
+槽头由驱动写、不能被帧数据盖掉），
 mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `mb_off`，不要按常量猜。
 
 - 规模由 module param 定：`frame_width`（640）/`frame_height`（480）/`frame_slot_bytes`（0 = 宽×高 = 307200）/`frame_slots`（默认 1）；

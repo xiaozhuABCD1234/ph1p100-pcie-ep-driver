@@ -49,20 +49,14 @@
  * --------------------------------------------------------------------------
  * 三、帧缓存布局（决定了 PGM 怎么摆）
  * --------------------------------------------------------------------------
- *   字 0        = 帧号（img_frame_src.v:14-15/:166-171；相机同布局 cam_fb_writer.v:44-49）
- *   字 1..76799 = 像素，4 像素/32bit 字、小端（x 小的在低字节，
- *                 img_frame_src.v:12-15、cam_fb_writer.v:125）
- *   ⇒ 像素 k 在字 (k/4 + 1) 的第 (k%4) 字节；一帧 640x480 = 307200 像素，
- *     但帧缓存只有 76800 字（307200 字节，ep_bar_win.v:46 PTR_BYTES=0x4B000），
- *     字 0 被帧号占掉 4 字节 ⇒ 实际只存得下 76799 字 = 307196 个像素，
- *     最后 4 个像素（x=636..639, y=479）两个写源都不写
- *     （cam_fb_writer.v:47-49 原文「末 4 像素与测试图源一样不写」；
- *      测试图发生器写完 widx==WORDS-1 即结束：img_frame_src.v:181-186）。
- *   两个写源的帧号约定差 1，工具会分别核对：
- *     - 测试图：字 0 = 本帧框号，帧结束时 FRAME_CNT 才 +1
- *               （:170 写 frame_cnt_t，:185 才自增）⇒ 读回 FRAME_CNT == 字0 + 1
- *     - 相机  ：SOF 时写 frame_cnt+1，EOF 时 frame_cnt++（cam_fb_writer.v:271/:279）
- *               ⇒ 读回 FRAME_CNT == 字0
+ *   字 0..76799 = 像素，4 像素/32bit 字、小端（x 小的在低字节，
+ *                 img_frame_src.v:12-16、cam_fb_writer.v:45-52）
+ *   ⇒ 像素 k 在字 (k/4) 的第 (k%4) 字节；一帧 640x480 = 307200 像素，
+ *     帧缓存 76800 字（307200 字节，ep_bar_win.v:46 PTR_BYTES=0x4B000）
+ *     正好装下整帧，第 0 行最左 4 个像素也在缓存里。
+ *   帧号不占帧缓存：它就是寄存器 0x4C FRAME_CNT（相机源在 EOF 递增，
+ *   cam_fb_writer.v:286；测试图源在帧末递增，img_frame_src.v:210），
+ *   所以本工具只从 0x4C 读帧号，不再去缓存里对账。
  *
  * --------------------------------------------------------------------------
  * 四、相机关态字（0x80 = A 路，0x84 = B 路）逐位含义
@@ -151,7 +145,7 @@ const EP_DEVICE_ID: u32 = 0xabcd; // 同上 :56（与厂商驱动匹配表一致
 
 const FB_BYTES: usize = 0x4B000; // ep_bar_win.v:46 PTR_BYTES（640*480）
 const FB_WORDS: usize = FB_BYTES / 4; // 76800 字
-const FB_PIXELS: usize = FB_WORDS * 4 - 4; // 字 1..76799 → 307196 个像素
+const FB_PIXELS: usize = FB_WORDS * 4; // 字 0..76799 → 307200 个像素（整帧）
 const FB_IMAGE_PIX: u32 = 640 * 480; // 期望的 W*H
 
 // 寄存器表：只有 ep_bar_win.v 读 mux（:216-239）登记过的 offset 才允许访问
@@ -527,15 +521,15 @@ fn wait_new_frame(
 
 // ------------------------------------------------- 帧缓存 → PGM 像素映射
 
-/// 像素 k ← 帧缓存字 (k/4 + 1) 的第 (k%4) 字节，低字节 = 最左像素：
-///   - 字 0 是帧号，像素字从字 1 开始（img_frame_src.v:14-15/:166-171）
-///   - 4 像素/32bit 字、小端（img_frame_src.v:12-15；相机同布局 cam_fb_writer.v:125）
-///   - 帧缓存只有 FB_PIXELS 个像素位置，末尾 (npix_img - npix_store) 个像素留 0
+/// 像素 k ← 帧缓存字 (k/4) 的第 (k%4) 字节，低字节 = 最左像素：
+///   - 字 0..76799 全是像素（帧号不占缓存，它是 0x4C/0xA0 这些计数器寄存器）
+///   - 4 像素/32bit 字、小端（img_frame_src.v:12-16；相机同布局 cam_fb_writer.v:125）
+///   - 帧缓存 76800 字 = 307200 字节，正好装下 640x480 整帧
 /// 剩下的字节保持 0，由调用者先清零。
 fn fb_to_image(fb: &[u32], img: &mut [u8], npix_store: usize) {
     let n = std::cmp::min(npix_store, img.len());
     for k in 0..n {
-        let w = fb[k / 4 + 1];
+        let w = fb[k / 4];
         img[k] = ((w >> (8 * (k % 4) as u32)) & 0xff) as u8;
     }
 }
@@ -545,7 +539,8 @@ fn fb_to_image(fb: &[u32], img: &mut [u8], npix_store: usize) {
 /// 测试图源的像素公式（img_frame_src.v:15-17）：
 ///   pix = x[7:0] + y[7:0] + frame_cnt[7:0] + PIX_ADD，顶层没覆盖 PIX_ADD（默认 0）
 ///   （ph1p_pcie_ep_top.v:591-595 只传了 W/H/IDLE_CYCLE）
-/// 逐像素核对，既验证搬运正确性，也验证「字 0 = 帧号、像素从字 1 开始」这个布局理解。
+/// 逐像素核对，既验证搬运正确性，也验证「字 0..76799 = 像素（字 k 装 x..x+3）」
+/// 这个布局理解（帧号不占缓存，由调用者另外从 0x4C 给）。
 fn pattern_check(img: &[u8], n: usize, w: usize, frame: u32, what: &str) -> usize {
     let mut bad = 0usize;
 
@@ -571,10 +566,10 @@ fn pattern_check(img: &[u8], n: usize, w: usize, frame: u32, what: &str) -> usiz
     bad
 }
 
-/// ---- --selftest：主机侧「字0=帧号 / 像素从字1起」映射与自检逻辑的离线自证 ----
+/// ---- --selftest：主机侧「整块缓存都是像素」映射与自检逻辑的离线自证 ----
 /// 合成一帧（按 RTL 公式生成帧缓存内容）喂给本工具真正用的那两段代码：
-///   ① 本工具的映射必须 0 处不符；② 旧草稿那种「把字 0 也当像素」的错位映射
-/// 必须被查出不符。不访问任何硬件。
+///   ① 本工具的映射必须 0 处不符；② 旧版那种「字 0 当帧号、像素从字 1 起」的
+/// 错位映射必须被查出不符。不访问任何硬件。
 fn self_test() -> i32 {
     let w = 640usize;
     let h = 480usize;
@@ -584,18 +579,17 @@ fn self_test() -> i32 {
 
     println!("=== --selftest：主机侧像素映射/自检逻辑离线自证（未访问硬件）===");
     println!(
-        "  合成帧：字 0 = 帧号 {}；像素字 1..{} = (x+y+帧号)&0xff",
-        frame,
-        FB_WORDS - 1
+        "  合成帧：字 0..{} 全是像素 (x+y+帧号)&0xff（帧号 {} 只在寄存器里）",
+        FB_WORDS - 1,
+        frame
     );
 
     let mut fb = vec![0u32; FB_WORDS];
-    fb[0] = frame;
     for k in 0..npix_store {
         let px = (k % w) as u32;
         let py = (k / w) as u32;
         let p = (px + py + (frame & 0xff)) & 0xff;
-        fb[k / 4 + 1] |= p << (8 * (k % 4) as u32);
+        fb[k / 4] |= p << (8 * (k % 4) as u32);
     }
 
     let mut ret = EX_OK;
@@ -607,12 +601,13 @@ fn self_test() -> i32 {
         ret = EX_INCONSISTENT;
     }
 
-    // 反证：字 0 也当像素（小端机上的原始字节铺开）→ 必须被抓出来
+    // 反证：旧版映射（字 0 当帧号、像素从字 1 起）→ 必须被抓出来
     let mut img2 = vec![0u8; npix_img];
-    // SAFETY: 把整个 fb（FB_BYTES 字节）当字节数组读，等价于 C 版的 memcpy(img, fb, npix_img)
-    let raw = unsafe { std::slice::from_raw_parts(fb.as_ptr() as *const u8, npix_img.min(FB_BYTES)) };
-    img2[..raw.len()].copy_from_slice(raw);
-    if pattern_check(&img2, npix_store, w, frame, "这是旧草稿的映射，本就该不符") == 0 {
+    for k in 0..npix_store {
+        let wv = fb.get(k / 4 + 1).copied().unwrap_or(0);
+        img2[k] = ((wv >> (8 * (k % 4) as u32)) & 0xff) as u8;
+    }
+    if pattern_check(&img2, npix_store, w, frame, "这是旧映射，本就该不符") == 0 {
         eprintln!("!! 自证失败：自检没能查出已知的 4 像素错位");
         ret = EX_INCONSISTENT;
     }
@@ -1021,12 +1016,10 @@ fn run() -> i32 {
     let len_post = rd!(R_LEN);
     ptr = rd!(R_PTR);
 
-    let frame_word = fb[0]; // 字 0 = 帧号（img_frame_src.v:14-15/:166-171）
-
-    // ---- 12. 拼 PGM：像素 k ← 字 (k/4 + 1) 的第 (k%4) 字节 ----
+    // ---- 12. 拼 PGM：像素 k ← 字 (k/4) 的第 (k%4) 字节（帧号不占缓存）----
     let npix_img = w as usize * h as usize;
     let npix_store = std::cmp::min(FB_PIXELS, npix_img);
-    let mut img = vec![0u8; npix_img]; // 最后 4 个像素帧缓存里没有 → 保持 0
+    let mut img = vec![0u8; npix_img];
     fb_to_image(&fb, &mut img, npix_store);
 
     let mut fp = match std::fs::File::create(&out_path) {
@@ -1047,14 +1040,11 @@ fn run() -> i32 {
     }
 
     // ---- 13. 一致性校验 ----
+    // 帧号只在 0x4C 里（不再占用帧缓存字 0），所以只靠「搬运期间帧号没变」
+    // + （测试图源时）逐像素公式自检来判一致性。
     let torn = f_post != f_pre;
-    let frame_ok = if src_cam {
-        // cam_fb_writer.v:271 写 frame_cnt+1、:279 EOF 才 frame_cnt++ ⇒ 字 0 == FRAME_CNT
-        frame_word == f_pre
-    } else {
-        // img_frame_src.v:170 写 frame_cnt_t、:185 帧末才自增 ⇒ 字 0 == FRAME_CNT - 1
-        f_pre == frame_word.wrapping_add(1)
-    };
+    // 测试图源的像素公式用的是「帧末才 +1」的那个帧号 ⇒ 生成这一帧时用的是 f_pre - 1
+    let pattern_frame = f_pre.wrapping_sub(1);
 
     println!("\n=== 结果 ===");
     println!(
@@ -1066,24 +1056,14 @@ fn run() -> i32 {
         if src_cam { "相机" } else { "测试图源" },
         if src_cam { 1 } else { 0 }
     );
-    println!("  帧号（缓存字 0）: {}", frame_word);
+    println!("  帧号（0x4C）    : {}（帧缓存字 0..{} 全是像素，帧号不再占缓存）",
+             f_pre, FB_WORDS - 1);
     println!(
         "  FRAME_CNT       : 抓帧前 {} → 搬运前 {} → 搬运后 {}  {}",
         f0,
         f_pre,
         f_post,
         if torn { "← 搬运期间变过！" } else { "（搬运期间未变）" }
-    );
-    println!(
-        "  帧号关系        : 字0={} 与 搬运前 FRAME_CNT={} {}（{}）",
-        frame_word,
-        f_pre,
-        if frame_ok { "自洽" } else { "**对不上**" },
-        if src_cam {
-            "相机：字0 == FRAME_CNT（cam_fb_writer.v:271/:279）"
-        } else {
-            "测试图：字0 == FRAME_CNT-1（img_frame_src.v:170/:185）"
-        }
     );
     println!(
         "  DATA_LEN        : 抓帧前 {} / 搬运后 {}（期望 {} = {}x{}）",
@@ -1120,16 +1100,14 @@ fn run() -> i32 {
         }
     );
     println!(
-        "  布局说明        : 字 0 = 帧号，像素字只有 {} 个 ⇒ PGM 前 {} 个像素来自帧缓存，",
+        "  布局说明        : 字 0..{} 全是像素（帧缓存 {} 字节 = 一帧 {}x{}），",
         FB_WORDS - 1,
-        npix_store
+        FB_BYTES,
+        w,
+        h
     );
     println!(
-        "                    末尾 {} 个像素（x={}..{}, y={}）帧缓存里不存，已填 0",
-        npix_img - npix_store,
-        npix_store % w as usize,
-        w - 1,
-        h - 1
+        "                    字 k 装 x=k*4..k*4+3（低字节 = 最左像素）；帧号只看 0x4C"
     );
 
     let mut bad = 0usize;
@@ -1138,17 +1116,17 @@ fn run() -> i32 {
             &img,
             npix_store,
             w as usize,
-            frame_word,
-            "若整帧不符，先查 RTL 布局/搬运；只末尾几个不符，多半是撕裂",
+            pattern_frame,
+            "若整帧不符，先查 RTL 布局/搬运；零散几个不符，多半是撕裂",
         );
     }
 
     println!(
         "  一致性          : {}",
-        if torn || !frame_ok || suspect {
+        if torn || bad != 0 || suspect {
             "**不通过**（图已写出，但请勿当可信帧用；原因见上面的告警）"
         } else {
-            "OK（搬运期间帧号未变、帧号关系自洽）"
+            "OK（搬运期间帧号未变；测试图源逐像素公式自检通过）"
         }
     );
 
@@ -1158,13 +1136,8 @@ fn run() -> i32 {
             f_pre, f_post, dump_ms
         );
     }
-    if !frame_ok {
-        eprintln!(
-            "!! 缓存字 0 的帧号与 FRAME_CNT 关系不符：布局假设（字 0 = 帧号、像素从字 1 起）或帧同步需要复核"
-        );
-    }
 
-    if torn || !frame_ok || bad != 0 || suspect {
+    if torn || bad != 0 || suspect {
         EX_INCONSISTENT
     } else {
         EX_OK

@@ -7,7 +7,7 @@
  *
  *   1) 分配：dma_alloc_coherent 一块物理连续、页对齐的一致性内存，大小由
  *      module param 决定（默认 1 槽 × 640x480 灰度 = 307200 字节/槽）。
- *      每槽步长页对齐，推帧目标按 phys_addr + stride * n 算。
+ *      每槽步长页对齐，推帧目标按 phys_addr + stride * n + hdr_bytes 算（= 像素区起点）。
  *   2) 接口：ANLOGIC_IOCFRAMEINFO 把物理地址、大小、几何与序号/计数报给用户态；
  *      ANLOGIC_IOCFRAMEWAIT 提供「帧就绪」轮询（序号 + 计数）—— 本 EP 目前只有
  *      Legacy 中断、没有 MSI，所以不做中断，只轮询邮箱。
