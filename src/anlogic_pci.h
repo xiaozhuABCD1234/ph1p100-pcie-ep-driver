@@ -59,7 +59,8 @@
 enum anlogic_pci_cdev_type {
     ANLOGIC_PCI_CDEV_USER = 0,  /* minor 0 -> /dev/ANLOGIC-PCI<n>_user */
     ANLOGIC_PCI_CDEV_CTRL = 1,  /* minor 1 -> /dev/ANLOGIC-PCI<n>_control */
-    ANLOGIC_PCI_CDEV_FRAME = 2, /* minor 2 -> /dev/ANLOGIC-PCI<n>_frame */
+    ANLOGIC_PCI_CDEV_FRAME = 2, /* minor 2 -> /dev/ANLOGIC-PCI<n>_frame（A 路相机） */
+    ANLOGIC_PCI_CDEV_FRAME_B = 3, /* minor 3 -> /dev/ANLOGIC-PCI<n>_frame_b（B 路相机） */
     ANLOGIC_PCI_CDEV_TYPE_NUM
 };
 
@@ -68,6 +69,7 @@ enum anlogic_pci_card_flags {
     ANLOGIC_PCI_CARD_CDEV_USER,
     ANLOGIC_PCI_CARD_CDEV_CTRL,
     ANLOGIC_PCI_CARD_CDEV_FRAME,
+    ANLOGIC_PCI_CARD_CDEV_FRAME_B,
 };
 
 /* 一个 DMA 通道的登记信息（本 EP 没有 XDMA 配置 BAR，通道号是固定枚举出来的） */
@@ -132,7 +134,12 @@ struct anlogic_pci_hw {
     unsigned int frame_slots;                 /* 槽位数 */
     unsigned int frame_width;
     unsigned int frame_height;
-    unsigned int frame_push_done;              /* 推帧门铃已经补到第几帧（0 = 还没补过） */
+    unsigned int frame_push_done;              /* A 路推帧门铃已经补到第几帧（0 = 还没补过） */
+    unsigned int frame_streams;                /* 收帧缓冲里的路数（1 = 单路老布局，2 = A/B 两路） */
+    unsigned int frame_stream_bytes;           /* 每路字节数 = stride*slots + 一页 */
+    unsigned int frame_mb_off_b;               /* B 路 mailbox 在整块缓冲内的字节偏移 */
+    struct anlogic_frame_mailbox *frame_mb_b;  /* B 路 mailbox（= frame_virt + frame_mb_off_b） */
+    unsigned int frame_push_done_b;            /* B 路推帧门铃已经补到第几帧 */
 
     /*
      * 相机链路 / 推帧的初始化状态：探测时由 anlogic_pci_link_arm() 写好，
@@ -142,6 +149,8 @@ struct anlogic_pci_hw {
     u64 link_push_db;                         /* 0xB8/0xBC 当前值（帧缓冲 mailbox 页里的门铃字） */
     u32 link_ctrl;                            /* 探测时写进 0x44 的值 */
     unsigned int link_armed;                  /* 推帧目标/门铃地址与使能位都已就位 */
+    unsigned int link_arm_bits;               /* 本次 arm 实际置上的 CTRL 位（含 B 路推帧使能与否） */
+    unsigned int link_push_b_ok;              /* 1 = B 路推帧寄存器可用（老映像没有时为 0） */
 
     /*
      * 生命周期与串行化：fd 打开的引用计数（mmap 出来的 VMA 不另计数，它在 fd 的
@@ -161,6 +170,7 @@ struct anlogic_pci_cdev {
     dev_t cdevno;
     struct cdev cdev;
     int bar;                /* 该节点对外暴露的 BAR（mmap/ioctl 用） */
+    unsigned int stream;    /* 收帧缓冲节点看哪一路（0 = A，1 = B） */
     struct device *sys_device;
 };
 
@@ -176,7 +186,8 @@ struct anlogic_pci_card {
     unsigned int flags;
     struct anlogic_pci_cdev ctrl_cdev;
     struct anlogic_pci_cdev user_cdev;
-    struct anlogic_pci_cdev frame_cdev;
+    struct anlogic_pci_cdev frame_cdev;      /* A 路 */
+    struct anlogic_pci_cdev frame_b_cdev;    /* B 路 */
 };
 
 /* anlogic_pci_hw.c */

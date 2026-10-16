@@ -20,6 +20,7 @@ static const char * const anlogic_pci_node_names[ANLOGIC_PCI_CDEV_TYPE_NUM] = {
     [ANLOGIC_PCI_CDEV_USER] = ANLOGIC_PCI_NODE_NAME "%d_user",
     [ANLOGIC_PCI_CDEV_CTRL] = ANLOGIC_PCI_NODE_NAME "%d_control",
     [ANLOGIC_PCI_CDEV_FRAME] = ANLOGIC_PCI_NODE_NAME "%d_frame",
+    [ANLOGIC_PCI_CDEV_FRAME_B] = ANLOGIC_PCI_NODE_NAME "%d_frame_b",
 };
 
 static inline void anlogic_pci_card_flag_set(struct anlogic_pci_card *card,
@@ -215,6 +216,11 @@ static int anlogic_pci_cdev_create(struct anlogic_pci_card *card,
         anlogic_pci_ctrl_init(cdev);
         break;
     case ANLOGIC_PCI_CDEV_FRAME:
+        cdev->stream = 0;                 /* A 路 */
+        anlogic_pci_frame_init(cdev);
+        break;
+    case ANLOGIC_PCI_CDEV_FRAME_B:
+        cdev->stream = 1;                 /* B 路：同一套命令字，看另一路缓冲 */
         anlogic_pci_frame_init(cdev);
         break;
     default:
@@ -289,6 +295,21 @@ int anlogic_pci_card_create_interfaces(struct anlogic_pci_card *card)
         anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_FRAME);
     }
 
+    /*
+     * B 路收帧缓冲节点（minor 3，节点名 _frame_b）：命令字与 A 路完全相同，
+     * 只是 INFO/WAIT/mmap 都看缓冲里的第 1 路。缓冲只有一路时（frame_streams=1）
+     * 不建这个节点 —— 没有那一路的槽与 mailbox，建了也没东西可看。
+     */
+    if (hw->frame_virt && hw->frame_streams > 1) {
+        rv = anlogic_pci_cdev_create(card, &card->frame_b_cdev, -1,
+                                     ANLOGIC_PCI_CDEV_FRAME_B);
+        if (rv < 0) {
+            pr_err("create_char(frame_b_cdev) failed\n");
+            goto fail;
+        }
+        anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_FRAME_B);
+    }
+
     return 0;
 
 fail:
@@ -316,6 +337,12 @@ void anlogic_pci_card_destroy_interfaces(struct anlogic_pci_card *card)
         rv = anlogic_pci_cdev_destroy(&card->frame_cdev);
         if (rv < 0)
             pr_err("Failed to destroy cdev frame, error 0x%x\n", rv);
+    }
+
+    if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_FRAME_B)) {
+        rv = anlogic_pci_cdev_destroy(&card->frame_b_cdev);
+        if (rv < 0)
+            pr_err("Failed to destroy cdev frame_b, error 0x%x\n", rv);
     }
 
     if (card->major)

@@ -9,8 +9,10 @@
  *   3) 把那一槽像素写成 P5 灰度 PGM。
  *
  * 缓冲布局与 FPGA 的握手约定（握手时序、槽头字段）写在 include/anlogic_pci_ioctl.h：
- * 槽区从缓冲起点开始，槽 n 在 phys_addr + stride*n（槽头后才是像素），mailbox
- * 描述符在槽区之后、由 ioctl 报的 mb_off 定位（整页，不与槽区重叠）。本工具只读：
+ * 每一路自己的「槽区 + mailbox 页」：槽 n 在本路起点 + stride*n（槽头后才是像素），
+ * mailbox 在本路槽区之后（由 ioctl 报的 mb_off 定位，整页，不与槽区重叠）。
+ * 本路起点 = mb_off - stride*slots（单路缓冲 = 0；A/B 两路时 B 路 = 第 1 路起点），
+ * 而 mmap 映射的是整块缓冲，所以槽地址要加上这个起点。本工具只读：
  *   - 打开设备用只读；mmap 用 PROT_READ（驱动也会拒绝可写映射）；
  *   - 不碰任何 BAR 寄存器，所以寄存器访问规约在这一层没有适用对象
  *     （该规约管的是对 EP 的 MMIO，本层读写的是系统内存）。
@@ -93,6 +95,13 @@ fn mb_field(p: *const u32) -> u32 {
     let v = unsafe { sys::rd32(p) };
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     v
+}
+
+/// 本路在整块缓冲里的起点：每路都是「槽区在路首、mailbox 紧随其后」，
+/// 所以 路首 = mb_off - stride*slots（A 路 = 0，B 路 = 第 1 路起点）。
+/// 单路缓冲（frame_streams=1）时结果恒为 0，与改双路之前完全一致。
+fn stream_base(info: &IocFrame) -> usize {
+    (info.mb_off as usize).wrapping_sub(info.stride as usize * info.slots as usize)
 }
 
 fn frame_info(fd: RawFd, info: &mut IocFrame) -> Result<(), ()> {
@@ -338,7 +347,8 @@ fn run() -> i32 {
         eprintln!("!! 驱动报的槽位 {} 越界（共 {} 槽）", slot, info.slots);
         return EX_INCONSISTENT;
     }
-    let hdr = (map.as_ptr() as usize + slot as usize * info.stride as usize) as *const FrameSlotHdr;
+    let hdr = (map.as_ptr() as usize + stream_base(&info) +
+               slot as usize * info.stride as usize) as *const FrameSlotHdr;
     let hdr_seq = mb_field(hdr as *const u32);
     let hdr_len = mb_field(unsafe { hdr.cast::<u32>().add(1) });
     let hdr_flags = mb_field(unsafe { hdr.cast::<u32>().add(2) });
@@ -392,7 +402,8 @@ fn run() -> i32 {
         );
         copy = npix;
     }
-    let src = map.as_ptr() as usize + slot as usize * info.stride as usize + info.hdr_bytes as usize;
+    let src = map.as_ptr() as usize + stream_base(&info) +
+              slot as usize * info.stride as usize + info.hdr_bytes as usize;
     // SAFETY: 源地址在只读映射内（descriptor_check 已核对 stride/slots/mb_off 都合得上）
     unsafe {
         std::ptr::copy_nonoverlapping(src as *const u8, img.as_mut_ptr(), copy);

@@ -6,7 +6,7 @@
  * 本层只做「缓冲 + 接口」，真正的收帧等 FPGA 侧打通后再验：
  *
  *   1) 分配：dma_alloc_coherent 一块物理连续、页对齐的一致性内存，大小由
- *      module param 决定（默认 1 槽 × 640x480 灰度 = 307200 字节/槽）。
+ *      module param 决定（默认 1 槽 × 3840x2160 灰度 = 8294400 字节/槽）。
  *      每槽步长页对齐，推帧目标按 phys_addr + stride * n + hdr_bytes 算（= 像素区起点）。
  *   2) 接口：ANLOGIC_IOCFRAMEINFO 把物理地址、大小、几何与序号/计数报给用户态；
  *      ANLOGIC_IOCFRAMEWAIT 提供「帧就绪」轮询（序号 + 计数）—— 本 EP 目前只有
@@ -40,15 +40,17 @@
 
 #include "anlogic_pci.h"
 
-/* 一帧的默认几何：640x480 灰度 = 307200 字节 */
-#define ANLOGIC_FRAME_DEF_WIDTH     640u
-#define ANLOGIC_FRAME_DEF_HEIGHT    480u
+/* 一帧的默认几何：相机整帧 3840x2160 灰度 = 8294400 字节（4K，1 字节 1 像素） */
+#define ANLOGIC_FRAME_DEF_WIDTH     3840u
+#define ANLOGIC_FRAME_DEF_HEIGHT    2160u
 /*
  * 默认单槽。推帧引擎只往主机给的那一个目标地址写（0xB0/0xB4 由驱动探测时写好、
  * 之后不逐帧轮换），所以帧永远落在同一个槽里；多槽下用户态按 (seq-1)%slots 取槽
  * 会取到没数据的槽。要跑别的路径（PIO 0x60 / 只读 DDR3）时可以用 frame_slots 开多槽。
  */
 #define ANLOGIC_FRAME_DEF_SLOTS     1u
+/* 默认两路：A 路（_frame）与 B 路（_frame_b）各一块相机 */
+#define ANLOGIC_FRAME_DEF_STREAMS   2u
 /* 轮询间隔，也是「等帧」时的睡眠粒度 */
 #define ANLOGIC_FRAME_POLL_MS       10u
 /* 一帧像素字节数的合理上限，防止 module param 写出荒唐的分配量 */
@@ -57,21 +59,30 @@
 
 static unsigned int frame_width = ANLOGIC_FRAME_DEF_WIDTH;
 module_param(frame_width, uint, 0444);
-MODULE_PARM_DESC(frame_width, "收帧缓冲的每帧宽度（像素），默认 640");
+MODULE_PARM_DESC(frame_width, "收帧缓冲的每帧宽度（像素），默认 3840");
 
 static unsigned int frame_height = ANLOGIC_FRAME_DEF_HEIGHT;
 module_param(frame_height, uint, 0444);
-MODULE_PARM_DESC(frame_height, "收帧缓冲的每帧高度（像素），默认 480");
+MODULE_PARM_DESC(frame_height, "收帧缓冲的每帧高度（像素），默认 2160");
 
-/* 0 表示用 frame_width * frame_height（默认 640x480 灰度 = 307200 字节） */
+/* 0 表示用 frame_width * frame_height（默认 3840x2160 灰度 = 8294400 字节） */
 static unsigned int frame_slot_bytes;
 module_param(frame_slot_bytes, uint, 0444);
-MODULE_PARM_DESC(frame_slot_bytes, "一帧像素字节数，0 = frame_width*frame_height（默认 307200）");
+MODULE_PARM_DESC(frame_slot_bytes, "一帧像素字节数，0 = frame_width*frame_height（默认 8294400）");
 
 static unsigned int frame_slots = ANLOGIC_FRAME_DEF_SLOTS;
 module_param(frame_slots, uint, 0444);
 MODULE_PARM_DESC(frame_slots,
                  "收帧缓冲的槽位数（1..16），默认 1（推帧目标固定，多槽只有槽 0 有推来的帧）");
+
+/*
+ * 缓冲里放几路（两块相机各一路）。2 = A/B 两路（默认）：缓冲 = 两套完全相同的
+ * 「槽区 + mailbox 页」，A 路在前、B 路在后，各有一个字符节点（_frame / _frame_b）。
+ * 置 1 就退回单路老布局（只有 A 路、只有 _frame 节点），用来和旧映像对齐。
+ */
+static unsigned int frame_streams = ANLOGIC_FRAME_DEF_STREAMS;
+module_param(frame_streams, uint, 0444);
+MODULE_PARM_DESC(frame_streams, "收帧缓冲的路数（1 = 单路老布局，2 = A/B 两路），默认 2");
 
 /*
  * mailbox 与槽头的字段偏移是 FPGA / 驱动 / 用户态三方共用的 ABI，偏移算错的话
@@ -93,18 +104,21 @@ static_assert(sizeof(struct anlogic_frame_slot_hdr) == 16,
  * 若以后把 RC 标成 dma-coherent（改按 cacheable 映射），这里读序号之前必须补
  * dma_sync_single_for_cpu()，否则会读到脏 cache line。
  */
-static void anlogic_pci_frame_seq_read(struct anlogic_pci_hw *hw, u32 *seq,
-                                       u32 *count)
+static void anlogic_pci_frame_seq_read(struct anlogic_pci_hw *hw,
+                                       unsigned int stream, u32 *seq, u32 *count)
 {
-    *seq = READ_ONCE(hw->frame_mb->seq);
+    struct anlogic_frame_mailbox *mb = stream ? hw->frame_mb_b : hw->frame_mb;
+
+    *seq = READ_ONCE(mb->seq);
     dma_rmb();
-    *count = READ_ONCE(hw->frame_mb->count);
+    *count = READ_ONCE(mb->count);
 }
 
 /*
  * 推帧门铃 → mailbox 协议的补齐（见 include/anlogic_pci_ioctl.h 里「本板推帧通路的
  * 实际分工」那段）：门铃字装的是 FPGA 侧的「已推帧数」（1 起、每帧 +1）；驱动见到它
- * 比上次大了，就
+ * 比上次大了，就（**每路各看自己那个门铃字**：A 路在路 0 的 mailbox 里，
+ * B 路在路 1 的 mailbox 里 —— 两路同时推时各补各的槽头与 seq，互不干扰）
  *   ① 把新帧的槽头（seq/len/flags）写进该帧所在的槽，
  *   ② 跟上 mailbox.count，
  *   ③ **最后**才更新 mailbox.seq —— 与头文件里给 FPGA 定的是同一个顺序：
@@ -113,23 +127,39 @@ static void anlogic_pci_frame_seq_read(struct anlogic_pci_hw *hw, u32 *seq,
  * frame_slots 默认 1，(done-1)%slots 恒为 0。
  * 读门铃用 READ_ONCE + dma_rmb()：先看到门铃，再去看它标记的那一帧。
  */
-static void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
+static void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw,
+                                        unsigned int stream)
 {
-    struct anlogic_frame_mailbox *mb = hw->frame_mb;
+    struct anlogic_frame_mailbox *mb;
     struct anlogic_frame_slot_hdr *hdr;
+    u8 *base;
+    unsigned int *push_done;
     unsigned int slot;
     u32 done;
 
+    if (!hw || stream >= hw->frame_streams)
+        return;
+    if (stream) {
+        mb = hw->frame_mb_b;
+        push_done = &hw->frame_push_done_b;
+    } else {
+        mb = hw->frame_mb;
+        push_done = &hw->frame_push_done;
+    }
     if (!mb || !hw->frame_slots || !hw->frame_stride)
         return;
 
+    /* 本路在整块缓冲里的起点：路 0 就是缓冲起点 */
+    base = (u8 *)hw->frame_virt +
+           (size_t)stream * hw->frame_stream_bytes;
+
     done = READ_ONCE(mb->push_dbell);
     dma_rmb();
-    if (!done || done == hw->frame_push_done)
+    if (!done || done == *push_done)
         return;
 
     slot = (done - 1) % hw->frame_slots;
-    hdr = (struct anlogic_frame_slot_hdr *)((u8 *)hw->frame_virt +
+    hdr = (struct anlogic_frame_slot_hdr *)(base +
                                             (size_t)slot * hw->frame_stride);
     WRITE_ONCE(hdr->seq, done);
     WRITE_ONCE(hdr->len, hw->frame_slot_bytes);
@@ -140,10 +170,10 @@ static void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
     dma_wmb();
     WRITE_ONCE(mb->seq, done);
     dma_wmb();
-    hw->frame_push_done = done;
+    *push_done = done;
 
-    pr_debug("收帧缓冲：门铃 %u，补齐槽 %u 的槽头与 mailbox.seq/count。\n",
-             done, slot);
+    pr_debug("收帧缓冲：%s路门铃 %u，补齐槽 %u 的槽头与 mailbox.seq/count。\n",
+             stream ? "B " : "A ", done, slot);
 }
 
 /*
@@ -159,7 +189,10 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     unsigned int slot_bytes = frame_slot_bytes;
     unsigned int slots = frame_slots;
     unsigned int hdr_bytes = sizeof(struct anlogic_frame_slot_hdr);
+    unsigned int streams = frame_streams;
     unsigned int stride;
+    unsigned int stream_bytes;
+    unsigned int i;
     size_t size;
 
     if (!hw || !hw->pdev) {
@@ -191,14 +224,24 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
         slots = ANLOGIC_FRAME_DEF_SLOTS;
     }
 
+    if (!streams || streams > ANLOGIC_FRAME_MAX_STREAMS) {
+        pr_warn("收帧缓冲：frame_streams=%u 非法，改用 %u。\n", streams,
+                ANLOGIC_FRAME_DEF_STREAMS);
+        streams = ANLOGIC_FRAME_DEF_STREAMS;
+    }
+
     /* 每槽页对齐：槽头 + 一帧像素，再向上取整到页 */
     stride = (unsigned int)PAGE_ALIGN((size_t)hdr_bytes + slot_bytes);
     /*
-     * 布局（与 include/anlogic_pci_ioctl.h 的说明一致，FPGA 按这个算 MWr 目标）：
+     * 布局（与 include/anlogic_pci_ioctl.h 的说明一致，FPGA 按这个算 MWr 目标）。
+     * 每一路内部：
      *   [0, stride*slots)            槽区，槽 i 在 stride*i，槽头后是像素
      *   [stride*slots, +一页)         mailbox 描述符，页对齐、与槽区不重叠
+     * 路与路之间整段平铺：路 s 在缓冲内的起点 = s * stream_bytes
+     * （stream_bytes 本身是页的整数倍，所以每路起点也是页对齐的）。
      */
-    size = (size_t)stride * slots + PAGE_SIZE;
+    stream_bytes = (unsigned int)((size_t)stride * slots + PAGE_SIZE);
+    size = (size_t)stream_bytes * streams;
 
     hw->frame_virt = dma_alloc_coherent(&hw->pdev->dev, size, &hw->frame_phys,
                                         GFP_KERNEL);
@@ -220,11 +263,19 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     /* 清零：序号从 0 起，FPGA 没接上时用户态一问就是「无新帧」 */
     memset(hw->frame_virt, 0, size);
 
-    /* mailbox 放在槽区之后的一整页里，与槽区不重叠（见头文件的布局说明） */
+    /* mailbox 放在本路槽区之后的一整页里，与槽区不重叠（见头文件的布局说明） */
     hw->frame_mb_off = (unsigned int)((size_t)stride * slots);
     hw->frame_mb = (struct anlogic_frame_mailbox *)((u8 *)hw->frame_virt +
                                                    hw->frame_mb_off);
+    hw->frame_mb_off_b = streams > 1 ? stream_bytes + hw->frame_mb_off : 0;
+    hw->frame_mb_b = streams > 1
+                     ? (struct anlogic_frame_mailbox *)((u8 *)hw->frame_virt +
+                                                        hw->frame_mb_off_b)
+                     : NULL;
     hw->frame_size = size;
+    hw->frame_streams = streams;
+    hw->frame_stream_bytes = stream_bytes;
+    hw->frame_push_done_b = 0;
     hw->frame_stride = stride;
     hw->frame_slot_bytes = slot_bytes;
     hw->frame_hdr_bytes = hdr_bytes;
@@ -232,24 +283,28 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     hw->frame_width = width;
     hw->frame_height = height;
 
-    mb = hw->frame_mb;
-    mb->seq = 0;
-    mb->count = 0;
-    mb->push_dbell = 0;
-    mb->slot_bytes = slot_bytes;
-    mb->slots = slots;
-    mb->stride = stride;
-    mb->width = width;
-    mb->height = height;
-    /* magic 最后写：FPGA/用户态看到 magic 就说明描述符已经在内存里了 */
-    dma_wmb();
-    mb->magic = ANLOGIC_FRAME_MAGIC;
-    dma_wmb();
+    /* 每路的 mailbox 都要填：字段完全相同，各自记自己那一份 */
+    for (i = 0; i < streams; i++) {
+        mb = (i == 0) ? hw->frame_mb : hw->frame_mb_b;
+        mb->seq = 0;
+        mb->count = 0;
+        mb->push_dbell = 0;
+        mb->slot_bytes = slot_bytes;
+        mb->slots = slots;
+        mb->stride = stride;
+        mb->width = width;
+        mb->height = height;
+        /* magic 最后写：FPGA/用户态看到 magic 就说明描述符已经在内存里了 */
+        dma_wmb();
+        mb->magic = ANLOGIC_FRAME_MAGIC;
+        dma_wmb();
+    }
 
-    pr_info("收帧缓冲：phys 0x%llx, size %zu = %u 槽 × 步长 %u + mailbox 页"
-            "（%ux%u, %u 字节/帧，mailbox 偏移 %zu）。\n",
-            (unsigned long long)hw->frame_phys, size, slots, stride, width,
-            height, slot_bytes, (size_t)stride * slots);
+    pr_info("收帧缓冲：phys 0x%llx, size %zu = %u 路 ×（%u 槽 × 步长 %u + mailbox 页）"
+            "（%ux%u, %u 字节/帧；A 路 mailbox 偏移 %zu，B 路 0x%x）。\n",
+            (unsigned long long)hw->frame_phys, size, streams, slots, stride,
+            width, height, slot_bytes, (size_t)stride * slots,
+            hw->frame_mb_off_b);
 
     return 0;
 }
@@ -267,6 +322,7 @@ void anlogic_pci_frame_free(struct anlogic_pci_hw *hw)
 
     hw->frame_virt = NULL;
     hw->frame_mb = NULL;
+    hw->frame_mb_b = NULL;
     hw->frame_mb_off = 0;
     hw->frame_phys = 0;
     hw->frame_size = 0;
@@ -277,19 +333,31 @@ void anlogic_pci_frame_free(struct anlogic_pci_hw *hw)
     hw->frame_push_done = 0;
     hw->frame_width = 0;
     hw->frame_height = 0;
+    hw->frame_streams = 0;
+    hw->frame_stream_bytes = 0;
+    hw->frame_mb_off_b = 0;
+    hw->frame_mb_b = NULL;
+    hw->frame_push_done_b = 0;
 }
 
 static void anlogic_pci_frame_fill_info(struct anlogic_pci_hw *hw,
+                                        unsigned int stream,
                                         struct anlogic_ioc_frame *info)
 {
     u32 seq, count;
 
-    /* 先把 FPGA 推来的帧补进 mailbox（门铃驱动的协议补齐），再报给用户态 */
-    anlogic_pci_frame_push_sync(hw);
-    anlogic_pci_frame_seq_read(hw, &seq, &count);
+    /* 先把 FPGA 推来的帧补进本路的 mailbox（门铃驱动的协议补齐），再报给用户态 */
+    anlogic_pci_frame_push_sync(hw, stream);
+    anlogic_pci_frame_seq_read(hw, stream, &seq, &count);
 
     memset(info, 0, sizeof(*info));
-    info->phys_addr = (unsigned long long)hw->frame_phys;
+    /*
+     * phys_addr = **本路**在缓冲里的物理起点（路 0 = 缓冲起点，与改双路之前一致），
+     * size = 整块缓冲（mmap 映射的也是整块，所以一次映射两路都能看），
+     * mb_off = 本路 mailbox 在整块缓冲内的偏移。
+     */
+    info->phys_addr = (unsigned long long)hw->frame_phys +
+                      (unsigned long long)stream * hw->frame_stream_bytes;
     info->size = (unsigned long long)hw->frame_size;
     info->stride = hw->frame_stride;
     info->slot_bytes = hw->frame_slot_bytes;
@@ -299,7 +367,7 @@ static void anlogic_pci_frame_fill_info(struct anlogic_pci_hw *hw,
     info->height = hw->frame_height;
     info->seq = seq;
     info->count = count;
-    info->mb_off = hw->frame_mb_off;
+    info->mb_off = stream ? hw->frame_mb_off_b : hw->frame_mb_off;
 }
 
 /*
@@ -308,6 +376,7 @@ static void anlogic_pci_frame_fill_info(struct anlogic_pci_hw *hw,
  * 醒一次看 mailbox。没有新帧**不是错误**：ready 保持 0 返回 0，用户态据此报「无新帧」。
  */
 static long anlogic_pci_frame_wait(struct anlogic_pci_hw *hw,
+                                   unsigned int stream,
                                    struct anlogic_ioc_frame_wait *arg)
 {
     unsigned long deadline = jiffies + msecs_to_jiffies(arg->timeout_ms);
@@ -321,8 +390,8 @@ static long anlogic_pci_frame_wait(struct anlogic_pci_hw *hw,
             rv = -ENODEV;
             break;
         }
-        anlogic_pci_frame_push_sync(hw);
-        anlogic_pci_frame_seq_read(hw, &seq, &count);
+        anlogic_pci_frame_push_sync(hw, stream);
+        anlogic_pci_frame_seq_read(hw, stream, &seq, &count);
         if (seq != arg->last_seq) {
             arg->ready = 1;
             break;
@@ -382,7 +451,7 @@ long anlogic_pci_frame_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
         {
             struct anlogic_ioc_frame info;
 
-            anlogic_pci_frame_fill_info(hw, &info);
+            anlogic_pci_frame_fill_info(hw, cdev->stream, &info);
             if (copy_to_user((void __user *)arg, &info, sizeof(info))) {
                 pr_err("copy_to_user(frame info) 失败。\n");
                 return -EFAULT;
@@ -404,7 +473,7 @@ long anlogic_pci_frame_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
                        wait.timeout_ms, ANLOGIC_FRAME_MAX_WAIT_MS);
                 return -EINVAL;
             }
-            rv = anlogic_pci_frame_wait(hw, &wait);
+            rv = anlogic_pci_frame_wait(hw, cdev->stream, &wait);
             if (copy_to_user((void __user *)arg, &wait, sizeof(wait))) {
                 pr_err("copy_to_user(frame wait) 失败。\n");
                 return -EFAULT;

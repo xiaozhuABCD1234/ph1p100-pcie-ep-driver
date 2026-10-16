@@ -241,6 +241,7 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
     u32 ctrl, cam_stat = 0, ddr_status = 0, ddr_seq = 0, pushed = 0, frame_cnt = 0;
     u32 dst_lo, dst_hi, db_lo, db_hi;
     u64 dst, db;
+    unsigned int arm_bits;
     unsigned int waited = 0;
     int armed = 0;
     int rv;
@@ -309,20 +310,69 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
     hw->link_push_db = db;
 
     /*
+     * ①之二 B 路推帧目标/门铃：两块相机同时推，所以 B 路也要一份自己的目标地址
+     *      与门铃字。地址用的是 B 路那一份缓冲（路 1）里的槽 0 像素起点与它的
+     *      mailbox.push_dbell，与 A 路互不相干。
+     *      老映像里没有 0x100~0x10C 这组寄存器（读回是 0xdeadbeef）—— 那种情况
+     *      不当作致命错误：给一条明确警告，退化成「只跑 A 路」，其余照常。
+     */
+    arm_bits = ANLOGIC_CTRL_ARM_BITS;
+    hw->link_push_b_ok = 0;
+    if (hw->frame_streams > 1 && hw->frame_mb_b) {
+        u64 dst_b = (u64)hw->frame_phys + (u64)hw->frame_stream_bytes +
+                    (u64)hw->frame_hdr_bytes;
+        u64 db_b = (u64)hw->frame_phys + (u64)hw->frame_mb_off_b +
+                   (u64)offsetof(struct anlogic_frame_mailbox, push_dbell);
+        u32 dst_b_lo = (u32)dst_b, dst_b_hi = (u32)(dst_b >> 32);
+        u32 db_b_lo = (u32)db_b, db_b_hi = (u32)(db_b >> 32);
+
+        rv = anlogic_pci_link_write32(hw, ANLOGIC_BAR_PUSH_DST_LO_OFF_B, dst_b_lo);
+        if (!rv)
+            rv = anlogic_pci_link_write32(hw, ANLOGIC_BAR_PUSH_DST_HI_OFF_B, dst_b_hi);
+        if (!rv)
+            rv = anlogic_pci_link_write32(hw, ANLOGIC_BAR_PUSH_DB_LO_OFF_B, db_b_lo);
+        if (!rv)
+            rv = anlogic_pci_link_write32(hw, ANLOGIC_BAR_PUSH_DB_HI_OFF_B, db_b_hi);
+        if (rv < 0) {
+            pr_warn("链路：写 B 路推帧目标/门铃失败 %d，本次只跑 A 路。\n", rv);
+        } else {
+            rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_PUSH_DST_LO_OFF_B, &ctrl);
+            if (!rv && ctrl != dst_b_lo) {
+                pr_warn("链路：0x100 回读 0x%08x != 写入 0x%08x（老映像没有 B 路推帧"
+                        "寄存器），本次只跑 A 路。\n", ctrl, dst_b_lo);
+                rv = -EIO;
+            }
+            if (!rv) {
+                hw->link_push_b_ok = 1;
+                arm_bits = ANLOGIC_CTRL_ARM_BITS_AB;
+                pr_info("链路：B 路推帧目标 0x%llx、门铃 0x%llx（收帧缓冲路 1，"
+                        "偏移 0x%x）。\n",
+                        (unsigned long long)dst_b, (unsigned long long)db_b,
+                        hw->frame_mb_off_b);
+            }
+        }
+    } else {
+        pr_info("链路：收帧缓冲只有一路（frame_streams=%u），只跑 A 路推帧。\n",
+                hw->frame_streams);
+    }
+
+    /*
      * ② CTRL 使能位：总使能 + 相机写源 + 允许相机帧写进 DDR3 + 允许推帧
      *    （bit7=0 走 DDR3 源，见 include/anlogic_pci_ioctl.h 的 ANLOGIC_CTRL_ARM_BITS）。
+     *    B 路推帧寄存器可用时把 bit8 一起置上 —— 两路同时推。
      *    bit2 保持当前值不动 —— 它是重触发电平，翻了就等于做一次传感器初始化。
      */
-    rv = anlogic_pci_link_ctrl_update(hw, ANLOGIC_CTRL_ARM_BITS, 0, &ctrl);
+    rv = anlogic_pci_link_ctrl_update(hw, arm_bits, 0, &ctrl);
     if (rv < 0) {
         pr_err("链路：写 0x44 CTRL 失败 %d，初始化中断。\n", rv);
         return rv;
     }
-    if ((ctrl & ANLOGIC_CTRL_ARM_BITS) != ANLOGIC_CTRL_ARM_BITS) {
+    if ((ctrl & arm_bits) != arm_bits) {
         pr_err("链路：0x44 回读 0x%08x 里使能位没置全（要 0x%08x），初始化中断。\n",
-               ctrl, ANLOGIC_CTRL_ARM_BITS);
+               ctrl, arm_bits);
         return -EIO;
     }
+    hw->link_arm_bits = arm_bits;
     armed = 1;
 
     pr_info("链路：推帧目标 0x%llx、门铃 0x%llx（都在收帧缓冲 0x%llx 里），"
@@ -355,7 +405,9 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
         } else {
             pr_info("链路：等了 %u ms 相机仍没起来（lane_valid=0），翻转 CTRL[2] 重新初始化传感器。\n",
                     waited);
-            rv = anlogic_pci_link_ctrl_update(hw, ANLOGIC_CTRL_ARM_BITS,
+            /* 用本次 arm 实际置上的那组位（含 B 路推帧使能），别写死 A 路那份，
+               否则一次重触发就把 bit8 抹掉、B 路推帧悄悄停下 */
+            rv = anlogic_pci_link_ctrl_update(hw, arm_bits,
                                               ANLOGIC_CTRL_MCLK_SEL, &ctrl);
             if (rv < 0) {
                 pr_err("链路：重触发写 0x44 失败 %d。\n", rv);
@@ -420,13 +472,15 @@ void anlogic_pci_link_disarm(struct anlogic_pci_hw *hw)
         hw->link_armed = 0;
         return;
     }
+    /* A/B 两路的推帧使能一起关（两路都在往同一块即将释放的内存里写） */
     rv = anlogic_pci_link_write32(hw, ANLOGIC_BAR_CTRL_OFF,
-                                  ctrl & ~ANLOGIC_CTRL_PUSH_EN);
+                                  ctrl & ~(ANLOGIC_CTRL_PUSH_EN |
+                                           ANLOGIC_CTRL_PUSH_EN_B));
     if (rv < 0) {
         pr_warn("链路：卸载时关推帧使能失败 %d。\n", rv);
     } else {
         pr_info("链路：卸载前已关推帧使能（0x44 = 0x%08x），等一帧落地。\n",
-                ctrl & ~ANLOGIC_CTRL_PUSH_EN);
+                ctrl & ~(ANLOGIC_CTRL_PUSH_EN | ANLOGIC_CTRL_PUSH_EN_B));
         msleep(20);
     }
 
@@ -558,7 +612,9 @@ long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
             }
 
             /* 链路初始化所需的位重新置上 + CTRL[2] 翻转一次 = 重跑一遍传感器初始化 */
-            rv = anlogic_pci_link_ctrl_update(hw, ANLOGIC_CTRL_ARM_BITS,
+            rv = anlogic_pci_link_ctrl_update(hw, hw->link_arm_bits ?
+                                              hw->link_arm_bits :
+                                              ANLOGIC_CTRL_ARM_BITS,
                                               ANLOGIC_CTRL_MCLK_SEL, &rt.ctrl);
             if (rv < 0) {
                 pr_err("链路 ioctl：重触发写 0x44 失败 %d。\n", rv);
@@ -679,6 +735,102 @@ long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
             }
             pr_info("链路：推帧目标复核 0x%08x%08x、门铃 0x%08x%08x，"
                     "本次写了 0x%x，push_en=%u。\n",
+                    cfg.dst_hi, cfg.dst_lo, cfg.db_hi, cfg.db_lo, applied,
+                    cfg.push_en);
+        }
+        break;
+
+    case ANLOGIC_IOCPUSHCFGB:
+        {
+            struct anlogic_ioc_push_cfg_b cfg;
+            u32 rb, ctrl;
+            unsigned int applied = 0;
+
+            if (copy_from_user((void *)&cfg, (void __user *)arg, sizeof(cfg))) {
+                pr_err("链路 ioctl：copy_from_user(B 路推帧地址) 失败。\n");
+                return -EFAULT;
+            }
+            if (cfg.flags & ~(ANLOGIC_PUSH_CFG_SET_DST |
+                              ANLOGIC_PUSH_CFG_SET_DB)) {
+                pr_err("链路 ioctl：B 路 flags 0x%x 有不认识的位。\n", cfg.flags);
+                return -EINVAL;
+            }
+
+            if (cfg.flags & ANLOGIC_PUSH_CFG_SET_DST) {
+                rv = anlogic_pci_link_write32(hw,
+                                              ANLOGIC_BAR_PUSH_DST_LO_OFF_B,
+                                              cfg.dst_lo);
+                if (!rv)
+                    rv = anlogic_pci_link_write32(hw,
+                                                  ANLOGIC_BAR_PUSH_DST_HI_OFF_B,
+                                                  cfg.dst_hi);
+                if (rv < 0) {
+                    pr_err("链路 ioctl：写 B 路推帧目标失败 %d。\n", rv);
+                    return rv;
+                }
+                rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_PUSH_DST_LO_OFF_B,
+                                             &rb);
+                if (rv < 0)
+                    return rv;
+                if (rb != cfg.dst_lo) {
+                    pr_err("链路 ioctl：0x100 回读 0x%08x != 写入 0x%08x（老映像"
+                           "没有 B 路推帧寄存器？）。\n", rb, cfg.dst_lo);
+                    return -EIO;
+                }
+                applied |= ANLOGIC_PUSH_CFG_SET_DST;
+            }
+
+            if (cfg.flags & ANLOGIC_PUSH_CFG_SET_DB) {
+                rv = anlogic_pci_link_write32(hw, ANLOGIC_BAR_PUSH_DB_LO_OFF_B,
+                                              cfg.db_lo);
+                if (!rv)
+                    rv = anlogic_pci_link_write32(hw,
+                                                  ANLOGIC_BAR_PUSH_DB_HI_OFF_B,
+                                                  cfg.db_hi);
+                if (rv < 0) {
+                    pr_err("链路 ioctl：写 B 路门铃地址失败 %d。\n", rv);
+                    return rv;
+                }
+                rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_PUSH_DB_LO_OFF_B,
+                                             &rb);
+                if (rv < 0)
+                    return rv;
+                if (rb != cfg.db_lo) {
+                    pr_err("链路 ioctl：0x108 回读 0x%08x != 写入 0x%08x。\n",
+                           rb, cfg.db_lo);
+                    return -EIO;
+                }
+                applied |= ANLOGIC_PUSH_CFG_SET_DB;
+            }
+
+            /* 复核：无论写没写，都把 B 路寄存器现值与使能位读回来给用户态 */
+            rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_PUSH_DST_LO_OFF_B,
+                                         &cfg.dst_lo);
+            if (!rv)
+                rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_PUSH_DST_HI_OFF_B,
+                                             &cfg.dst_hi);
+            if (!rv)
+                rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_PUSH_DB_LO_OFF_B,
+                                             &cfg.db_lo);
+            if (!rv)
+                rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_PUSH_DB_HI_OFF_B,
+                                             &cfg.db_hi);
+            if (!rv)
+                rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_CTRL_OFF, &ctrl);
+            if (rv < 0)
+                return rv;
+
+            cfg.push_en  = (ctrl & ANLOGIC_CTRL_PUSH_EN_B) ? 1u : 0u;
+            cfg.reserved = 0;              /* B 路没有 ERAM 源 */
+            cfg.armed    = hw->link_armed;
+            cfg.applied  = applied;
+
+            if (copy_to_user((void __user *)arg, &cfg, sizeof(cfg))) {
+                pr_err("链路 ioctl：copy_to_user(B 路推帧地址) 失败。\n");
+                return -EFAULT;
+            }
+            pr_info("链路：B 路推帧目标复核 0x%08x%08x、门铃 0x%08x%08x，"
+                    "本次写了 0x%x，push_en_b=%u。\n",
                     cfg.dst_hi, cfg.dst_lo, cfg.db_hi, cfg.db_lo, applied,
                     cfg.push_en);
         }
