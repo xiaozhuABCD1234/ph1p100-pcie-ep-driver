@@ -125,17 +125,27 @@ struct anlogic_pci_hw {
     dma_addr_t frame_phys;
     size_t frame_size;
     struct anlogic_frame_mailbox *frame_mb;   /* = frame_virt + stride*slots（槽区之后的页） */
+    unsigned int frame_mb_off;                /* mailbox 在缓冲内的字节偏移（页对齐） */
     unsigned int frame_stride;                /* 槽位步长（页对齐） */
     unsigned int frame_slot_bytes;            /* 一帧像素字节数 */
     unsigned int frame_hdr_bytes;             /* 槽头字节数 */
     unsigned int frame_slots;                 /* 槽位数 */
     unsigned int frame_width;
     unsigned int frame_height;
+    unsigned int frame_push_done;              /* 推帧门铃已经补到第几帧（0 = 还没补过） */
 
     /*
-     * 生命周期与串行化：fd 打开计数 + mmap 出来的 VMA 计数合在 refs 里。
-     * remove 先置 removed=1，再拿一次 lock 排空在飞的 ioctl/mmap，最后等 refs
-     * 归零才让上层释放 hw 与收帧缓冲（见 anlogic_pci_hw_quiesce）。
+     * 相机链路 / 推帧的武装状态：探测时由 anlogic_pci_link_arm() 写好，
+     * 用户态用上头的三条 ioctl 复核/重设（见 anlogic_pci_link.c）。
+     */
+    u64 link_push_dst;                        /* 0xB0/0xB4 当前值（主机物理地址） */
+    u64 link_push_db;                         /* 0xB8/0xBC 当前值（帧缓冲 mailbox 页里的门铃字） */
+    u32 link_ctrl;                            /* 探测时写进 0x44 的值 */
+    unsigned int link_armed;                  /* 推帧目标/门铃地址与使能位都已就位 */
+
+    /*
+     * 生命周期与串行化：fd 打开的引用计数（mmap 出来的 VMA 不另计数，它在 fd 的
+     * release 之前一直把文件钉着，见 anlogic_pci_hw.c 的说明）。
      */
     struct mutex lock;
     atomic_t removed;
@@ -175,11 +185,11 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev,
                           int *c2h_channel_max);
 void anlogic_pci_hw_close(struct pci_dev *pdev, void *hw);
 
-/* 生命周期：open/release 与 VMA open/close 计数引用，remove 排空后等它归零 */
+/* 生命周期：open/release 计数引用，remove 排空后等它归零（mmap 出来的 VMA 不另计数，
+ * 理由见 anlogic_pci_hw.c 里那段注释） */
 int anlogic_pci_hw_get(struct anlogic_pci_hw *hw);
 void anlogic_pci_hw_put(struct anlogic_pci_hw *hw);
 void anlogic_pci_hw_quiesce(struct anlogic_pci_hw *hw);
-extern const struct vm_operations_struct anlogic_pci_vm_ops;
 
 /* anlogic_pci_chrdev.c */
 int anlogic_pci_chrdev_init(void);
@@ -200,5 +210,11 @@ void anlogic_pci_frame_init(struct anlogic_pci_cdev *cdev);
 
 /* anlogic_pci_ctrl.c */
 void anlogic_pci_ctrl_init(struct anlogic_pci_cdev *cdev);
+
+/* anlogic_pci_link.c（相机链路 / 推帧：探测时武装、状态查询、重触发、地址复核/重设） */
+int anlogic_pci_link_arm(struct anlogic_pci_hw *hw);
+void anlogic_pci_link_disarm(struct anlogic_pci_hw *hw);
+long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
+                            void __user *arg);
 
 #endif /* ANLOGIC_PCI_H */

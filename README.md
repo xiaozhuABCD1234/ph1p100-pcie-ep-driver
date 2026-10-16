@@ -4,6 +4,9 @@
 由厂商 `anlogic_pci` 驱动移植而来，原先只做 PIO 寄存器访问；现在另加了一层「收帧缓冲」
 （dma_alloc_coherent 分配、物理地址/序号经 ioctl 给用户态、FPGA 侧拿它当 MWr 目标），
 真正的收帧等 FPGA 接通后再验。
+探测时驱动还会把「下 bit / 重启之后必须人工补」的三步做完（写 0x44 CTRL 使能位、
+按需重触发一次传感器初始化、把收帧缓冲的 DMA 地址填进推帧目标与门铃寄存器），
+失败只报错不上报 probe 失败，状态与手动重触发由三条链路 ioctl 暴露（见下面）。
 MMIO 访问规约（先读 BAR0+0x40 验 MAGIC、单笔不超过 4 个双字、读到 0xffffffff 立即
 熔断）在两条路径上各自落实：控制节点 `/dev/ANLOGIC-PCI0_control` 的 ioctl 由内核
 `src/anlogic_pci_ctrl.c` 逐笔校验；`/dev/ANLOGIC-PCI0_user` 的 mmap 只放 offset 0 的
@@ -20,9 +23,10 @@ mmap sysfs 的 `resource0`（pci-sysfs 的 mmap 不查资源是否已被驱动 c
 | `src/anlogic_pci_frame.c` | 收帧缓冲层（dma_alloc_coherent 分配/释放、帧就绪轮询、取帧节点的 ioctl 与只读 mmap） |
 | `src/anlogic_pci_chrdev.c` | 字符设备注册层（class / char 区域、节点创建与销毁） |
 | `src/anlogic_pci_ctrl.c` | 控制与用户节点的 file_operations（ioctl、mmap） |
+| `src/anlogic_pci_link.c` | 相机链路 / 推帧：探测时武装（使能位、推帧与门铃地址、按需重触发）、状态查询、手动重触发、地址复核/重设 |
 | `src/anlogic_pci.h` | 驱动内部头（三层共用） |
 | `include/anlogic_pci_ioctl.h` | ioctl 协议，驱动与用户态共用的唯一一份 |
-| `app/rs/` | 用户态（Rust，cargo 工程 `anlogic_pci_tools`，四个 bin）：`cam_grab` 抓帧（PIO）、`frame_grab` 从收帧缓冲取帧、`pci_bar` 单 dw 读写、`pcie_check` 链路自检 |
+| `app/rs/` | 用户态（Rust，cargo 工程 `anlogic_pci_tools`，五个 bin）：`cam_grab` 抓帧（PIO）、`frame_grab` 从收帧缓冲取帧、`link_ctl` 查/改链路与推帧状态、`pci_bar` 单 dw 读写、`pcie_check` 链路自检 |
 
 厂商原始驱动不在本仓库（在 `~/Projects/.archive-ph1p-*/vendor_driver_original/`），
 只在需要对照移植改动时取用，避免两份代码并存分叉。
@@ -65,8 +69,11 @@ mailbox 字段与握手约定写在 `include/anlogic_pci_ioctl.h`（FPGA 侧必�
 缓冲区里槽区在前（槽 n 的 MWr 目标 = `phys_addr + stride*n`，槽头之后才是像素），
 mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `mb_off`，不要按常量猜。
 
-- 规模由 module param 定：`frame_width`（640）/`frame_height`（480）/`frame_slot_bytes`（0 = 宽×高 = 307200）/`frame_slots`（默认 4，多帧余量）；
+- 规模由 module param 定：`frame_width`（640）/`frame_height`（480）/`frame_slot_bytes`（0 = 宽×高 = 307200）/`frame_slots`（默认 1）；
+  默认单槽：推帧引擎只往主机给的那一个目标地址写（驱动探测时写好、不逐帧轮换），多槽下用户态按序号取槽会取到没数据的槽；
 - ioctl：`ANLOGIC_IOCFRAMEINFO` 报物理地址、大小、几何、`mb_off` 与序号/计数；`ANLOGIC_IOCFRAMEWAIT` 等帧（`timeout_ms=0` 只查不等）；
+- 推帧引擎只往门铃写「已推帧数」（不写槽头、不碰 mailbox.seq/count，见 `include/anlogic_pci_ioctl.h`），
+  这三样由驱动在轮询时补齐，所以用户态照旧只读 `mailbox.seq`；
 - 用户态：`./frame_grab --info` 只看缓冲参数，`./frame_grab -o f.pgm` 取最新一帧；
 - FPGA 还没接上时 `mailbox.seq` 恒 0，`frame_grab` 打印「无新帧」并以退出码 4 返回（不写文件）。
 
@@ -80,6 +87,9 @@ mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `
 ./cam_grab -s cam frame.pgm      # 抓一帧 640x480 灰度存 PGM（走 BAR0 的 PIO，慢）
 ./frame_grab --info              # 看收帧缓冲的物理地址/大小/几何/序号，不取帧
 ./frame_grab -o dma_frame.pgm    # 从收帧缓冲取最新一帧存 PGM（FPGA 未接通时退出码 4 = 无新帧）
+./link_ctl                       # 查链路与推帧状态（是否锁/是否武装/已推帧数/错误码/地址）
+./link_ctl retrig -t 2000        # 手动重触发一次相机初始化并等锁定
+./link_ctl push                  # 复核推帧目标与门铃地址（带 --dst-lo/--db-lo 等参数就是重设）
 ```
 
 ## 移植要点（适配内核 7.x 的 API 改动）
@@ -103,4 +113,10 @@ mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `
   `frame_grab` 锁 `_frame`、`pci_bar` 不锁），不是跨工具的一次一个进程；`cam_grab` 与
   `pci_bar` 可以同时跑。驱动侧只用 `hw->lock` 串行化同一实例上的 ioctl/mmap。
 - 单次 MMIO 读不超过 4 dw，只用 32 位对齐访问：FPGA 侧完成包长度未夹紧，长读会静默错数据。
+- 推帧这一路只往一个固定主机地址写：探测时写好 0xB0/0xB4（= 收帧缓冲的 DMA 地址）
+  与 0xB8/0xBC（= 缓冲内 mailbox 页的门铃字），之后不逐帧轮换，所以 `frame_slots` 默认 1。
+  要换地址用 `link_ctl push --dst-lo/--dst-hi/--db-lo/--db-hi`（写了必回读复核）。
+- 链路/推帧的三条 ioctl 都在控制节点上：`ANLOGIC_IOCLINKSTATUS`（查）、
+  `ANLOGIC_IOCLINKRETRIG`（手动重触发传感器初始化）、`ANLOGIC_IOCPUSHCFG`（复核/重设
+  推帧目标与门铃地址）；结构体与位定义都在 `include/anlogic_pci_ioctl.h`。
 - FPGA 热重配置后主机 BAR 全部读回 `0xffffffff`，必须重启 RK3588 重新枚举才能恢复 Gen2 x2。

@@ -106,7 +106,8 @@ pub struct FrameMailbox {
     pub stride: u32,
     pub width: u32,
     pub height: u32,
-    pub reserved: [u32; 8],
+    pub push_dbell: u32,
+    pub reserved: [u32; 7],
 }
 
 /// `struct anlogic_frame_slot_hdr`（16 字节）
@@ -148,6 +149,124 @@ pub struct IocFrameWait {
     pub slot: u32,
 }
 
+// ------------------------------------------------- 相机链路 / 推帧（寄存器层）
+//
+// 对照头文件里那一组 ANLOGIC_BAR_*_OFF 与 CTRL 位定义（表见
+// fpga/rtl/ep_side/img/ep_bar_win.v）。
+
+/// `ANLOGIC_BAR_MAGIC_OFF` / `ANLOGIC_BAR_MAGIC_VAL`
+pub const ANLOGIC_BAR_MAGIC_OFF: u32 = 0x40;
+pub const ANLOGIC_BAR_MAGIC_VAL: u32 = 0x5043_4946;
+/// `ANLOGIC_MMIO_ALL_F`：读到全 F 立即熔断
+pub const ANLOGIC_MMIO_ALL_F: u32 = 0xffff_ffff;
+
+pub const ANLOGIC_BAR_CTRL_OFF: u32 = 0x44;
+pub const ANLOGIC_BAR_FRAME_CNT_OFF: u32 = 0x4C;
+pub const ANLOGIC_BAR_CAM_A_STAT_OFF: u32 = 0x80;
+pub const ANLOGIC_BAR_DDR_SEQ_OFF: u32 = 0xA0;
+pub const ANLOGIC_BAR_DDR_BASE_OFF: u32 = 0xA4;
+pub const ANLOGIC_BAR_DDR_STATUS_OFF: u32 = 0xA8;
+pub const ANLOGIC_BAR_PUSH_DONE_OFF: u32 = 0xC0;
+pub const ANLOGIC_BAR_PUSH_STATUS_OFF: u32 = 0xC4;
+pub const ANLOGIC_BAR_PUSH_ERR_OFF: u32 = 0xC8;
+pub const ANLOGIC_BAR_PUSH_TLP_OFF: u32 = 0xCC;
+
+/// `ANLOGIC_CTRL_*`
+pub const ANLOGIC_CTRL_ENABLE: u32 = 1 << 0;
+pub const ANLOGIC_CTRL_TRIGGER: u32 = 1 << 1;
+pub const ANLOGIC_CTRL_MCLK_SEL: u32 = 1 << 2;
+pub const ANLOGIC_CTRL_CAM_SEL: u32 = 1 << 4;
+pub const ANLOGIC_CTRL_DDR_EN: u32 = 1 << 5;
+pub const ANLOGIC_CTRL_PUSH_EN: u32 = 1 << 6;
+pub const ANLOGIC_CTRL_PUSH_SRC: u32 = 1 << 7;
+
+/// `ANLOGIC_CAM_STAT_LANE_MASK` / `ANLOGIC_CAM_LANE_VALID()` / `ANLOGIC_CAM_LANE_ALL`
+pub const ANLOGIC_CAM_STAT_LANE_MASK: u32 = 0x1e;
+pub const ANLOGIC_CAM_LANE_ALL: u32 = 0xf;
+pub const fn anlogic_cam_lane_valid(stat: u32) -> u32 {
+    (stat & ANLOGIC_CAM_STAT_LANE_MASK) >> 1
+}
+
+/// `ANLOGIC_DDR_STATUS_*`
+pub const ANLOGIC_DDR_STATUS_ALIVE: u32 = 1 << 3;
+pub const ANLOGIC_DDR_STATUS_CAL_DONE: u32 = 1 << 4;
+
+/// `ANLOGIC_PUSH_STATUS_*`
+pub const ANLOGIC_PUSH_STATUS_BUSY: u32 = 1 << 0;
+pub const ANLOGIC_PUSH_STATUS_LAST_OK: u32 = 1 << 1;
+pub const ANLOGIC_PUSH_STATUS_DB_SENT: u32 = 1 << 2;
+
+/// `ANLOGIC_PUSH_ERR_*`（0xC8 的取值）
+pub const ANLOGIC_PUSH_ERR_NAMES: [&str; 5] = [
+    "正常（数据与门铃都发了）",
+    "目标地址未配置（整帧没发）",
+    "等 tl_tx_wait 超时（本帧停发）",
+    "AXI 读响应非 OKAY（本帧停发）",
+    "门铃地址未配置（数据推了、门铃没发）",
+];
+
+/// `struct anlogic_ioc_link_status`（ANLOGIC_IOCLINKSTATUS 的出参）
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IocLinkStatus {
+    pub ctrl: u32,
+    pub frame_cnt: u32,
+    pub cam_stat: u32,
+    pub lane_valid: u32,
+    pub cam_locked: u32,
+    pub ddr_seq: u32,
+    pub ddr_base: u32,
+    pub ddr_status: u32,
+    pub ddr_ready: u32,
+    pub ddr_len: u32,
+    pub pushed: u32,
+    pub push_status: u32,
+    pub push_err: u32,
+    pub push_tlp_cnt: u32,
+    pub push_en: u32,
+    pub push_src: u32,
+    pub armed: u32,
+    pub dst_lo: u32,
+    pub dst_hi: u32,
+    pub db_lo: u32,
+    pub db_hi: u32,
+    pub seq: u32,
+    pub count: u32,
+}
+
+/// `struct anlogic_ioc_link_retrig`（ANLOGIC_IOCLINKRETRIG 的出入参）
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IocLinkRetrig {
+    pub wait_ms: u32,
+    pub ctrl: u32,
+    pub cam_stat: u32,
+    pub lane_valid: u32,
+    pub cam_locked: u32,
+    pub frame_cnt: u32,
+    pub frames_flowing: u32,
+    pub waited_ms: u32,
+}
+
+/// `ANLOGIC_PUSH_CFG_SET_DST` / `ANLOGIC_PUSH_CFG_SET_DB`
+pub const ANLOGIC_PUSH_CFG_SET_DST: u32 = 0x1;
+pub const ANLOGIC_PUSH_CFG_SET_DB: u32 = 0x2;
+
+/// `struct anlogic_ioc_push_cfg`（ANLOGIC_IOCPUSHCFG 的出入参）
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IocPushCfg {
+    pub flags: u32,
+    pub dst_lo: u32,
+    pub dst_hi: u32,
+    pub db_lo: u32,
+    pub db_hi: u32,
+    pub push_en: u32,
+    pub push_src: u32,
+    pub armed: u32,
+    pub applied: u32,
+}
+
 // 全零即「驱动侧还没填」的合法初值；这些都是纯 POD，直接零初始化。
 macro_rules! impl_default_zeroed {
     ($($t:ty),* $(,)?) => { $(
@@ -159,7 +278,8 @@ macro_rules! impl_default_zeroed {
         }
     )* };
 }
-impl_default_zeroed!(IocBase, IocInfo, IocBar, CfgWrite, FrameMailbox, FrameSlotHdr, IocFrame, IocFrameWait);
+impl_default_zeroed!(IocBase, IocInfo, IocBar, CfgWrite, FrameMailbox, FrameSlotHdr, IocFrame, IocFrameWait,
+                     IocLinkStatus, IocLinkRetrig, IocPushCfg);
 
 // 与头文件一致：sizeof 与关键字段偏移必须钉死（缓冲布局算错就会取到错数据）。
 const _: () = {
@@ -193,6 +313,7 @@ const _: () = {
     assert!(std::mem::offset_of!(FrameMailbox, seq) == 4);
     assert!(std::mem::offset_of!(FrameMailbox, count) == 8);
     assert!(std::mem::offset_of!(FrameMailbox, stride) == 20);
+    assert!(std::mem::offset_of!(FrameMailbox, push_dbell) == 32);
     assert!(std::mem::offset_of!(FrameSlotHdr, len) == 4);
     assert!(std::mem::offset_of!(FrameSlotHdr, flags) == 8);
     assert!(std::mem::offset_of!(IocFrame, phys_addr) == 0);
@@ -204,6 +325,18 @@ const _: () = {
     assert!(std::mem::offset_of!(IocFrameWait, last_seq) == 0);
     assert!(std::mem::offset_of!(IocFrameWait, ready) == 16);
     assert!(std::mem::offset_of!(IocFrameWait, slot) == 20);
+    assert!(std::mem::size_of::<IocLinkStatus>() == 92);
+    assert!(std::mem::offset_of!(IocLinkStatus, cam_stat) == 8);
+    assert!(std::mem::offset_of!(IocLinkStatus, pushed) == 40);
+    assert!(std::mem::offset_of!(IocLinkStatus, dst_lo) == 68);
+    assert!(std::mem::offset_of!(IocLinkStatus, seq) == 84);
+    assert!(std::mem::size_of::<IocLinkRetrig>() == 32);
+    assert!(std::mem::offset_of!(IocLinkRetrig, lane_valid) == 12);
+    assert!(std::mem::offset_of!(IocLinkRetrig, frames_flowing) == 24);
+    assert!(std::mem::offset_of!(IocLinkRetrig, waited_ms) == 28);
+    assert!(std::mem::size_of::<IocPushCfg>() == 36);
+    assert!(std::mem::offset_of!(IocPushCfg, db_lo) == 12);
+    assert!(std::mem::offset_of!(IocPushCfg, applied) == 32);
 };
 
 // -------------------------------------------------------------- IOCTL 编号
@@ -221,6 +354,12 @@ pub const ANLOGIC_IOCR: u64 = ioc(IOC_READ, ANLOGIC_IOC_MAGIC, 5, 16);
 pub const ANLOGIC_IOCFRAMEINFO: u64 = ioc(IOC_READ, ANLOGIC_IOC_MAGIC, 10, 56);
 /// `ANLOGIC_IOCFRAMEWAIT = _IOWR(ANLOGIC_IOC_MAGIC, 11, struct anlogic_ioc_frame_wait)`
 pub const ANLOGIC_IOCFRAMEWAIT: u64 = ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, 11, 24);
+/// `ANLOGIC_IOCLINKSTATUS = _IOR(ANLOGIC_IOC_MAGIC, 12, struct anlogic_ioc_link_status)`
+pub const ANLOGIC_IOCLINKSTATUS: u64 = ioc(IOC_READ, ANLOGIC_IOC_MAGIC, 12, 92);
+/// `ANLOGIC_IOCLINKRETRIG = _IOWR(ANLOGIC_IOC_MAGIC, 13, struct anlogic_ioc_link_retrig)`
+pub const ANLOGIC_IOCLINKRETRIG: u64 = ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, 13, 32);
+/// `ANLOGIC_IOCPUSHCFG = _IOWR(ANLOGIC_IOC_MAGIC, 14, struct anlogic_ioc_push_cfg)`
+pub const ANLOGIC_IOCPUSHCFG: u64 = ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, 14, 36);
 
 #[cfg(test)]
 mod tests {
@@ -234,5 +373,8 @@ mod tests {
         assert_eq!(ANLOGIC_IOCR, 0x8010_7805);
         assert_eq!(ANLOGIC_IOCFRAMEINFO, 0x8038_780a);
         assert_eq!(ANLOGIC_IOCFRAMEWAIT, 0xc018_780b);
+        assert_eq!(ANLOGIC_IOCLINKSTATUS, 0x805c_780c);
+        assert_eq!(ANLOGIC_IOCLINKRETRIG, 0xc020_780d);
+        assert_eq!(ANLOGIC_IOCPUSHCFG, 0xc024_780e);
     }
 }

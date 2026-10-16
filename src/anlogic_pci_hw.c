@@ -657,6 +657,17 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev,
     if (rv < 0)
         goto err_interrupts;
 
+    /*
+     * 相机链路 / 推帧的武装：下 bit 或重启之后 FPGA 里一切归零，这一段把以前靠
+     * 人工补的初始化步骤（使能位、推帧/门铃地址、按需重触发传感器）做完。
+     * 失败**不**让 probe 失败：老 FPGA 映像没有这组寄存器，硬失败会让驱动装不上；
+     * 它自己会把原因打全，并把 armed 留在 0，用户态可用 ANLOGIC_IOCLINKSTATUS 查。
+     */
+    rv = anlogic_pci_link_arm(hw);
+    if (rv < 0)
+        pr_err("链路：探测时武装失败 %d，驱动继续加载（用 ioctl 看状态、重试）。\n",
+               rv);
+
     /* 把实际生效的参数回传给上层 */
     *user_max = hw->user_max;
     *h2c_channel_max = hw->h2c_channel_max;
@@ -701,6 +712,8 @@ void anlogic_pci_hw_close(struct pci_dev *pdev, void *dev_hndl)
     anlogic_pci_irq_teardown(hw);
     anlogic_pci_disable_msi_msix(hw, pdev);
     anlogic_pci_remove_engines(hw);
+    /* 先让 FPGA 别再往这块缓冲推帧，再释放（否则 MWr 会打进已经被复用的内存） */
+    anlogic_pci_link_disarm(hw);
     anlogic_pci_frame_free(hw);
     anlogic_pci_unmap_bars(hw, pdev);
 
@@ -715,14 +728,20 @@ void anlogic_pci_hw_close(struct pci_dev *pdev, void *dev_hndl)
  * 生命周期与串行化（修「收帧节点 fd/映射与卸载脱钩」与「驱动全程无锁」）：
  *
  *   - open 一个节点时用 hw_get() 增引用；hw->removed 置后一律拒绝新的取用；
- *   - release 与 VMA 的 open/close 减引用；
+ *   - 等 fd 的 release（hw_put）减引用；
  *   - remove 调 hw_quiesce()：先置 removed，再拿一次 hw->lock 排空正在跑的
  *     ioctl/mmap（它们在入口看到 removed 会尽快返回），最后等引用归零才让上层
- *     释放 hw、BAR 映射与收帧缓冲。
+ *     释放 hw、BAR 映射与收帧缓冲。等帧 ioctl 最长睡 600 s，每轮都看 removed。
  *
- * 引用同时覆盖 fd 与 mmap 出来的 VMA：mmap 必须由已打开的 fd 发起，fd 没关之前
- * 引用不会归零，所以「mmap fop 返回」到「内核调用 vm_ops->open」之间没有窗口，
- * VMA 的引用不会漏计。等帧 ioctl 最长睡 600 s，它每轮都会看 removed 并提前退出。
+ * 引用只用 fd 数，mmap 出来的 VMA 不另计数（这里踩过坑，写清楚）：VMA 是由一个
+ * 已打开的 fd mmap 出来的，内核把它钉在 vm_file 上（mmap_region 里 get_file），
+ * fd 的 release（本层的 hw_put）要等最后一个 VMA 也消失才会被调用 —— 所以
+ * refs==0 本身就意味着「既没有开着的 fd、也没有活着的映射」。
+ * 反过来「在 vm_ops->open/close 里加一减一」是错的：内核只在 fork/split 时替
+ * **新** VMA 调 vm_ops->open（mm/mmap.c 的 dup_mmap、mm/vma.c 的 split），首次
+ * mmap 出来的那个 VMA 只会拿到一次 vm_ops->close（remove_vma），而且 mmap 失败
+ * 后的回退路径也走 remove_vma —— 两个方向都不配对。实测：一次 frame_grab 取帧
+ * 就把 refs 减成了 -1，rmmod 卡在 hw_quiesce 里出不来。
  */
 int anlogic_pci_hw_get(struct anlogic_pci_hw *hw)
 {
@@ -745,32 +764,19 @@ void anlogic_pci_hw_put(struct anlogic_pci_hw *hw)
 {
     if (!hw)
         return;
-    if (atomic_dec_and_test(&hw->refs))
-        wake_up_all(&hw->refs_wait);
-}
 
-static void anlogic_pci_vma_open(struct vm_area_struct *vma)
-{
-    struct anlogic_pci_hw *hw = vma->vm_private_data;
-
-    if (hw)
-        atomic_inc(&hw->refs);
-}
-
-static void anlogic_pci_vma_close(struct vm_area_struct *vma)
-{
-    struct anlogic_pci_hw *hw = vma->vm_private_data;
-
-    if (!hw)
+    /*
+     * 计账严格配对：put 比 get 多一次，refs 就会变成负数，而 quiesce 等的是
+     * 「引用归零」，负数再也回不到 0（见下面 quiesce 里为什么这里必须拦住）。
+     * 这里当场告警并把这一笔多余的 put 丢掉：多出来的 put 只丢一个引用，不会把
+     * 卸载路径钉死；告警栈能指出是哪条路径多减了。
+     */
+    if (WARN_ON_ONCE(atomic_read(&hw->refs) <= 0))
         return;
+
     if (atomic_dec_and_test(&hw->refs))
         wake_up_all(&hw->refs_wait);
 }
-
-const struct vm_operations_struct anlogic_pci_vm_ops = {
-    .open = anlogic_pci_vma_open,
-    .close = anlogic_pci_vma_close,
-};
 
 void anlogic_pci_hw_quiesce(struct anlogic_pci_hw *hw)
 {
@@ -786,8 +792,19 @@ void anlogic_pci_hw_quiesce(struct anlogic_pci_hw *hw)
     mutex_unlock(&hw->lock);
 
     refs = atomic_read(&hw->refs);
-    if (refs)
+    if (refs > 0)
         pr_info("hw 0x%p: wait for %d user reference(s) before teardown.\n",
                 hw, refs);
-    wait_event(hw->refs_wait, atomic_read(&hw->refs) == 0);
+
+    /*
+     * 这是卸载路径上唯一的等待点，也是上一版把 rmmod 卡死的地方：
+     *   wait_event() 是**不可中断**的，等不到的判据会让 rmmod 永久停在 D 状态，
+     *   连 SIGKILL 都杀不掉 —— 关机时 systemd 一直报「Waiting for process: rmmod」。
+     * 判据写成 <= 0 而不是 == 0：正常路径上引用只会从 1 减到 0（上面 hw_put 已经
+     * 拦住多减），两种写法等价；万一将来又有人把计数减成负数，这里也只会放行卸载，
+     * 不会再等一个永远不为 0 的条件。
+     * 引用归零 = 既没有开着的 fd、也没有活着的映射（VMA 钉着 vm_file，fd 的 release
+     * 要等最后一个 VMA 消失才跑），所以此时的等待不会漏掉任何还在访问 hw 的用户。
+     */
+    wait_event(hw->refs_wait, atomic_read(&hw->refs) <= 0);
 }

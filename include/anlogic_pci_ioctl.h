@@ -87,7 +87,7 @@ typedef struct cfgwrite {
  * FPGA 侧的 MWr 目标 = phys_addr + stride * 槽位号（0..slots-1），像素从槽头之后开始；
  * ioctl 把 mb_off 一并报给用户态，用户态靠它定位 mailbox（不要自己按固定偏移猜）。
  *
- * 握手约定（驱动只读、不写这些字段，只在分配时填描述符）：
+ * 握手约定：
  *   - 驱动分配完就把 magic/slot_bytes/slots/stride/width/height 写进 mailbox，
  *     FPGA 可以先读它拿几何参数；magic == ANLOGIC_FRAME_MAGIC 才算有效。
  *     magic 必须是最后一笔写，且前面用屏障挡开（写到 DRAM 必须可见才算就绪）。
@@ -99,6 +99,15 @@ typedef struct cfgwrite {
  *     没有 MSI，所以这一层不做中断；FPGA 没接上时 seq 恒 0 →「无新帧」。
  *   - 槽区布局在驱动加载后固定不变：slot_bytes / slots / stride 不随帧变化，FPGA
  *     不要自行换算 stride，一律用 ioctl 报出来的 mb_off 与 stride。
+ *
+ * 本板推帧通路的实际分工（与上面那套约定的差异，按 FPGA 侧现状写实）：
+ *   推帧引擎（fpga/rtl/ep_side/ddr/ddr_frame_pusher.v）只把整帧 MWr 到主机给的
+ *   目标地址（0xB0/0xB4），**不写槽头、也不碰 mailbox.seq/count**；它只在推完
+ *   一帧后往门铃地址（0xB8/0xBC）单独写一个 dw，内容是本帧的已推帧数（1 起）。
+ *   所以那三项由驱动在看门铃时补齐：门铃写进 mailbox 页里的 push_dbell 字，
+ *   驱动见到它变大就把对应槽的槽头、mailbox.seq/count 一并写好，用户态照旧
+ *   只轮询 mailbox.seq。推帧目标地址是固定的一块（推帧引擎不做逐帧轮换），
+ *   因此多槽下只有槽 0 会收到推来的帧 —— frame_slots 默认取 1。
  */
 #define ANLOGIC_FRAME_MAGIC     0x4D524641u   /* 小端字节序为 'A','F','R','M' */
 
@@ -109,20 +118,21 @@ typedef struct cfgwrite {
 
 struct anlogic_frame_mailbox {
     unsigned int magic;        /* 驱动写 ANLOGIC_FRAME_MAGIC：本描述符有效 */
-    unsigned int seq;          /* FPGA 写：已完成帧的序号，每帧 +1，从 1 起；0 = 还没帧 */
-    unsigned int count;        /* FPGA 写：累计完成帧数（单调 +1，用来分辨序号回绕） */
+    unsigned int seq;          /* 已完成帧的序号，每帧 +1，从 1 起；0 = 还没帧 */
+    unsigned int count;        /* 累计完成帧数（单调 +1，用来分辨序号回绕） */
     unsigned int slot_bytes;   /* 一帧像素字节数 */
     unsigned int slots;        /* 槽位数 */
     unsigned int stride;       /* 槽位步长（字节，页对齐） */
     unsigned int width;        /* 每帧宽度（像素） */
     unsigned int height;       /* 每帧高度（像素） */
-    unsigned int reserved[8];  /* 补齐到 64 字节 */
+    unsigned int push_dbell;   /* 推帧门铃：EP 写本帧的已推帧数（1 起），驱动见它变大就补 seq/count/槽头 */
+    unsigned int reserved[7];  /* 补齐到 64 字节 */
 };
 
 struct anlogic_frame_slot_hdr {
-    unsigned int seq;          /* FPGA 写：本槽是第几帧，取帧时要与 mailbox.seq 核对 */
-    unsigned int len;          /* FPGA 写：本槽有效像素字节数（≤ slot_bytes） */
-    unsigned int flags;        /* FPGA 写：ANLOGIC_FRAME_FLAG_COMPLETE 表示整帧完整 */
+    unsigned int seq;          /* 本槽是第几帧，取帧时要与 mailbox.seq 核对 */
+    unsigned int len;          /* 本槽有效像素字节数（≤ slot_bytes） */
+    unsigned int flags;        /* ANLOGIC_FRAME_FLAG_COMPLETE 表示整帧完整 */
     unsigned int reserved;
 };
 
@@ -161,6 +171,157 @@ struct anlogic_ioc_frame_wait {
 /* 读取到全 F 即视为设备已不可用（PCIe 链路断开/复位），两侧都立即熔断 */
 #define ANLOGIC_MMIO_ALL_F      0xffffffffu
 
+/*
+ * BAR0 寄存器窗里「相机链路 / 推帧」用到的偏移与位定义，表见
+ * fpga/rtl/ep_side/img/ep_bar_win.v 头部那张寄存器表（驱动与用户态共用这一份，
+ * 用户态解码状态字时按这里的位定义解，别在工具里另抄一套）。
+ */
+#define ANLOGIC_BAR_CTRL_OFF        0x44u   /* CTRL：bit 定义见下 */
+#define ANLOGIC_BAR_FRAME_CNT_OFF   0x4Cu   /* 帧缓存已完成帧数 */
+#define ANLOGIC_BAR_CAM_A_STAT_OFF  0x80u   /* A 路相机状态字（帧缓存写源就是 A 路） */
+#define ANLOGIC_BAR_CAM_B_STAT_OFF  0x84u   /* B 路相机状态字 */
+#define ANLOGIC_BAR_DDR_SEQ_OFF     0xA0u   /* 已整帧落 DDR3 的帧号 */
+#define ANLOGIC_BAR_DDR_BASE_OFF    0xA4u   /* 该帧在 DDR3 里的字节基址 */
+#define ANLOGIC_BAR_DDR_STATUS_OFF  0xA8u   /* DDR 握手状态 */
+#define ANLOGIC_BAR_DDR_LEN_OFF     0xACu   /* 每帧字节数 */
+#define ANLOGIC_BAR_PUSH_DST_LO_OFF 0xB0u   /* 推帧目标地址低 32 位 */
+#define ANLOGIC_BAR_PUSH_DST_HI_OFF 0xB4u   /* 推帧目标地址高 32 位 */
+#define ANLOGIC_BAR_PUSH_DB_LO_OFF  0xB8u   /* 门铃地址低 32 位 */
+#define ANLOGIC_BAR_PUSH_DB_HI_OFF  0xBCu   /* 门铃地址高 32 位 */
+#define ANLOGIC_BAR_PUSH_DONE_OFF   0xC0u   /* 已推帧数（1 起） */
+#define ANLOGIC_BAR_PUSH_STATUS_OFF 0xC4u   /* 推帧状态 */
+#define ANLOGIC_BAR_PUSH_ERR_OFF    0xC8u   /* 最近一次推帧错误码 */
+#define ANLOGIC_BAR_PUSH_TLP_OFF    0xCCu   /* 最近一帧发出的 MWr 数（正常 2400） */
+
+/* 本驱动要读写的寄存器里偏移最大的那个（+1），用来判 BAR0 映射长度够不够 */
+#define ANLOGIC_BAR_LINK_WIN_END    (ANLOGIC_BAR_PUSH_TLP_OFF + 4u)
+
+/* CTRL（0x44）位定义 */
+#define ANLOGIC_CTRL_ENABLE     0x00000001u  /* bit0  总使能 */
+#define ANLOGIC_CTRL_TRIGGER    0x00000002u  /* bit1  单帧触发（自清，测试图源用） */
+#define ANLOGIC_CTRL_MCLK_SEL   0x00000004u  /* bit2  电平一变就重跑一次传感器初始化（xclr 拉放 + 201 条表） */
+#define ANLOGIC_CTRL_CAM_SEL    0x00000010u  /* bit4  帧缓存写源：1 = 相机，0 = 测试图 */
+#define ANLOGIC_CTRL_DDR_EN     0x00000020u  /* bit5  每完成一帧自动搬进 DDR3 */
+#define ANLOGIC_CTRL_PUSH_EN    0x00000040u  /* bit6  每有一帧就用 MWr 推给主机 */
+#define ANLOGIC_CTRL_PUSH_SRC   0x00000080u  /* bit7  推帧数据源：0 = DDR3，1 = 片内 ERAM */
+
+/*
+ * 探测时武装链路的位：总使能 + 相机写源 + DDR 搬运 + 推帧，bit7 保持 0。
+ * bit7=0 是必须的：DDR3 那一帧才是「相机 → DDR → 主机」这条链路的中间站，
+ * 片内 ERAM 源会与 DDR 搬运抢帧缓存唯一的读口（见 ep_bar_win.v 的说明）。
+ * bit2 不在里面：它是重触发电平，由驱动按当前值就地翻转（见 anlogic_pci_link.c）。
+ */
+#define ANLOGIC_CTRL_ARM_BITS   (ANLOGIC_CTRL_ENABLE | ANLOGIC_CTRL_CAM_SEL | \
+                                 ANLOGIC_CTRL_DDR_EN | ANLOGIC_CTRL_PUSH_EN)
+
+/* A 路相机状态字（0x80）里的 lane_valid：bit[4:1]，非 0 = MIPI 链路已锁 */
+#define ANLOGIC_CAM_STAT_LANE_SHIFT     1u
+#define ANLOGIC_CAM_STAT_LANE_MASK      0x0000001eu
+#define ANLOGIC_CAM_STAT_BCLK_RUNNING   0x00000001u
+#define ANLOGIC_CAM_STAT_CFG_DONE       0x00000020u
+#define ANLOGIC_CAM_STAT_BUS_ERR        0x00000040u
+
+#define ANLOGIC_CAM_LANE_VALID(stat) \
+    (((stat) & ANLOGIC_CAM_STAT_LANE_MASK) >> ANLOGIC_CAM_STAT_LANE_SHIFT)
+
+/* DDR 握手状态（0xA8）位定义 */
+#define ANLOGIC_DDR_STATUS_VALID    0x00000001u
+#define ANLOGIC_DDR_STATUS_BUSY     0x00000002u
+#define ANLOGIC_DDR_STATUS_ERR      0x00000004u
+#define ANLOGIC_DDR_STATUS_ALIVE    0x00000008u
+#define ANLOGIC_DDR_STATUS_CAL_DONE 0x00000010u
+
+/* 推帧状态（0xC4）位定义；[31:16] 是累计错误数 */
+#define ANLOGIC_PUSH_STATUS_BUSY        0x00000001u
+#define ANLOGIC_PUSH_STATUS_LAST_OK     0x00000002u
+#define ANLOGIC_PUSH_STATUS_DB_SENT     0x00000004u
+#define ANLOGIC_PUSH_STATUS_DDR_ALIVE   0x00000008u
+#define ANLOGIC_PUSH_STATUS_DDR_CAL     0x00000010u
+
+/* 推帧错误码（0xC8） */
+#define ANLOGIC_PUSH_ERR_NONE       0u  /* 正常：数据与门铃都发了 */
+#define ANLOGIC_PUSH_ERR_NO_DST     1u  /* 目标地址未配置 */
+#define ANLOGIC_PUSH_ERR_WAIT_TO    2u  /* 等 tl_tx_wait 超时 */
+#define ANLOGIC_PUSH_ERR_AXI        3u  /* AXI 读响应非 OKAY */
+#define ANLOGIC_PUSH_ERR_NO_DB      4u  /* 门铃地址未配置（数据推了、门铃没发） */
+
+/*
+ * 相机链路 / 推帧的状态查询（ANLOGIC_IOCLINKSTATUS，只读）。
+ * 字段全部来自 BAR0 寄存器（先过 0x40 MAGIC 门禁、读到全 F 立即熔断）与探测时
+ * 记下的武装结果；任何一项读失败就整个 ioctl 返回 -EIO，不做「部分成功」。
+ */
+struct anlogic_ioc_link_status {
+    unsigned int ctrl;          /* 0x44 读回 */
+    unsigned int frame_cnt;     /* 0x4C 帧缓存已完成帧数 */
+    unsigned int cam_stat;      /* 0x80 A 路状态字原始值 */
+    unsigned int lane_valid;    /* cam_stat[4:1] */
+    unsigned int cam_locked;    /* 1 = lane_valid != 0（MIPI 链路已锁） */
+    unsigned int ddr_seq;       /* 0xA0 */
+    unsigned int ddr_base;      /* 0xA4 */
+    unsigned int ddr_status;    /* 0xA8 原始值 */
+    unsigned int ddr_ready;     /* 1 = alive && cal_done（DDR3 可用） */
+    unsigned int ddr_len;       /* 0xAC 每次搬进 DDR3 的字节数 */
+    unsigned int pushed;        /* 0xC0 已推帧数（1 起） */
+    unsigned int push_status;   /* 0xC4 原始值 */
+    unsigned int push_err;      /* 0xC8 最近一次推帧错误码 */
+    unsigned int push_tlp_cnt;  /* 0xCC 最近一帧发出的 MWr 数（正常 2400） */
+    unsigned int push_en;       /* 1 = CTRL bit6 已置位（推帧使能） */
+    unsigned int push_src;      /* CTRL bit7（0 = 从 DDR3 推，1 = 从片内 ERAM 推） */
+    unsigned int armed;         /* 1 = 推帧目标/门铃地址与使能位都已由驱动写好 */
+    unsigned int dst_lo;        /* 0xB0 推帧目标地址低 32 位 */
+    unsigned int dst_hi;        /* 0xB4 推帧目标地址高 32 位 */
+    unsigned int db_lo;         /* 0xB8 门铃地址低 32 位 */
+    unsigned int db_hi;         /* 0xBC 门铃地址高 32 位 */
+    unsigned int seq;           /* mailbox.seq（驱动补齐后的已完成帧号） */
+    unsigned int count;         /* mailbox.count */
+};
+
+/*
+ * 手动重新触发一次相机初始化（ANLOGIC_IOCLINKRETRIG，链路掉了之后恢复用）。
+ * 语义 = 把 CTRL 的武装位重新置上、并把 bit2 翻转一次（电平一变，顶层就重走
+ * xclr 拉低 → 放开 → 重写整张 201 条寄存器表，见 ph1p_pcie_ep_top.v 的相机段）。
+ * wait_ms = 0 表示只触发不等结果；> 0 表示最多等这么久，等「四路 lane 全对齐」
+ * 或「帧计数开始动」（两者满足一个就算起来了，实测 lane 全部对齐要几秒，中间可能
+ * 掉回 0，只看 lane_valid 非 0 会把正在恢复的状态误判成已锁定）。
+ * frame_cnt / frames_flowing 是等待结束时 0x4C 的读数与它相对开始等时是否变过。
+ */
+struct anlogic_ioc_link_retrig {
+    unsigned int wait_ms;         /* in  触发后最多等多久（0 = 不等，上限 ANLOGIC_LINK_MAX_WAIT_MS） */
+    unsigned int ctrl;            /* out 触发后 0x44 读回 */
+    unsigned int cam_stat;        /* out 触发后 0x80 读回 */
+    unsigned int lane_valid;      /* out lane_valid（等完之后的实际值） */
+    unsigned int cam_locked;      /* out 1 = lane_valid != 0 */
+    unsigned int frame_cnt;       /* out 等完之后的 0x4C 帧计数 */
+    unsigned int frames_flowing;  /* out 1 = 帧计数相对开始等时变过（帧已经在出） */
+    unsigned int waited_ms;       /* out 实际等了多久 */
+};
+
+#define ANLOGIC_LINK_MAX_WAIT_MS    5000u
+
+/* lane_valid 四条 lane 全对齐的取值 */
+#define ANLOGIC_CAM_LANE_ALL        0xfu
+
+/* 重设推帧目标/门铃地址时至少给一个（flags 位） */
+#define ANLOGIC_PUSH_CFG_SET_DST    0x1u
+#define ANLOGIC_PUSH_CFG_SET_DB     0x2u
+
+/*
+ * 复核 / 重设推帧目标与门铃地址（ANLOGIC_IOCPUSHCFG）。
+ * flags = 0 只复核（out 字段填当前寄存器读回值）；置了 SET_ 位才写对应地址，
+ * 写完必读回复核，读回与写入不一致时返回 -EIO。
+ */
+struct anlogic_ioc_push_cfg {
+    unsigned int flags;         /* in  ANLOGIC_PUSH_CFG_SET_* 的组合，0 = 只复核 */
+    unsigned int dst_lo;        /* in/out 推帧目标地址低 32 位（SET_DST 时按 in 用） */
+    unsigned int dst_hi;        /* in/out 推帧目标地址高 32 位 */
+    unsigned int db_lo;         /* in/out 门铃地址低 32 位（SET_DB 时按 in 用） */
+    unsigned int db_hi;         /* in/out 门铃地址高 32 位 */
+    unsigned int push_en;       /* out CTRL bit6 */
+    unsigned int push_src;      /* out CTRL bit7 */
+    unsigned int armed;         /* out 1 = 驱动已武装 */
+    unsigned int applied;       /* out 本次真正写进去的相关位 */
+};
+
 /* IOCTL codes */
 #define ANLOGIC_IOCINFO         _IOWR(ANLOGIC_IOC_MAGIC, ANLOGIC_IOC_INFO, struct anlogic_ioc_info)
 #define ANLOGIC_IOCOFFLINE      _IO(ANLOGIC_IOC_MAGIC, ANLOGIC_IOC_OFFLINE)
@@ -173,5 +334,8 @@ struct anlogic_ioc_frame_wait {
 #define ANLOGIC_IOCCFGR         _IOR(ANLOGIC_IOC_MAGIC, 9, unsigned int)
 #define ANLOGIC_IOCFRAMEINFO    _IOR(ANLOGIC_IOC_MAGIC, 10, struct anlogic_ioc_frame)
 #define ANLOGIC_IOCFRAMEWAIT    _IOWR(ANLOGIC_IOC_MAGIC, 11, struct anlogic_ioc_frame_wait)
+#define ANLOGIC_IOCLINKSTATUS   _IOR(ANLOGIC_IOC_MAGIC, 12, struct anlogic_ioc_link_status)
+#define ANLOGIC_IOCLINKRETRIG   _IOWR(ANLOGIC_IOC_MAGIC, 13, struct anlogic_ioc_link_retrig)
+#define ANLOGIC_IOCPUSHCFG      _IOWR(ANLOGIC_IOC_MAGIC, 14, struct anlogic_ioc_push_cfg)
 
 #endif /* ANLOGIC_PCI_IOCTL_H */

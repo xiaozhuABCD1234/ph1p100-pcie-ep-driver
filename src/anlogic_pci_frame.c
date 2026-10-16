@@ -6,12 +6,16 @@
  * 本层只做「缓冲 + 接口」，真正的收帧等 FPGA 侧打通后再验：
  *
  *   1) 分配：dma_alloc_coherent 一块物理连续、页对齐的一致性内存，大小由
- *      module param 决定（默认 4 槽 × 640x480 灰度 = 307200 字节/槽，留多帧余量）。
- *      每槽步长页对齐，FPGA 只要拿 phys_addr + stride * n 就能当 MWr 目标。
+ *      module param 决定（默认 1 槽 × 640x480 灰度 = 307200 字节/槽）。
+ *      每槽步长页对齐，推帧目标按 phys_addr + stride * n 算。
  *   2) 接口：ANLOGIC_IOCFRAMEINFO 把物理地址、大小、几何与序号/计数报给用户态；
  *      ANLOGIC_IOCFRAMEWAIT 提供「帧就绪」轮询（序号 + 计数）—— 本 EP 目前只有
  *      Legacy 中断、没有 MSI，所以不做中断，只轮询邮箱。
- *   3) 释放：模块卸载（hw_close）与 probe 出错路径都经 anlogic_pci_frame_free()，
+ *   3) 推帧门铃：FPGA 推帧引擎只往门铃字写「已推帧数」，不写槽头、不碰
+ *      mailbox.seq/count（见 include/anlogic_pci_ioctl.h 的说明）。所以本层在
+ *      轮询时盯的是门铃字，见到它变大就把对应槽的槽头与 mailbox.seq/count 补齐
+ *      —— 用户态（frame_grab）照旧只读 mailbox.seq，协议面不变。
+ *   4) 释放：模块卸载（hw_close）与 probe 出错路径都经 anlogic_pci_frame_free()，
  *      保证 dma_free_coherent 一定被调用。
  *
  * 内存布局与握手约定写在 include/anlogic_pci_ioctl.h（驱动/用户态/FPGA 三方共用）。
@@ -39,8 +43,12 @@
 /* 一帧的默认几何：640x480 灰度 = 307200 字节 */
 #define ANLOGIC_FRAME_DEF_WIDTH     640u
 #define ANLOGIC_FRAME_DEF_HEIGHT    480u
-/* 默认 4 槽：一帧在搬、一帧在写、一帧给用户态取，另外留一槽余量 */
-#define ANLOGIC_FRAME_DEF_SLOTS     4u
+/*
+ * 默认单槽。推帧引擎只往主机给的那一个目标地址写（0xB0/0xB4 由驱动探测时写好、
+ * 之后不逐帧轮换），所以帧永远落在同一个槽里；多槽下用户态按 (seq-1)%slots 取槽
+ * 会取到没数据的槽。要跑别的路径（PIO 0x60 / 只读 DDR3）时可以用 frame_slots 开多槽。
+ */
+#define ANLOGIC_FRAME_DEF_SLOTS     1u
 /* 轮询间隔，也是「等帧」时的睡眠粒度 */
 #define ANLOGIC_FRAME_POLL_MS       10u
 /* 一帧像素字节数的合理上限，防止 module param 写出荒唐的分配量 */
@@ -62,7 +70,8 @@ MODULE_PARM_DESC(frame_slot_bytes, "一帧像素字节数，0 = frame_width*fram
 
 static unsigned int frame_slots = ANLOGIC_FRAME_DEF_SLOTS;
 module_param(frame_slots, uint, 0444);
-MODULE_PARM_DESC(frame_slots, "收帧缓冲的槽位数（1..16），默认 4（多帧余量）");
+MODULE_PARM_DESC(frame_slots,
+                 "收帧缓冲的槽位数（1..16），默认 1（推帧目标固定，多槽只有槽 0 有推来的帧）");
 
 /*
  * mailbox 与槽头的字段偏移是 FPGA / 驱动 / 用户态三方共用的 ABI，偏移算错的话
@@ -90,6 +99,51 @@ static void anlogic_pci_frame_seq_read(struct anlogic_pci_hw *hw, u32 *seq,
     *seq = READ_ONCE(hw->frame_mb->seq);
     dma_rmb();
     *count = READ_ONCE(hw->frame_mb->count);
+}
+
+/*
+ * 推帧门铃 → mailbox 协议的补齐（见 include/anlogic_pci_ioctl.h 里「本板推帧通路的
+ * 实际分工」那段）：门铃字装的是 FPGA 侧的「已推帧数」（1 起、每帧 +1）；驱动见到它
+ * 比上次大了，就
+ *   ① 把新帧的槽头（seq/len/flags）写进该帧所在的槽，
+ *   ② 跟上 mailbox.count，
+ *   ③ **最后**才更新 mailbox.seq —— 与头文件里给 FPGA 定的是同一个顺序：
+ *      用户态看到序号变化时，槽头一定已经在内存里了（序号是最后一笔写）。
+ * 推帧目标地址由驱动在探测时写好且不逐帧轮换，所以推来的帧都在同一个槽里；
+ * frame_slots 默认 1，(done-1)%slots 恒为 0。
+ * 读门铃用 READ_ONCE + dma_rmb()：先看到门铃，再去看它标记的那一帧。
+ */
+static void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
+{
+    struct anlogic_frame_mailbox *mb = hw->frame_mb;
+    struct anlogic_frame_slot_hdr *hdr;
+    unsigned int slot;
+    u32 done;
+
+    if (!mb || !hw->frame_slots || !hw->frame_stride)
+        return;
+
+    done = READ_ONCE(mb->push_dbell);
+    dma_rmb();
+    if (!done || done == hw->frame_push_done)
+        return;
+
+    slot = (done - 1) % hw->frame_slots;
+    hdr = (struct anlogic_frame_slot_hdr *)((u8 *)hw->frame_virt +
+                                            (size_t)slot * hw->frame_stride);
+    WRITE_ONCE(hdr->seq, done);
+    WRITE_ONCE(hdr->len, hw->frame_slot_bytes);
+    WRITE_ONCE(hdr->flags, ANLOGIC_FRAME_FLAG_COMPLETE);
+    WRITE_ONCE(hdr->reserved, 0);
+    dma_wmb();
+    WRITE_ONCE(mb->count, done);
+    dma_wmb();
+    WRITE_ONCE(mb->seq, done);
+    dma_wmb();
+    hw->frame_push_done = done;
+
+    pr_debug("收帧缓冲：门铃 %u，补齐槽 %u 的槽头与 mailbox.seq/count。\n",
+             done, slot);
 }
 
 /*
@@ -167,8 +221,9 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     memset(hw->frame_virt, 0, size);
 
     /* mailbox 放在槽区之后的一整页里，与槽区不重叠（见头文件的布局说明） */
+    hw->frame_mb_off = (unsigned int)((size_t)stride * slots);
     hw->frame_mb = (struct anlogic_frame_mailbox *)((u8 *)hw->frame_virt +
-                                                   (size_t)stride * slots);
+                                                   hw->frame_mb_off);
     hw->frame_size = size;
     hw->frame_stride = stride;
     hw->frame_slot_bytes = slot_bytes;
@@ -180,6 +235,7 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     mb = hw->frame_mb;
     mb->seq = 0;
     mb->count = 0;
+    mb->push_dbell = 0;
     mb->slot_bytes = slot_bytes;
     mb->slots = slots;
     mb->stride = stride;
@@ -211,12 +267,14 @@ void anlogic_pci_frame_free(struct anlogic_pci_hw *hw)
 
     hw->frame_virt = NULL;
     hw->frame_mb = NULL;
+    hw->frame_mb_off = 0;
     hw->frame_phys = 0;
     hw->frame_size = 0;
     hw->frame_stride = 0;
     hw->frame_slot_bytes = 0;
     hw->frame_hdr_bytes = 0;
     hw->frame_slots = 0;
+    hw->frame_push_done = 0;
     hw->frame_width = 0;
     hw->frame_height = 0;
 }
@@ -226,6 +284,8 @@ static void anlogic_pci_frame_fill_info(struct anlogic_pci_hw *hw,
 {
     u32 seq, count;
 
+    /* 先把 FPGA 推来的帧补进 mailbox（门铃驱动的协议补齐），再报给用户态 */
+    anlogic_pci_frame_push_sync(hw);
     anlogic_pci_frame_seq_read(hw, &seq, &count);
 
     memset(info, 0, sizeof(*info));
@@ -239,7 +299,7 @@ static void anlogic_pci_frame_fill_info(struct anlogic_pci_hw *hw,
     info->height = hw->frame_height;
     info->seq = seq;
     info->count = count;
-    info->mb_off = (unsigned int)((u8 *)hw->frame_mb - (u8 *)hw->frame_virt);
+    info->mb_off = hw->frame_mb_off;
 }
 
 /*
@@ -261,6 +321,7 @@ static long anlogic_pci_frame_wait(struct anlogic_pci_hw *hw,
             rv = -ENODEV;
             break;
         }
+        anlogic_pci_frame_push_sync(hw);
         anlogic_pci_frame_seq_read(hw, &seq, &count);
         if (seq != arg->last_seq) {
             arg->ready = 1;
@@ -411,10 +472,11 @@ static int anlogic_pci_frame_mmap(struct file *file, struct vm_area_struct *vma)
         goto out_unlock;
     }
 
-    /* 卸载时等这条映射关闭（vm_ops->close 减引用） */
-    vma->vm_ops = &anlogic_pci_vm_ops;
-    vma->vm_private_data = hw;
-
+    /*
+     * 映射完成后就不再需要 vm_ops：这块内存的引用已经由文件引用链盖住
+     * （VMA 钉着 vm_file，fd 的 release 等最后一个 VMA 消失才跑），
+     * 在 vm_ops->close 里再减一次计数会把引用数减成负数（见 hw.c 的说明）。
+     */
     rv = dma_mmap_coherent(&hw->pdev->dev, vma, hw->frame_virt,
                            hw->frame_phys, hw->frame_size);
     if (rv) {

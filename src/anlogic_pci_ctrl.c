@@ -4,8 +4,9 @@
  *
  * 控制节点与用户 BAR 窗口节点共用这里的 file_operations：ioctl 单 dw / 批量读写、
  * 配置空间读写，以及把 BAR 映射给用户态的 mmap。
- * （收帧缓冲节点的 ioctl/mmap 在 anlogic_pci_frame.c；控制节点的 switch 里只是
- * 把两条收帧命令转发过去，方便只开一个节点也能问到缓冲物理地址与序号。）
+ * （收帧缓冲的 ioctl/mmap 在 anlogic_pci_frame.c，相机链路/推帧的三条命令在
+ * anlogic_pci_link.c；控制节点的 switch 里只是把这几条转发过去，方便只开一个
+ * 节点也能问到缓冲地址、链路状态与推帧武装情况。）
  *
  * 本文件是控制/用户 BAR 节点上用户态可控 MMIO 的入口。ioctl 这条路径逐条实现
  * 下面这些访问校验（先读 BAR0+0x40 验 MAGIC、单笔不超过 4 个双字、读到
@@ -402,6 +403,15 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
     case ANLOGIC_IOCFRAMEWAIT:
         return anlogic_pci_frame_ioctl(cdev, cmd, (void __user *)arg);
 
+    /*
+     * 相机链路 / 推帧的三条命令（实现在 anlogic_pci_link.c，同样只做转发）：
+     * 查状态、手动重触发传感器初始化、复核/重设推帧目标与门铃地址。
+     */
+    case ANLOGIC_IOCLINKSTATUS:
+    case ANLOGIC_IOCLINKRETRIG:
+    case ANLOGIC_IOCPUSHCFG:
+        return anlogic_pci_link_ioctl(cdev, cmd, (void __user *)arg);
+
     default:
         pr_err("UNKNOWN ioctl cmd 0x%x.\n", cmd);
         return -ENOTTY;
@@ -470,12 +480,11 @@ static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
     /*
      * MMIO 页不能按 cache line 访问 EP，所以映射成 noncached；
      * 同时防止这些页被换入换出或被 dump。
-     * vm_ops 的 open/close 计引用，卸载时等这条映射关闭。
+     * 这里不挂 vm_ops：映射的引用由文件引用链盖住（VMA 钉着 vm_file，fd 的
+     * release 等最后一个 VMA 消失才跑），挂 vm_ops 再减计数会把引用减成负数。
      */
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
     vm_flags_set(vma, ANLOGIC_PCI_VMEM_FLAGS);
-    vma->vm_ops = &anlogic_pci_vm_ops;
-    vma->vm_private_data = hw;
 
     rv = io_remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT,
                             vsize, vma->vm_page_prot);
