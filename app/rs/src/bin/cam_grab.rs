@@ -868,9 +868,9 @@ fn run() -> i32 {
     let h = height;
     let pat_bits = ctrl & CTRL_PAT_MASK; // 写 CTRL 必须带上 [3:2]，见 ep_bar_win.v:157-161
     /*
-     * 写 CTRL 会把整个字覆盖，而 [7:5] 是驱动探测时武装好的位（bit5 = 每帧搬进 DDR3、
+     * 写 CTRL 会把整个字覆盖，而 [7:5] 是驱动探测时初始化好的位（bit5 = 每帧搬进 DDR3、
      * bit6 = 推帧给主机、bit7 = 推帧源）。本工具只改「写源」相关的位，上面那三位
-     * 一律照原样带回去 —— 否则跑一次 cam_grab 就把链路武装拆了，又得人工补。
+     * 一律照原样带回去 —— 否则跑一次 cam_grab 就把链路的初始化拆了，又得人工补。
      */
     let keep_bits = ctrl & !(CTRL_ENABLE | CTRL_TRIGGER | CTRL_CAM_SEL | CTRL_PAT_MASK);
 

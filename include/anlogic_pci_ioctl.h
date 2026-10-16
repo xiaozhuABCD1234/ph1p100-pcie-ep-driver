@@ -208,7 +208,7 @@ struct anlogic_ioc_frame_wait {
 #define ANLOGIC_CTRL_PUSH_SRC   0x00000080u  /* bit7  推帧数据源：0 = DDR3，1 = 片内 ERAM */
 
 /*
- * 探测时武装链路的位：总使能 + 相机写源 + DDR 搬运 + 推帧，bit7 保持 0。
+ * 探测时初始化链路的位：总使能 + 相机写源 + DDR 搬运 + 推帧，bit7 保持 0。
  * bit7=0 是必须的：DDR3 那一帧才是「相机 → DDR → 主机」这条链路的中间站，
  * 片内 ERAM 源会与 DDR 搬运抢帧缓存唯一的读口（见 ep_bar_win.v 的说明）。
  * bit2 不在里面：它是重触发电平，由驱动按当前值就地翻转（见 anlogic_pci_link.c）。
@@ -250,7 +250,7 @@ struct anlogic_ioc_frame_wait {
 /*
  * 相机链路 / 推帧的状态查询（ANLOGIC_IOCLINKSTATUS，只读）。
  * 字段全部来自 BAR0 寄存器（先过 0x40 MAGIC 门禁、读到全 F 立即熔断）与探测时
- * 记下的武装结果；任何一项读失败就整个 ioctl 返回 -EIO，不做「部分成功」。
+ * 记下的初始化结果；任何一项读失败就整个 ioctl 返回 -EIO，不做「部分成功」。
  */
 struct anlogic_ioc_link_status {
     unsigned int ctrl;          /* 0x44 读回 */
@@ -280,7 +280,7 @@ struct anlogic_ioc_link_status {
 
 /*
  * 手动重新触发一次相机初始化（ANLOGIC_IOCLINKRETRIG，链路掉了之后恢复用）。
- * 语义 = 把 CTRL 的武装位重新置上、并把 bit2 翻转一次（电平一变，顶层就重走
+ * 语义 = 把链路初始化用的 CTRL 位重新置上、并把 bit2 翻转一次（电平一变，顶层就重走
  * xclr 拉低 → 放开 → 重写整张 201 条寄存器表，见 ph1p_pcie_ep_top.v 的相机段）。
  * wait_ms = 0 表示只触发不等结果；> 0 表示最多等这么久，等「四路 lane 全对齐」
  * 或「帧计数开始动」（两者满足一个就算起来了，实测 lane 全部对齐要几秒，中间可能
@@ -320,7 +320,7 @@ struct anlogic_ioc_push_cfg {
     unsigned int db_hi;         /* in/out 门铃地址高 32 位 */
     unsigned int push_en;       /* out CTRL bit6 */
     unsigned int push_src;      /* out CTRL bit7 */
-    unsigned int armed;         /* out 1 = 驱动已武装 */
+    unsigned int armed;         /* out 1 = 驱动已初始化 */
     unsigned int applied;       /* out 本次真正写进去的相关位 */
 };
 

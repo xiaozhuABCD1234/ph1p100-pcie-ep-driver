@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Anlogic PH1P100 PCIe 端点（RK3588 主机侧）驱动：相机链路 / 推帧的武装与状态。
+ * Anlogic PH1P100 PCIe 端点（RK3588 主机侧）驱动：相机链路 / 推帧的初始化与状态。
  *
  * 为什么要有这一层：FPGA 每次重新配置（下 bit）或主机每次重启之后，EP 里所有
  * 寄存器都归零，链路要人工做三件事才通 ——
@@ -19,7 +19,7 @@
  * 读之前先读 0x40 验 MAGIC，读到 0xffffffff 立即熔断返回 -EIO，单笔只做 32 位对齐
  * 访问。写之前也验一次 MAGIC —— 设备已经不响应时不要把控制位写进别的窗口。
  *
- * 失败处理：探测时的武装失败**不让 probe 失败**（老 FPGA 映像里没有这组寄存器，
+ * 失败处理：探测时的初始化失败**不让 probe 失败**（老 FPGA 映像里没有这组寄存器，
  * 硬失败会让驱动装不上），但一定 pr_err 打全，并把 armed 留在 0，用户态可由
  * ANLOGIC_IOCLINKSTATUS 看出卡在哪一步、再用另外两条 ioctl 重试。
  */
@@ -204,7 +204,7 @@ static int anlogic_pci_link_wait_up(struct anlogic_pci_hw *hw,
     return 0;
 }
 
-/* 探测成功时那一行状态：链路是否锁、推帧是否已武装、目标地址 */
+/* 探测成功时那一行状态：链路是否锁、推帧是否已初始化、目标地址 */
 static void anlogic_pci_link_print(const struct anlogic_pci_hw *hw, u32 cam_stat,
                                    int armed, u32 pushed, u32 ddr_status,
                                    u32 ddr_seq)
@@ -215,7 +215,7 @@ static void anlogic_pci_link_print(const struct anlogic_pci_hw *hw, u32 cam_stat
             "推帧 %s、目标 0x%llx、门铃 0x%llx、DDR3 %s（状态字 0x%08x，已落 %u 帧）、"
             "已推 %u 帧。\n",
             lane ? "已锁" : "未锁", lane, cam_stat,
-            armed ? "已武装" : "**未武装**",
+            armed ? "已初始化" : "**未初始化**",
             (unsigned long long)hw->link_push_dst,
             (unsigned long long)hw->link_push_db,
             ((ddr_status & ANLOGIC_DDR_STATUS_ALIVE) &&
@@ -224,7 +224,7 @@ static void anlogic_pci_link_print(const struct anlogic_pci_hw *hw, u32 cam_stat
 }
 
 /*
- * 探测时的武装：MAGIC 门禁 → 推帧/门铃地址 → CTRL 使能位 → 按需重触发 → 打印状态。
+ * 探测时的初始化：MAGIC 门禁 → 推帧/门铃地址 → CTRL 使能位 → 按需重触发 → 打印状态。
  *
  * 为什么地址写在使能位**之前**：使能位一置上，推帧引擎遇到下一帧就按寄存器里当前的
  * 地址推。重装驱动时那几个地址寄存器还是上一次加载留下的旧值（那块缓冲已经还给内核
@@ -250,7 +250,7 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
 
     /* 收帧缓冲必须先分配好：推帧目标就是它，门铃字也在它里面 */
     if (!hw->frame_virt || !hw->frame_mb) {
-        pr_err("链路：收帧缓冲还没分配好，无法武装推帧（先看收帧缓冲的报错）。\n");
+        pr_err("链路：收帧缓冲还没分配好，无法初始化推帧（先看收帧缓冲的报错）。\n");
         return -EINVAL;
     }
 
@@ -284,7 +284,7 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
     if (!rv)
         rv = anlogic_pci_link_write32(hw, ANLOGIC_BAR_PUSH_DB_HI_OFF, db_hi);
     if (rv < 0) {
-        pr_err("链路：写推帧目标/门铃地址失败 %d，武装中断。\n", rv);
+        pr_err("链路：写推帧目标/门铃地址失败 %d，初始化中断。\n", rv);
         return rv;
     }
 
@@ -315,11 +315,11 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
      */
     rv = anlogic_pci_link_ctrl_update(hw, ANLOGIC_CTRL_ARM_BITS, 0, &ctrl);
     if (rv < 0) {
-        pr_err("链路：写 0x44 CTRL 失败 %d，武装中断。\n", rv);
+        pr_err("链路：写 0x44 CTRL 失败 %d，初始化中断。\n", rv);
         return rv;
     }
     if ((ctrl & ANLOGIC_CTRL_ARM_BITS) != ANLOGIC_CTRL_ARM_BITS) {
-        pr_err("链路：0x44 回读 0x%08x 里使能位没置全（要 0x%08x），武装中断。\n",
+        pr_err("链路：0x44 回读 0x%08x 里使能位没置全（要 0x%08x），初始化中断。\n",
                ctrl, ANLOGIC_CTRL_ARM_BITS);
         return -EIO;
     }
@@ -557,7 +557,7 @@ long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
                 return -EINVAL;
             }
 
-            /* 武装位重新置上 + CTRL[2] 翻转一次 = 重跑一遍传感器初始化 */
+            /* 链路初始化所需的位重新置上 + CTRL[2] 翻转一次 = 重跑一遍传感器初始化 */
             rv = anlogic_pci_link_ctrl_update(hw, ANLOGIC_CTRL_ARM_BITS,
                                               ANLOGIC_CTRL_MCLK_SEL, &rt.ctrl);
             if (rv < 0) {
@@ -624,7 +624,7 @@ long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
                            rb, cfg.dst_lo);
                     return -EIO;
                 }
-                /* 只有当两个地址都写进同一片缓冲里，驱动才算「已武装」 */
+                /* 只有当两个地址都写进同一片缓冲里，驱动才算「已初始化」 */
                 applied |= ANLOGIC_PUSH_CFG_SET_DST;
                 hw->link_push_dst = ((u64)cfg.dst_hi << 32) | cfg.dst_lo;
             }

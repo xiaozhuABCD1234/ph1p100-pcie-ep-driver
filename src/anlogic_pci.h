@@ -135,7 +135,7 @@ struct anlogic_pci_hw {
     unsigned int frame_push_done;              /* 推帧门铃已经补到第几帧（0 = 还没补过） */
 
     /*
-     * 相机链路 / 推帧的武装状态：探测时由 anlogic_pci_link_arm() 写好，
+     * 相机链路 / 推帧的初始化状态：探测时由 anlogic_pci_link_arm() 写好，
      * 用户态用上头的三条 ioctl 复核/重设（见 anlogic_pci_link.c）。
      */
     u64 link_push_dst;                        /* 0xB0/0xB4 当前值（主机物理地址） */
@@ -211,7 +211,7 @@ void anlogic_pci_frame_init(struct anlogic_pci_cdev *cdev);
 /* anlogic_pci_ctrl.c */
 void anlogic_pci_ctrl_init(struct anlogic_pci_cdev *cdev);
 
-/* anlogic_pci_link.c（相机链路 / 推帧：探测时武装、状态查询、重触发、地址复核/重设） */
+/* anlogic_pci_link.c（相机链路 / 推帧：探测时初始化、状态查询、重触发、地址复核/重设） */
 int anlogic_pci_link_arm(struct anlogic_pci_hw *hw);
 void anlogic_pci_link_disarm(struct anlogic_pci_hw *hw);
 long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,

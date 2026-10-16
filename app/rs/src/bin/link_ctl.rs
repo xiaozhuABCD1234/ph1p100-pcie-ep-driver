@@ -28,11 +28,11 @@
  *   -h             用法
  *
  * 退出码：
- *   0 正常（链路已锁、推帧已武装、最近一次推帧无错、DDR3 就绪）
+ *   0 正常（链路已锁、推帧已初始化、最近一次推帧无错、DDR3 就绪）
  *   1 命令行用法错误
  *   2 设备不可用（open/ioctl 失败）
  *   3 相机链路未锁（lane_valid==0）
- *   4 推帧未武装（CTRL bit6 没置位）
+ *   4 推帧未初始化（CTRL bit6 没置位）
  *   5 推帧最近一次报错（0xC8 != 0）或 DDR3 未就绪
  */
 use std::ffi::c_void;
@@ -62,7 +62,7 @@ const EX_NOT_ARMED: i32 = 4;
 const EX_PUSH_ERR: i32 = 5;
 
 const EXIT_HELP: &str =
-    "退出码：0 正常，1 用法，2 设备不可用，3 链路未锁，4 推帧未武装，5 推帧报错/DDR 未就绪";
+    "退出码：0 正常，1 用法，2 设备不可用，3 链路未锁，4 推帧未初始化，5 推帧报错/DDR 未就绪";
 
 /// 一条 64 位地址按「低 32 位在前」拼回来（寄存器里就是 lo/hi 两个字）
 fn addr64(lo: u32, hi: u32) -> u64 {
@@ -128,7 +128,7 @@ fn print_status(st: &IocLinkStatus, quiet: bool) {
     );
     println!(
         "推帧    : {}  0xC0 已推 {} 帧，最近一帧 {} 笔 MWr，0xC4=0x{:08x}（busy={} last_ok={} 门铃已发={}）",
-        if st.push_en != 0 { "已武装（CTRL bit6=1）" } else { "**未武装**（CTRL bit6=0）" },
+        if st.push_en != 0 { "已初始化（CTRL bit6=1）" } else { "**未初始化**（CTRL bit6=0）" },
         st.pushed,
         st.push_tlp_cnt,
         st.push_status,
@@ -179,9 +179,9 @@ fn print_status(st: &IocLinkStatus, quiet: bool) {
         st.db_lo,
         st.db_hi,
         if st.armed != 0 {
-            "（驱动探测时武装过）"
+            "（驱动探测时初始化过）"
         } else {
-            "（驱动没武装成——看 dmesg 里驱动的报错）"
+            "（驱动没初始化成——看 dmesg 里驱动的报错）"
         }
     );
 }
@@ -221,7 +221,7 @@ fn print_push_cfg(cfg: &IocPushCfg) {
         cfg.db_hi
     );
     println!(
-        "本次写入: {}（applied=0x{:x}）  推帧使能={}  推帧源={}  驱动武装过={}",
+        "本次写入: {}（applied=0x{:x}）  推帧使能={}  推帧源={}  驱动初始化过={}",
         if cfg.applied == 0 { "无（只复核）" } else { "已写并回读复核通过" },
         cfg.applied,
         cfg.push_en,
@@ -229,7 +229,7 @@ fn print_push_cfg(cfg: &IocPushCfg) {
         cfg.armed
     );
     if cfg.applied != 0 && cfg.armed == 0 {
-        eprintln!("!! 注意：地址写进去了，但驱动记的武装状态是「没成」——看 dmesg 里驱动报的错。");
+        eprintln!("!! 注意：地址写进去了，但驱动记的初始化状态是「没成」——看 dmesg 里驱动报的错。");
     }
 }
 
@@ -481,7 +481,7 @@ fn run() -> i32 {
     }
     if st.push_en == 0 || st.armed == 0 {
         eprintln!(
-            "!! 推帧没武装（CTRL bit6={}、驱动武装过={}）",
+            "!! 推帧没初始化（CTRL bit6={}、驱动初始化过={}）",
             bit(st.ctrl, ANLOGIC_CTRL_PUSH_EN),
             st.armed
         );

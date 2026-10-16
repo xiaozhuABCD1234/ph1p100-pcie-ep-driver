@@ -658,14 +658,14 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev,
         goto err_interrupts;
 
     /*
-     * 相机链路 / 推帧的武装：下 bit 或重启之后 FPGA 里一切归零，这一段把以前靠
+     * 相机链路 / 推帧的初始化：下 bit 或重启之后 FPGA 里一切归零，这一段把以前靠
      * 人工补的初始化步骤（使能位、推帧/门铃地址、按需重触发传感器）做完。
      * 失败**不**让 probe 失败：老 FPGA 映像没有这组寄存器，硬失败会让驱动装不上；
      * 它自己会把原因打全，并把 armed 留在 0，用户态可用 ANLOGIC_IOCLINKSTATUS 查。
      */
     rv = anlogic_pci_link_arm(hw);
     if (rv < 0)
-        pr_err("链路：探测时武装失败 %d，驱动继续加载（用 ioctl 看状态、重试）。\n",
+        pr_err("链路：探测时初始化失败 %d，驱动继续加载（用 ioctl 看状态、重试）。\n",
                rv);
 
     /* 把实际生效的参数回传给上层 */

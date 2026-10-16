@@ -23,7 +23,7 @@ mmap sysfs 的 `resource0`（pci-sysfs 的 mmap 不查资源是否已被驱动 c
 | `src/anlogic_pci_frame.c` | 收帧缓冲层（dma_alloc_coherent 分配/释放、帧就绪轮询、取帧节点的 ioctl 与只读 mmap） |
 | `src/anlogic_pci_chrdev.c` | 字符设备注册层（class / char 区域、节点创建与销毁） |
 | `src/anlogic_pci_ctrl.c` | 控制与用户节点的 file_operations（ioctl、mmap） |
-| `src/anlogic_pci_link.c` | 相机链路 / 推帧：探测时武装（使能位、推帧与门铃地址、按需重触发）、状态查询、手动重触发、地址复核/重设 |
+| `src/anlogic_pci_link.c` | 相机链路 / 推帧：探测时初始化（使能位、推帧与门铃地址、按需重触发）、状态查询、手动重触发、地址复核/重设 |
 | `src/anlogic_pci.h` | 驱动内部头（三层共用） |
 | `include/anlogic_pci_ioctl.h` | ioctl 协议，驱动与用户态共用的唯一一份 |
 | `app/rs/` | 用户态（Rust，cargo 工程 `anlogic_pci_tools`，五个 bin）：`cam_grab` 抓帧（PIO）、`frame_grab` 从收帧缓冲取帧、`link_ctl` 查/改链路与推帧状态、`pci_bar` 单 dw 读写、`pcie_check` 链路自检 |
@@ -59,6 +59,32 @@ rmmod anlogic_pci
 节点：`/dev/ANLOGIC-PCI0_control`（控制/寄存器）、`/dev/ANLOGIC-PCI0_user`（用户 BAR 窗口，本板 = BAR2）、
 `/dev/ANLOGIC-PCI0_frame`（收帧缓冲，只读 mmap + 帧就绪 ioctl）。
 
+### 装到板子上（要覆盖掉厂商版，不能只 insmod）
+
+这块板子的 rootfs 里**已经预装了一个厂商版 `anlogic_pci.ko`**，位置是
+`/usr/lib/modules/$(uname -r)/updates/`。它带同样的 PCI ID 别名，所以开机时会被
+自动加载，把手动 `insmod` 的移植版静默顶掉 —— 表现是**相机通路整个不可用**，
+但不会报任何错。
+
+症状：三个节点里只出现 `_control` 和 `_user`，**没有 `/dev/ANLOGIC-PCI0_frame`**
+（收帧缓冲不分配、推帧也不初始化）；`lsmod` 里 size 显示 36864。
+
+判别手上这个 `.ko` 是哪个版本：
+
+```sh
+lsmod | grep anlogic_pci                       # 36864 = 厂商版，45056 = 移植版
+strings anlogic_pci.ko | grep -c create_xcdev  # 厂商版 4，移植版 0
+```
+
+所以装到板子上要覆盖那个路径并 `depmod`，而不是只把文件拷到某个目录再 `insmod`：
+
+```sh
+cp anlogic_pci.ko /usr/lib/modules/$(uname -r)/updates/
+depmod -a
+rmmod anlogic_pci && modprobe anlogic_pci      # 之后开机就是这个版本了
+ls /dev/ANLOGIC-PCI0_*                         # 必须出现 _frame，否则还是厂商版
+```
+
 ## 收帧缓冲（DMA）
 
 驱动用 `dma_alloc_coherent` 分配一块物理连续、页对齐的缓冲给 FPGA 当 MWr 目标，内存布局、
@@ -78,6 +104,36 @@ mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `
 - 用户态：`./frame_grab --info` 只看缓冲参数，`./frame_grab -o f.pgm` 取最新一帧；
 - FPGA 还没接上时 `mailbox.seq` 恒 0，`frame_grab` 打印「无新帧」并以退出码 4 返回（不写文件）。
 
+## 收 4K（相机整帧直通 DDR3）
+
+FPGA 侧新增了「相机 4K 整帧直通 DDR3」这条路（见 `fpga/README.md`），主机侧只需把收帧
+缓冲按 4K 分配，其余代码不动 —— 几何、物理地址、门铃都由探测时那套 ioctl 报出来：
+
+```sh
+insmod anlogic_pci.ko frame_width=3840 frame_height=2160 frame_slots=1
+# frame_slot_bytes 留 0 ⇒ 用 width*height = 8294400 字节/槽
+ls /dev/ANLOGIC-PCI0_frame            # 必须出现，否则还是厂商版驱动（见上）
+./frame_grab --info                   # 应为 3840x2160、slot_bytes=8294400
+./frame_grab -o f.pgm                 # 8.29MB PGM
+```
+
+要点与限制：
+
+- **一帧 8294400 字节来自一次 `dma_alloc_coherent`**：8MB 级的一致性分配在 RK3588 上
+  要求 CMA 够大（`dmesg | grep -i cma`）。分配失败会在 probe 里打印
+  `dma_alloc_coherent(...) 失败`，dmesg 里一眼能看到。
+- **`frame_slots` 必须留 1**：FPGA 的推帧引擎只往主机给的那一个目标地址写
+  （探测时填的槽 0 像素区起点），多槽只有槽 0 会收到帧。
+- 驱动侧不用区分 640×480 / 4K：`mailbox.width/height/slot_bytes` 与
+  `ANLOGIC_IOCFRAMEINFO` 都是按 module param 算出来的，用户态照旧只轮询
+  `mailbox.seq`。`ANLOGIC_FRAME_MAX_SLOT_BYTES` 是 64MiB，4K 远在上限之内。
+- **推帧引擎的每帧字节数现在由 FPGA 侧现算**（640×480 与 4K 共用一份 RTL），所以
+  「驱动报的几何」和「FPGA 里那一帧的字节数」必须一致：4K 直通时是 3840×2160 的
+  8294400，老通路（fb[]→DDR3）是 640×480 的 307200。两者都必须是 4KB 的整数倍
+  （307200 = 75×4096、8294400 = 2025×4096）—— 换别的几何时这条要自己保证。
+- 4K 帧率目前仍受传感器限制（约 14.5fps，见 `fpga/README.md`），
+  所以 PCIe/DDR 都不是瓶颈；取一帧 PGM 8.29MB，`frame_grab` 写文件本身也要点时间。
+
 ## 最小用法
 
 ```sh
@@ -88,7 +144,7 @@ mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `
 ./cam_grab -s cam frame.pgm      # 抓一帧 640x480 灰度存 PGM（走 BAR0 的 PIO，慢）
 ./frame_grab --info              # 看收帧缓冲的物理地址/大小/几何/序号，不取帧
 ./frame_grab -o dma_frame.pgm    # 从收帧缓冲取最新一帧存 PGM（FPGA 未接通时退出码 4 = 无新帧）
-./link_ctl                       # 查链路与推帧状态（是否锁/是否武装/已推帧数/错误码/地址）
+./link_ctl                       # 查链路与推帧状态（是否锁/是否初始化/已推帧数/错误码/地址）
 ./link_ctl retrig -t 2000        # 手动重触发一次相机初始化并等锁定
 ./link_ctl push                  # 复核推帧目标与门铃地址（带 --dst-lo/--db-lo 等参数就是重设）
 ```
