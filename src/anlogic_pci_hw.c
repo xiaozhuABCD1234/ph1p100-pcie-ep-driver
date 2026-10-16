@@ -10,6 +10,7 @@
  */
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/idr.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -17,6 +18,9 @@
 #include <linux/string.h>
 
 #include "anlogic_pci.h"
+
+/* 每个探测成功的实例拿一个全局唯一的编号（节点名与通道名前缀用它） */
+static DEFINE_IDA(anlogic_pci_instance_ida);
 
 /* 0 = MSI-X，1 = MSI（默认），2 = Legacy */
 static unsigned int interrupt_mode = 1;
@@ -110,16 +114,26 @@ static int anlogic_pci_enable_msi_msix(struct anlogic_pci_hw *hw,
         pr_info("Enabling MSI-X\n");
         rv = pci_alloc_irq_vectors(pdev, req_nvec, req_nvec, PCI_IRQ_MSIX);
         pr_info("PCI alloc irq: %d vector\n", rv);
-        if (rv < 0)
-            pr_err("Couldn't enable MSI-X mode: %d\n", rv);
-        hw->msix_enabled = 1;
+        if (rv < 0) {
+            /* 分配失败不置标志，明确回落到 legacy，不把负值往外抛 */
+            pr_err("Couldn't enable MSI-X mode: %d, fall back to legacy\n",
+                   rv);
+            hw->msix_enabled = 0;
+            rv = 0;
+        } else {
+            hw->msix_enabled = 1;
+        }
     } else if (interrupt_mode == 1 &&
                anlogic_pci_msi_msix_capable(pdev, PCI_CAP_ID_MSI)) {
         pr_info("pci_enable_msi()\n");
         rv = pci_enable_msi(pdev);
-        if (rv < 0)
-            pr_err("Couldn't enable MSI mode: %d\n", rv);
-        hw->msi_enabled = 1;
+        if (rv < 0) {
+            pr_err("Couldn't enable MSI mode: %d, fall back to legacy\n", rv);
+            hw->msi_enabled = 0;
+            rv = 0;
+        } else {
+            hw->msi_enabled = 1;
+        }
     } else {
         pr_info("MSI/MSI-X not detected - using legacy interrupts\n");
     }
@@ -153,6 +167,7 @@ static int anlogic_pci_irq_msix_channel_setup(struct anlogic_pci_hw *hw)
             return rv;
         }
         engine->msix_irq_line = vector;
+        engine->irq_registered = 1;
         pr_info("engine %s, irq#%d.\n", engine->name, vector);
     }
 
@@ -167,6 +182,7 @@ static int anlogic_pci_irq_msix_channel_setup(struct anlogic_pci_hw *hw)
             return rv;
         }
         engine->msix_irq_line = vector;
+        engine->irq_registered = 1;
         pr_info("engine %s, irq#%d.\n", engine->name, vector);
     }
 
@@ -184,20 +200,22 @@ static void anlogic_pci_irq_msix_channel_teardown(struct anlogic_pci_hw *hw)
 
     engine = hw->engine_h2c;
     for (i = 0; i < hw->h2c_channel_max; i++, engine++) {
-        if (!engine->msix_irq_line)
-            break;
+        if (!engine->irq_registered)
+            continue;
         pr_debug("Release IRQ#%d for engine %p\n", engine->msix_irq_line,
                  engine);
         free_irq(engine->msix_irq_line, engine);
+        engine->irq_registered = 0;
     }
 
     engine = hw->engine_c2h;
     for (i = 0; i < hw->c2h_channel_max; i++, engine++) {
-        if (!engine->msix_irq_line)
-            break;
+        if (!engine->irq_registered)
+            continue;
         pr_debug("Release IRQ#%d for engine %p\n", engine->msix_irq_line,
                  engine);
         free_irq(engine->msix_irq_line, engine);
+        engine->irq_registered = 0;
     }
 }
 
@@ -206,14 +224,17 @@ static int anlogic_pci_irq_msi_setup(struct anlogic_pci_hw *hw,
 {
     int rv;
 
-    hw->irq_line = (int)pdev->irq;
+    /* 申请成功之后才写 irq_line；失败保持 -1，teardown 也就不会去 free */
     rv = request_irq(pdev->irq, anlogic_pci_isr, 0, hw->mod_name, hw);
-    if (rv)
+    if (rv) {
         pr_info("Couldn't use IRQ#%d, %d\n", pdev->irq, rv);
-    else
-        pr_info("Using IRQ#%d with 0x%p\n", pdev->irq, hw);
+        return rv;
+    }
+    hw->irq_line = (int)pdev->irq;
+    hw->irq_registered = 1;
+    pr_info("Using IRQ#%d with 0x%p\n", pdev->irq, hw);
 
-    return rv;
+    return 0;
 }
 
 static int anlogic_pci_irq_legacy_setup(struct anlogic_pci_hw *hw,
@@ -221,12 +242,14 @@ static int anlogic_pci_irq_legacy_setup(struct anlogic_pci_hw *hw,
 {
     int rv;
 
-    hw->irq_line = (int)pdev->irq;
     rv = request_irq(pdev->irq, anlogic_pci_isr, IRQF_SHARED, hw->mod_name, hw);
-    if (rv)
+    if (rv) {
         pr_info("Couldn't use IRQ#%d, %d\n", pdev->irq, rv);
-    else
-        pr_info("Using IRQ#%d with 0x%p\n", pdev->irq, hw);
+        return rv;
+    }
+    hw->irq_line = (int)pdev->irq;
+    hw->irq_registered = 1;
+    pr_info("Using IRQ#%d with 0x%p\n", pdev->irq, hw);
 
     return 0;
 }
@@ -235,9 +258,11 @@ static void anlogic_pci_irq_teardown(struct anlogic_pci_hw *hw)
 {
     if (hw->msix_enabled) {
         anlogic_pci_irq_msix_channel_teardown(hw);
-    } else if (hw->irq_line != -1) {
+    } else if (hw->irq_registered) {
         pr_info("Releasing IRQ#%d\n", hw->irq_line);
         free_irq(hw->irq_line, hw);
+        hw->irq_registered = 0;
+        hw->irq_line = -1;
     }
 }
 
@@ -266,7 +291,7 @@ static irqreturn_t anlogic_pci_channel_irq(int irq, void *dev_id)
     pr_debug("(irq=%d) <<<< INTERRUPT service ROUTINE\n", irq);
 
     if (engine && engine->hw)
-        engine->hw->irq_count++;
+        atomic_inc(&engine->hw->irq_count);
 
     return IRQ_HANDLED;
 }
@@ -279,7 +304,7 @@ static irqreturn_t anlogic_pci_isr(int irq, void *dev_id)
     pr_debug("(irq=%d, dev 0x%p) <<<< ISR.\n", irq, dev_id);
 
     if (hw)
-        hw->irq_count++;
+        atomic_inc(&hw->irq_count);
 
     return IRQ_HANDLED;
 }
@@ -316,6 +341,7 @@ static void anlogic_pci_unmap_bars(struct anlogic_pci_hw *hw,
         if (hw->bar[i]) {
             pci_iounmap(dev, hw->bar[i]);
             hw->bar[i] = NULL;
+            hw->bar_map_len[i] = 0;
         }
     }
 }
@@ -332,6 +358,7 @@ static int anlogic_pci_map_bar(struct anlogic_pci_hw *hw, struct pci_dev *dev,
     map_len = bar_len;
 
     hw->bar[idx] = NULL;
+    hw->bar_map_len[idx] = 0;
 
     /* 长度为 0 的 BAR 不映射（start 允许是 0） */
     if (!bar_len) {
@@ -350,6 +377,8 @@ static int anlogic_pci_map_bar(struct anlogic_pci_hw *hw, struct pci_dev *dev,
         pr_info("Could not map BAR %d.\n", idx);
         return -1;
     }
+    /* 边界校验一律用这个实际映射长度，而不是 pci_resource_len() */
+    hw->bar_map_len[idx] = map_len;
 
     pr_info("BAR%d at 0x%llx mapped at 0x%p, length=%llu(/%llu)\n", idx,
             (u64)bar_start, hw->bar[idx], (u64)map_len, (u64)bar_len);
@@ -555,6 +584,20 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev,
     hw->h2c_channel_max = *h2c_channel_max;
     hw->c2h_channel_max = *c2h_channel_max;
 
+    mutex_init(&hw->lock);
+    atomic_set(&hw->removed, 0);
+    atomic_set(&hw->refs, 0);
+    atomic_set(&hw->irq_count, 0);
+    init_waitqueue_head(&hw->refs_wait);
+
+    /* 全局唯一实例号：同型 EP 的第二张也能拿到不同的节点/通道名 */
+    hw->idx = ida_alloc(&anlogic_pci_instance_ida, GFP_KERNEL);
+    if (hw->idx < 0) {
+        pr_err("no free instance index, %d.\n", hw->idx);
+        kfree(hw);
+        return NULL;
+    }
+
     if (hw->user_max == 0 || hw->user_max > ANLOGIC_PCI_MAX_USER_IRQ)
         hw->user_max = ANLOGIC_PCI_MAX_USER_IRQ;
     if (hw->h2c_channel_max == 0 ||
@@ -569,6 +612,7 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev,
         pr_err("pci_enable_device() failed, %d.\n", rv);
         goto err_enable;
     }
+    hw->enabled = 1;
 
     /* 保留 INTx */
     anlogic_pci_check_intr_pend(pdev);
@@ -634,9 +678,10 @@ err_map:
     if (hw->got_regions)
         pci_release_regions(pdev);
 err_regions:
-    if (!hw->regions_in_use)
+    if (hw->enabled)
         pci_disable_device(pdev);
 err_enable:
+    ida_free(&anlogic_pci_instance_ida, hw->idx);
     kfree(hw);
     return NULL;
 }
@@ -662,5 +707,87 @@ void anlogic_pci_hw_close(struct pci_dev *pdev, void *dev_hndl)
     pci_release_regions(pdev);
     pci_disable_device(pdev);
 
+    ida_free(&anlogic_pci_instance_ida, hw->idx);
     kfree(hw);
+}
+
+/*
+ * 生命周期与串行化（修「收帧节点 fd/映射与卸载脱钩」与「驱动全程无锁」）：
+ *
+ *   - open 一个节点时用 hw_get() 增引用；hw->removed 置后一律拒绝新的取用；
+ *   - release 与 VMA 的 open/close 减引用；
+ *   - remove 调 hw_quiesce()：先置 removed，再拿一次 hw->lock 排空正在跑的
+ *     ioctl/mmap（它们在入口看到 removed 会尽快返回），最后等引用归零才让上层
+ *     释放 hw、BAR 映射与收帧缓冲。
+ *
+ * 引用同时覆盖 fd 与 mmap 出来的 VMA：mmap 必须由已打开的 fd 发起，fd 没关之前
+ * 引用不会归零，所以「mmap fop 返回」到「内核调用 vm_ops->open」之间没有窗口，
+ * VMA 的引用不会漏计。等帧 ioctl 最长睡 600 s，它每轮都会看 removed 并提前退出。
+ */
+int anlogic_pci_hw_get(struct anlogic_pci_hw *hw)
+{
+    int rv = 0;
+
+    if (!hw)
+        return -EINVAL;
+
+    mutex_lock(&hw->lock);
+    if (atomic_read(&hw->removed))
+        rv = -ENODEV;
+    else
+        atomic_inc(&hw->refs);
+    mutex_unlock(&hw->lock);
+
+    return rv;
+}
+
+void anlogic_pci_hw_put(struct anlogic_pci_hw *hw)
+{
+    if (!hw)
+        return;
+    if (atomic_dec_and_test(&hw->refs))
+        wake_up_all(&hw->refs_wait);
+}
+
+static void anlogic_pci_vma_open(struct vm_area_struct *vma)
+{
+    struct anlogic_pci_hw *hw = vma->vm_private_data;
+
+    if (hw)
+        atomic_inc(&hw->refs);
+}
+
+static void anlogic_pci_vma_close(struct vm_area_struct *vma)
+{
+    struct anlogic_pci_hw *hw = vma->vm_private_data;
+
+    if (!hw)
+        return;
+    if (atomic_dec_and_test(&hw->refs))
+        wake_up_all(&hw->refs_wait);
+}
+
+const struct vm_operations_struct anlogic_pci_vm_ops = {
+    .open = anlogic_pci_vma_open,
+    .close = anlogic_pci_vma_close,
+};
+
+void anlogic_pci_hw_quiesce(struct anlogic_pci_hw *hw)
+{
+    int refs;
+
+    if (!hw)
+        return;
+
+    atomic_set(&hw->removed, 1);
+
+    /* 等在飞的 ioctl/mmap 让出锁；它们看到 removed 后会尽快返回 */
+    mutex_lock(&hw->lock);
+    mutex_unlock(&hw->lock);
+
+    refs = atomic_read(&hw->refs);
+    if (refs)
+        pr_info("hw 0x%p: wait for %d user reference(s) before teardown.\n",
+                hw, refs);
+    wait_event(hw->refs_wait, atomic_read(&hw->refs) == 0);
 }

@@ -256,6 +256,11 @@ static long anlogic_pci_frame_wait(struct anlogic_pci_hw *hw,
 
     arg->ready = 0;
     for (;;) {
+        /* 卸载已经开始：不要继续等（最长 600 s），尽快把锁让出去 */
+        if (atomic_read(&hw->removed)) {
+            rv = -ENODEV;
+            break;
+        }
         anlogic_pci_frame_seq_read(hw, &seq, &count);
         if (seq != arg->last_seq) {
             arg->ready = 1;
@@ -372,13 +377,22 @@ static int anlogic_pci_frame_mmap(struct file *file, struct vm_area_struct *vma)
         return rv;
 
     hw = cdev->hw;
-    if (!hw || !hw->frame_virt || !hw->frame_size) {
+    if (mutex_lock_interruptible(&hw->lock))
+        return -ERESTARTSYS;
+    if (atomic_read(&hw->removed)) {
+        rv = -ENODEV;
+        goto out_unlock;
+    }
+
+    if (!hw->frame_virt || !hw->frame_size) {
         pr_err("mmap(): 收帧缓冲没有分配。\n");
-        return -EINVAL;
+        rv = -EINVAL;
+        goto out_unlock;
     }
     if (vma->vm_flags & VM_WRITE) {
         pr_err("mmap(): 收帧缓冲只允许只读映射（PROT_READ | MAP_SHARED）。\n");
-        return -EACCES;
+        rv = -EACCES;
+        goto out_unlock;
     }
     /*
      * 连 mprotect(PROT_WRITE) 也堵上：VM_MAYWRITE 置位时共享映射可以被改写成
@@ -393,24 +407,50 @@ static int anlogic_pci_frame_mmap(struct file *file, struct vm_area_struct *vma)
         (u64)off + (u64)vsize > (u64)hw->frame_size) {
         pr_err("mmap(): off 0x%lx + vsize 0x%lx 超出收帧缓冲 0x%zx。\n",
                off, vsize, hw->frame_size);
-        return -EINVAL;
+        rv = -EINVAL;
+        goto out_unlock;
     }
+
+    /* 卸载时等这条映射关闭（vm_ops->close 减引用） */
+    vma->vm_ops = &anlogic_pci_vm_ops;
+    vma->vm_private_data = hw;
 
     rv = dma_mmap_coherent(&hw->pdev->dev, vma, hw->frame_virt,
                            hw->frame_phys, hw->frame_size);
     if (rv) {
         pr_err("mmap(): dma_mmap_coherent 失败 %d。\n", rv);
-        return rv;
+        goto out_unlock;
     }
 
-    return 0;
+    rv = 0;
+out_unlock:
+    mutex_unlock(&hw->lock);
+    return rv;
 }
 
 static long anlogic_pci_frame_fops_ioctl(struct file *filp, unsigned int cmd,
                                          unsigned long arg)
 {
-    return anlogic_pci_frame_ioctl(filp->private_data, cmd,
-                                   (void __user *)arg);
+    struct anlogic_pci_cdev *cdev = filp->private_data;
+    struct anlogic_pci_hw *hw;
+    long rv;
+
+    rv = anlogic_pci_cdev_check(__func__, cdev);
+    if (rv < 0)
+        return rv;
+
+    hw = cdev->hw;
+    if (mutex_lock_interruptible(&hw->lock))
+        return -ERESTARTSYS;
+    if (atomic_read(&hw->removed)) {
+        mutex_unlock(&hw->lock);
+        return -ENODEV;
+    }
+
+    rv = anlogic_pci_frame_ioctl(cdev, cmd, (void __user *)arg);
+
+    mutex_unlock(&hw->lock);
+    return rv;
 }
 
 static const struct file_operations anlogic_pci_frame_fops = {

@@ -12,6 +12,7 @@
 #ifndef ANLOGIC_PCI_H
 #define ANLOGIC_PCI_H
 
+#include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -19,11 +20,13 @@
 #include <linux/io.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/wait.h>
 
 #include "anlogic_pci_ioctl.h"
 
@@ -76,6 +79,7 @@ struct anlogic_pci_engine {
     int channel;
     u32 irq_bitmask;
     int msix_irq_line;
+    int irq_registered;     /* 该通道的中断确实申请成功过 */
 };
 
 /* 资源与寄存器访问层：一个 EP 的 BAR 映射、区间、中断与通道登记 */
@@ -87,17 +91,20 @@ struct anlogic_pci_hw {
     const char *mod_name;
 
     void __iomem *bar[ANLOGIC_PCI_BAR_NUM];
+    resource_size_t bar_map_len[ANLOGIC_PCI_BAR_NUM]; /* 实际 ioremap 出来的长度 */
     int config_bar_idx;
     int user_bar_idx;
     int regions_in_use;     /* probe 时设备已被别人占用 */
     int got_regions;        /* pci_request_regions() 成功 */
+    int enabled;            /* 本驱动的 pci_enable_device() 成功（与 disable 配对） */
 
     int user_max;
     int h2c_channel_max;
     int c2h_channel_max;
 
-    int irq_count;
-    int irq_line;           /* -1 表示还没登记中断 */
+    atomic_t irq_count;
+    int irq_line;           /* 已登记中断的号；未登记时保持 -1 */
+    int irq_registered;     /* MSI/legacy 中断确实申请成功过（teardown 据此判断） */
     int msi_enabled;
     int msix_enabled;
 
@@ -124,6 +131,16 @@ struct anlogic_pci_hw {
     unsigned int frame_slots;                 /* 槽位数 */
     unsigned int frame_width;
     unsigned int frame_height;
+
+    /*
+     * 生命周期与串行化：fd 打开计数 + mmap 出来的 VMA 计数合在 refs 里。
+     * remove 先置 removed=1，再拿一次 lock 排空在飞的 ioctl/mmap，最后等 refs
+     * 归零才让上层释放 hw 与收帧缓冲（见 anlogic_pci_hw_quiesce）。
+     */
+    struct mutex lock;
+    atomic_t removed;
+    atomic_t refs;
+    wait_queue_head_t refs_wait;
 };
 
 /* 一个字符设备实例（控制节点或用户 BAR 窗口） */
@@ -157,6 +174,12 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev,
                           int *user_max, int *h2c_channel_max,
                           int *c2h_channel_max);
 void anlogic_pci_hw_close(struct pci_dev *pdev, void *hw);
+
+/* 生命周期：open/release 与 VMA open/close 计数引用，remove 排空后等它归零 */
+int anlogic_pci_hw_get(struct anlogic_pci_hw *hw);
+void anlogic_pci_hw_put(struct anlogic_pci_hw *hw);
+void anlogic_pci_hw_quiesce(struct anlogic_pci_hw *hw);
+extern const struct vm_operations_struct anlogic_pci_vm_ops;
 
 /* anlogic_pci_chrdev.c */
 int anlogic_pci_chrdev_init(void);

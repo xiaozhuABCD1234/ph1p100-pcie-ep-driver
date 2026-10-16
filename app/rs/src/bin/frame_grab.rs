@@ -365,7 +365,20 @@ fn run() -> i32 {
 
     // ---- 6. 搬像素（不整帧就补 0 并告警）----
     let npix = info.width as usize * info.height as usize;
-    let mut img = vec![0u8; npix];
+    /*
+     * width/height 来自 module param，最大分别可到 65535（乘积可达约 4.29 GB）。
+     * 直接 `vec![0u8; npix]` 在分配失败时是 abort（退出码 134），不在文件头声明的
+     * 0..6 里。改用 try_reserve，失败按 EX_OUTPUT 返回。
+     */
+    let mut img: Vec<u8> = Vec::new();
+    if img.try_reserve_exact(npix).is_err() {
+        eprintln!(
+            "!! 分配 {} 字节帧缓冲失败（几何 {}x{} 过大或内存不足）",
+            npix, info.width, info.height
+        );
+        return EX_OUTPUT;
+    }
+    img.resize(npix, 0u8);
     let mut copy = hdr_len as usize;
     if copy > info.slot_bytes as usize {
         eprintln!("!! 槽头 len={} 超过一帧 {} 字节，按一帧夹紧", hdr_len, info.slot_bytes);

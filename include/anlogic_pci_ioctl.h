@@ -5,8 +5,10 @@
  * 这里的结构体布局、字段类型与 ANLOGIC_IOC* 编号是板上用户态程序的 ABI：
  * 只允许增补，不允许改动已有编号、字段类型与顺序。
  *
- * 这些访问规约（先验 MAGIC、单次不超过 4 个双字、32 位对齐、全 F 熔断交给用户态、
- * ioctl 边界校验）由 anlogic_pci_ctrl.c 逐条实现。
+ * 这些访问规约（先读 BAR0+0x40 验 MAGIC、单次不超过 4 个双字、32 位对齐、读到
+ * 0xffffffff 立即熔断、ioctl 边界校验）由 anlogic_pci_ctrl.c 的 ioctl 路径逐条实现；
+ * /dev/..._user 的 mmap 是只放 offset 0 一页的裸窗口，逐 offset 白名单与熔断由
+ * 用户态自持（cam_grab 就是刻意直接 mmap sysfs resource0 的）。
  */
 #ifndef ANLOGIC_PCI_IOCTL_H
 #define ANLOGIC_PCI_IOCTL_H
@@ -53,7 +55,11 @@ struct anlogic_ioc_bar {
     unsigned int      rdata;   /* read data */
 };
 
-/* BULK 单次读写最多搬运多少个 dw（驱动按此上限校验 bar_len） */
+/*
+ * BULK 单次 ioctl 可以带多少个 dw（驱动按此上限校验 bar_len，再把整段按
+ * 4 dw 一块推进；每个读回值都先过 BAR0 的 0x40 MAGIC 门禁，读到 0xffffffff
+ * 立即以 -EIO 熔断）。
+ */
 #define MAX_DATA_SIZE   100
 
 struct anlogic_ioc_bar_bulk {
@@ -147,6 +153,13 @@ struct anlogic_ioc_frame_wait {
     unsigned int ready;       /* out 1 = 有比 last_seq 新的帧（新帧在 (seq-1)%slots 槽） */
     unsigned int slot;        /* out 新帧所在槽位（ready=1 时有效） */
 };
+
+/* BAR0 寄存器窗的 MAGIC 口（与驱动 anlogic_pci_ctrl.c、用户态 cam_grab 一致） */
+#define ANLOGIC_BAR_MAGIC_OFF   0x40u
+#define ANLOGIC_BAR_MAGIC_VAL   0x50434946u
+
+/* 读取到全 F 即视为设备已不可用（PCIe 链路断开/复位），两侧都立即熔断 */
+#define ANLOGIC_MMIO_ALL_F      0xffffffffu
 
 /* IOCTL codes */
 #define ANLOGIC_IOCINFO         _IOWR(ANLOGIC_IOC_MAGIC, ANLOGIC_IOC_INFO, struct anlogic_ioc_info)

@@ -61,6 +61,7 @@ int anlogic_pci_cdev_check(const char *fname, struct anlogic_pci_cdev *cdev)
 int anlogic_pci_cdev_open(struct inode *inode, struct file *file)
 {
     struct anlogic_pci_cdev *cdev;
+    int rv;
 
     /* 从 inode 找回包含它的字符设备结构 */
     cdev = container_of(inode->i_cdev, struct anlogic_pci_cdev, cdev);
@@ -70,6 +71,14 @@ int anlogic_pci_cdev_open(struct inode *inode, struct file *file)
                cdev, (unsigned long long)inode->i_ino, cdev->magic);
         return -EINVAL;
     }
+
+    /* 取一个生命周期引用：卸载会等所有 fd/VMA 引用归零才释放 hw */
+    rv = anlogic_pci_hw_get(cdev->hw);
+    if (rv) {
+        pr_info("cdev 0x%p: device is being removed, open refused.\n", cdev);
+        return rv;
+    }
+
     file->private_data = cdev;
 
     return 0;
@@ -100,6 +109,9 @@ int anlogic_pci_cdev_close(struct inode *inode, struct file *file)
         pr_err("hw 0x%p magic mismatch 0x%lx\n", hw, hw->magic);
         return -EINVAL;
     }
+
+    /* 与 open 的 hw_get() 配对；这里减到 0 会唤醒等卸载的 remove 路径 */
+    anlogic_pci_hw_put(hw);
 
     return 0;
 }
@@ -228,7 +240,12 @@ static int anlogic_pci_cdev_create(struct anlogic_pci_card *card,
 del_cdev:
     cdev_del(&cdev->cdev);
 unregister_region:
-    unregister_chrdev_region(cdev->cdevno, ANLOGIC_PCI_MINOR_COUNT);
+    /*
+     * 这里不释放 char 区间：整卡 [major, 0..254] 的释放只在
+     * anlogic_pci_card_destroy_interfaces() 一处做，失败后调用方一定会走到那里。
+     * 否则按 cdev->cdevno = MKDEV(major, type) 去 unregister，既只放掉区间的一部分，
+     * 又会去放从未申请的 minor 255，造成区间记账错乱与重复释放。
+     */
     return rv;
 }
 

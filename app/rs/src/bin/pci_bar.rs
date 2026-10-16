@@ -12,8 +12,12 @@
  * BAR1/BAR3/BAR5 没有各自的映射（BAR1 是 I/O BAR，BAR3/BAR5 是 64 位 BAR 的高半），
  * 驱动里对应 hw->bar[] 为 NULL，这里直接拒掉（规约 15）。
  *
- * 退出码沿用 C 版：用法/参数错是 `return -1`（进程退出码 255），open 失败是 1，其余 0。
+ * 退出码：
+ *   0   成功（读/写 ioctl 都返回成功）
+ *   1   open 失败，或 ioctl 返回错误（如 -EINVAL：bar 未映射/越界）
+ *   255 命令行用法/参数错（与 C 版 `return -1` 一致）
  */
+use std::ffi::c_void;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -37,8 +41,9 @@ macro_rules! fatal {
     }};
 }
 
-// 与 C 版一样：返回值（ioctl 的结果）不使用。
-fn reg_write(fd: i32, bar_id: u32, offset: u32, wdata: u32) {
+// ioctl 的返回值不吞：驱动返回 -EINVAL（bar 未映射/越界等）时必须让调用方看到，
+// 否则读失败时 rdata 保持 0，会被当成「真的读到 0」。
+fn reg_write(fd: i32, bar_id: u32, offset: u32, wdata: u32) -> std::io::Result<()> {
     let mut bar = IocBar {
         bar_id: bar_id as u16,
         bar_type: 0,
@@ -47,10 +52,10 @@ fn reg_write(fd: i32, bar_id: u32, offset: u32, wdata: u32) {
         rdata: 0,
     };
     // SAFETY: bar 就是 ANLOGIC_IOCW 对应的结构体
-    let _ = unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCW, &mut bar as *mut IocBar as *mut std::ffi::c_void) };
+    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCW, &mut bar as *mut IocBar as *mut c_void) }
 }
 
-fn reg_read(fd: i32, bar_id: u32, offset: u32) -> u32 {
+fn reg_read(fd: i32, bar_id: u32, offset: u32) -> std::io::Result<u32> {
     let mut bar = IocBar {
         bar_id: bar_id as u16,
         bar_type: 0,
@@ -59,8 +64,8 @@ fn reg_read(fd: i32, bar_id: u32, offset: u32) -> u32 {
         rdata: 0,
     };
     // SAFETY: bar 就是 ANLOGIC_IOCR 对应的结构体
-    let _ = unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCR, &mut bar as *mut IocBar as *mut std::ffi::c_void) };
-    bar.rdata
+    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCR, &mut bar as *mut IocBar as *mut c_void) }?;
+    Ok(bar.rdata)
 }
 
 fn main() {
@@ -116,11 +121,29 @@ fn main() {
     println!("character device {} opened.", CTRL_DEV);
 
     if mode == 1 {
-        reg_write(file.as_raw_fd(), bar_id, offset, wrdata);
-        println!("Write complete.");
+        match reg_write(file.as_raw_fd(), bar_id, offset, wrdata) {
+            Ok(()) => println!("Write complete."),
+            Err(e) => {
+                eprintln!(
+                    "!! ANLOGIC_IOCW failed: {} ({})",
+                    e,
+                    sys::errno_str(&e)
+                );
+                anlogic_pci_tools::exit_with(1);
+            }
+        }
     } else {
-        let reg_value = reg_read(file.as_raw_fd(), bar_id, offset);
-        println!("Read data: 0x{:x} complete.", reg_value);
+        match reg_read(file.as_raw_fd(), bar_id, offset) {
+            Ok(reg_value) => println!("Read data: 0x{:x} complete.", reg_value),
+            Err(e) => {
+                eprintln!(
+                    "!! ANLOGIC_IOCR failed: {} ({})",
+                    e,
+                    sys::errno_str(&e)
+                );
+                anlogic_pci_tools::exit_with(1);
+            }
+        }
     }
 
     // file 离开作用域即 close(fd)

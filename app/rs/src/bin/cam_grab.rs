@@ -87,6 +87,12 @@
  * --------------------------------------------------------------------------
  * 五、访问规约（逐条落实）
  * --------------------------------------------------------------------------
+ * 本工具刻意不走驱动的 ioctl，而是直接 mmap sysfs 的 resource0：PIO 抓帧对每次
+ * 寄存器访问的开销敏感，走 ioctl 要多付进程切换与驱动的串行化锁。pci-sysfs 的
+ * mmap（内核实现在 drivers/pci/pci-sysfs.c）不检查资源是否已被驱动 claim，因此
+ * 三条门禁——先读 0x40 验 MAGIC、单次不超过 4 个 dw、读到 0xffffffff 立即熔断
+ * ——由本工具自持（magic_gate / Regs::rd / Regs::data_rd），不依赖驱动侧校验。
+ *
  *   A-1 :201 只碰寄存器表登记过的 offset → off_rd_ok()/off_wr_ok() 白名单，
  *             DATA 口 0x60 只能经 data_rd() 访问（读了就动 PTR，不能随手读）
  *   A-3 :204 不做扫窗枚举 → 只读 0x40 判存在性
@@ -769,6 +775,9 @@ fn run() -> i32 {
     }
 
     // ---- 1. 打开并映射 BAR0 前 4KB（offset=0、length ≤ 4KB）----
+    // 刻意不经驱动的 ioctl / _user mmap：这里直接 mmap sysfs 的 resource0，
+    // 换来每笔寄存器访问没有进程切换开销。代价是驱动侧的门禁在这条路径上无效，
+    // 所以三条门禁（MAGIC / ≤4 dw / 全 F 熔断）由本工具自持（见文件头「五」）。
     // 先认设备（纯 sysfs 只读），确认是 PH1P100 EP 才去 open/mmap 它的 BAR0
     let rc = device_id_gate(&dev_path);
     if rc != EX_OK {

@@ -34,7 +34,8 @@ const fn ioc(dir: u32, ty: u32, nr: u32, size: u32) -> u64 {
 pub const ANLOGIC_IOC_MAGIC: u32 = b'x' as u32;
 /// `ANLOGIC_XCL_MAGIC = 0X586C0C6C`（ANLOGIC_IOCINFO 入参里的魔数）
 pub const ANLOGIC_XCL_MAGIC: u32 = 0x586C_0C6C;
-/// `MAX_DATA_SIZE`（BULK 单次搬运上限，本工具组的 ioctl 里没用 BULK，列出以便对照）
+/// `MAX_DATA_SIZE`（BULK 单次 ioctl 可带的上限 dw 数；驱动再把整段按 4 dw 分块，
+/// 本工具组的 ioctl 里没用 BULK，列出以便对照）
 pub const MAX_DATA_SIZE: usize = 100;
 
 // ------------------------------------------------------------ 基础结构体
@@ -162,8 +163,29 @@ impl_default_zeroed!(IocBase, IocInfo, IocBar, CfgWrite, FrameMailbox, FrameSlot
 
 // 与头文件一致：sizeof 与关键字段偏移必须钉死（缓冲布局算错就会取到错数据）。
 const _: () = {
+    assert!(std::mem::size_of::<IocBase>() == 8);
+    assert!(std::mem::offset_of!(IocBase, magic) == 0);
+    assert!(std::mem::offset_of!(IocBase, command) == 4);
     assert!(std::mem::size_of::<IocInfo>() == 40);
+    assert!(std::mem::offset_of!(IocInfo, vendor) == 8);
+    assert!(std::mem::offset_of!(IocInfo, device) == 10);
+    assert!(std::mem::offset_of!(IocInfo, subsystem_vendor) == 12);
+    assert!(std::mem::offset_of!(IocInfo, dma_engine_version) == 16);
+    assert!(std::mem::offset_of!(IocInfo, driver_version) == 20);
+    assert!(std::mem::offset_of!(IocInfo, feature_id) == 24);
+    assert!(std::mem::offset_of!(IocInfo, domain) == 32);
+    assert!(std::mem::offset_of!(IocInfo, bus) == 34);
+    assert!(std::mem::offset_of!(IocInfo, dev) == 35);
+    assert!(std::mem::offset_of!(IocInfo, func) == 36);
     assert!(std::mem::size_of::<IocBar>() == 16);
+    assert!(std::mem::offset_of!(IocBar, bar_id) == 0);
+    assert!(std::mem::offset_of!(IocBar, bar_type) == 2);
+    assert!(std::mem::offset_of!(IocBar, bar_offaddr) == 4);
+    assert!(std::mem::offset_of!(IocBar, wdata) == 8);
+    assert!(std::mem::offset_of!(IocBar, rdata) == 12);
+    assert!(std::mem::size_of::<CfgWrite>() == 8);
+    assert!(std::mem::offset_of!(CfgWrite, reg) == 0);
+    assert!(std::mem::offset_of!(CfgWrite, value) == 4);
     assert!(std::mem::size_of::<FrameMailbox>() == 64);
     assert!(std::mem::size_of::<FrameSlotHdr>() == 16);
     assert!(std::mem::size_of::<IocFrame>() == 56);

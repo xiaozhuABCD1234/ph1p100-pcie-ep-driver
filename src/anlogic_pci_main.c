@@ -101,6 +101,14 @@ static void anlogic_pci_remove(struct pci_dev *pdev)
 
     pr_info("pdev 0x%p, card 0x%p, hw 0x%p.\n", pdev, card, card->hw);
 
+    /*
+     * 先置 removed 并等所有 fd/mmap 引用归零，再拆节点与释放缓冲。
+     * PCI 层的 remove（/sys/.../remove、热拔插、AER 致命恢复）不会被
+     * cdev->owner 挡住，不等引用归零的话，进程手上还开着的 fd 或 frame 节点的
+     * VMA 就会在 hw 与 dma 缓冲被释放之后继续被访问（UAF / 读到复用内存）。
+     */
+    anlogic_pci_hw_quiesce(card->hw);
+
     anlogic_pci_card_free(card);
 
     dev_set_drvdata(&pdev->dev, NULL);

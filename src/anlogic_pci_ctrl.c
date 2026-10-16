@@ -7,17 +7,29 @@
  * （收帧缓冲节点的 ioctl/mmap 在 anlogic_pci_frame.c；控制节点的 switch 里只是
  * 把两条收帧命令转发过去，方便只开一个节点也能问到缓冲物理地址与序号。）
  *
- * 本文件是所有“用户态可控 MMIO”的唯一入口，逐条实现下面这些访问校验（先验
- * MAGIC、单次不超过 4 个双字、32 位对齐、全 F 熔断交给用户态、ioctl 边界校验、
- * mmap 溢出安全的边界判断、配置空间读写用 copy_from_user/copy_to_user）。
- * 这些校验一条都不允许删除或放宽。
+ * 本文件是控制/用户 BAR 节点上用户态可控 MMIO 的入口。ioctl 这条路径逐条实现
+ * 下面这些访问校验（先读 BAR0+0x40 验 MAGIC、单笔不超过 4 个双字、读到
+ * 0xffffffff 立即熔断返回 -EIO、32 位对齐、ioctl 边界校验、配置空间读写用
+ * copy_from_user/copy_to_user）；这些校验一条都不允许删除或放宽。
+ *
+ * /dev/..._user 的 mmap 是一条裸窗口：驱动只保证「offset 0、一页、落在已登记的
+ * 控制/用户 BAR 内」，逐 offset 白名单、先验 MAGIC 与全 F 熔断由用户态自持
+ * （app/rs 的 cam_grab 甚至刻意绕过驱动、直接 mmap sysfs resource0）。收帧
+ * 节点的 mmap 映射的是驱动自己分配的收帧内存，不走这里。
+ *
+ * 生命周期：ioctl/mmap 入口都用 hw->lock 串行化，并在 remove 置 removed 之后
+ * 拒绝执行（见 anlogic_pci_hw_get / anlogic_pci_hw_quiesce）。
  */
 #include <linux/ioctl.h>
+#include <linux/minmax.h>
 #include <linux/mm.h>
 #include <linux/pci.h>
 #include <linux/uaccess.h>
 
 #include "anlogic_pci.h"
+
+/* 一次连续 MMIO 访问的双字上限（超过就分块），与访问规约一致 */
+#define ANLOGIC_CTRL_MMIO_CHUNK_DW  4u
 
 static u32 anlogic_pci_read_cfg_dword(struct pci_dev *pdev, u32 off)
 {
@@ -73,15 +85,15 @@ static long anlogic_pci_version_ioctl(struct anlogic_pci_cdev *cdev,
  * 所有 BAR ioctl 的公共入口校验（本文件的公共校验）：
  *   - bar_id 必须 < ANLOGIC_PCI_BAR_NUM 且该 BAR 确实映射过；
  *   - off（BAR 内字节偏移）必须 4 字节对齐；
- *   - off + len（字节）必须落在 pci_resource_len() 以内，用 64 位加法，
- *     以免 32 位回绕绕过上界。
+ *   - off + len（字节）必须落在该 BAR 实际映射长度（hw->bar_map_len）以内，
+ *     用 64 位加法，以免 32 位回绕绕过上界。
  * 任何一条不满足返回 -EINVAL，0 表示可以继续访问。
  */
 static int anlogic_pci_ctrl_bar_range_check(struct anlogic_pci_hw *hw,
                                             unsigned int bar_id,
                                             unsigned int off, u64 len)
 {
-    resource_size_t rsrc_len;
+    resource_size_t map_len;
 
     if (bar_id >= ANLOGIC_PCI_BAR_NUM) {
         pr_err("ioctl: bar_id %u >= ANLOGIC_PCI_BAR_NUM %d.\n", bar_id,
@@ -96,23 +108,59 @@ static int anlogic_pci_ctrl_bar_range_check(struct anlogic_pci_hw *hw,
         pr_err("ioctl: bar_offaddr 0x%x is not 4-byte aligned.\n", off);
         return -EINVAL;
     }
-    rsrc_len = pci_resource_len(hw->pdev, bar_id);
-    if (!rsrc_len) {
-        pr_err("ioctl: bar_id %u resource length is 0.\n", bar_id);
+    /*
+     * 上界用实际 ioremap 出来的长度，不用 pci_resource_len()：BAR 超过 INT_MAX
+     * 时映射会被夹短，用资源长度会放过跑到映射外面的虚拟地址。
+     */
+    map_len = hw->bar_map_len[bar_id];
+    if (!map_len) {
+        pr_err("ioctl: bar_id %u mapped length is 0.\n", bar_id);
         return -EINVAL;
     }
-    if ((u64)off + len > (u64)rsrc_len) {
-        pr_err("ioctl: bar%u [0x%x, +0x%llx) exceeds resource length 0x%llx.\n",
+    if ((u64)off + len > (u64)map_len) {
+        pr_err("ioctl: bar%u [0x%x, +0x%llx) exceeds mapped length 0x%llx.\n",
                bar_id, off, (unsigned long long)len,
-               (unsigned long long)rsrc_len);
+               (unsigned long long)map_len);
         return -EINVAL;
     }
 
     return 0;
 }
 
-static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
-                                   unsigned long arg)
+/*
+ * 一次 BAR 读的统一实现（三条门禁里的两条与另一半）：
+ *   - BAR0（寄存器窗）上任何一次读之前先读 0x40 验 MAGIC，不符就不碰目标地址；
+ *   - 读回 0xffffffff 立即熔断，向外返回 -EIO。
+ * MAGIC 口只有 0x40 这个无副作用口，0x60 数据口会动 PTR，所以只在这里读 0x40。
+ */
+static int anlogic_pci_ctrl_read32(struct anlogic_pci_hw *hw,
+                                   unsigned int bar_id, unsigned int off,
+                                   u32 *val)
+{
+    if ((int)bar_id == hw->config_bar_idx &&
+        hw->bar_map_len[bar_id] >=
+                ANLOGIC_BAR_MAGIC_OFF + sizeof(u32)) {
+        u32 magic = ioread32(hw->bar[bar_id] + ANLOGIC_BAR_MAGIC_OFF);
+
+        if (magic != ANLOGIC_BAR_MAGIC_VAL) {
+            pr_err("ioctl: bar%u MAGIC 0x%08x != 0x%08x, refuse read of 0x%x.\n",
+                   bar_id, magic, ANLOGIC_BAR_MAGIC_VAL, off);
+            return -EIO;
+        }
+    }
+
+    *val = ioread32(hw->bar[bar_id] + off);
+    if (*val == ANLOGIC_MMIO_ALL_F) {
+        pr_err("ioctl: bar%u+0x%x reads 0xffffffff, device is dead, fuse.\n",
+               bar_id, off);
+        return -EIO;
+    }
+
+    return 0;
+}
+
+static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
+                                        unsigned long arg)
 {
     struct anlogic_pci_cdev *cdev = filp->private_data;
     struct anlogic_pci_hw *hw;
@@ -122,7 +170,7 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
     long result = 0;
     void __iomem *addr;
     int rv;
-    int i;
+    unsigned int i;
 
     rv = anlogic_pci_cdev_check(__func__, cdev);
     if (rv < 0)
@@ -202,8 +250,11 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
         if (rv < 0)
             return rv;
 
-        addr = hw->bar[ioctl_bar.bar_id] + ioctl_bar.bar_offaddr;
-        ioctl_bar.rdata = ioread32(addr);
+        rv = anlogic_pci_ctrl_read32(hw, ioctl_bar.bar_id,
+                                     ioctl_bar.bar_offaddr,
+                                     &ioctl_bar.rdata);
+        if (rv < 0)
+            return rv;
         if (copy_to_user((void __user *)arg, &ioctl_bar,
                          sizeof(struct anlogic_ioc_bar))) {
             pr_err("copy_to_user failed.\n");
@@ -233,10 +284,20 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
 
         addr = hw->bar[ioctl_bar_bulk.bar_id] + ioctl_bar_bulk.bar_offaddr;
 
-        /* 循环用局部下标 0..bar_len-1 逐双字推进，bar_offaddr 只在
-         * 算基址 addr 时用一次 */
-        for (i = 0; i < ioctl_bar_bulk.bar_len; i++)
-            iowrite32(ioctl_bar_bulk.wdata[i], addr + (i << 2));
+        /*
+         * 按 ANLOGIC_CTRL_MMIO_CHUNK_DW 个双字一块推进：单笔不越过 4 dw；
+         * bar_offaddr 只在算基址 addr 时用一次，块内用局部下标。
+         */
+        for (i = 0; i < ioctl_bar_bulk.bar_len;
+             i += ANLOGIC_CTRL_MMIO_CHUNK_DW) {
+            unsigned int n = min_t(unsigned int, ANLOGIC_CTRL_MMIO_CHUNK_DW,
+                                   ioctl_bar_bulk.bar_len - i);
+            unsigned int k;
+
+            for (k = 0; k < n; k++)
+                iowrite32(ioctl_bar_bulk.wdata[i + k],
+                          addr + ((i + k) << 2));
+        }
         break;
 
     case ANLOGIC_IOCBULKR:
@@ -259,12 +320,25 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
         if (rv < 0)
             return rv;
 
-        addr = hw->bar[ioctl_bar_bulk.bar_id] + ioctl_bar_bulk.bar_offaddr;
+        /*
+         * 按 ANLOGIC_CTRL_MMIO_CHUNK_DW 个双字一块读，每一笔都走带 MAGIC 门禁与
+         * 全 F 熔断的 anlogic_pci_ctrl_read32；块内用局部下标。
+         */
+        for (i = 0; i < ioctl_bar_bulk.bar_len;
+             i += ANLOGIC_CTRL_MMIO_CHUNK_DW) {
+            unsigned int n = min_t(unsigned int, ANLOGIC_CTRL_MMIO_CHUNK_DW,
+                                   ioctl_bar_bulk.bar_len - i);
+            unsigned int k;
 
-        /* 循环用局部下标 0..bar_len-1 逐双字推进，bar_offaddr 只在
-         * 算基址 addr 时用一次 */
-        for (i = 0; i < ioctl_bar_bulk.bar_len; i++)
-            ioctl_bar_bulk.rdata[i] = ioread32(addr + (i << 2));
+            for (k = 0; k < n; k++) {
+                rv = anlogic_pci_ctrl_read32(hw, ioctl_bar_bulk.bar_id,
+                                             ioctl_bar_bulk.bar_offaddr +
+                                             ((i + k) << 2),
+                                             &ioctl_bar_bulk.rdata[i + k]);
+                if (rv < 0)
+                    return rv;
+            }
+        }
 
         if (copy_to_user((void __user *)arg, &ioctl_bar_bulk,
                          sizeof(struct anlogic_ioc_bar_bulk))) {
@@ -336,15 +410,14 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
     return 0;
 }
 
-/* 把 PCIe BAR 映射到用户态，供 mmap 使用 */
+/* 把 PCIe BAR 映射到用户态，供 mmap 使用（只放 offset 0 的一页窗口） */
 static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
 {
     struct anlogic_pci_cdev *cdev = file->private_data;
     struct anlogic_pci_hw *hw;
-    unsigned long off;
     unsigned long phys;
     unsigned long vsize;
-    resource_size_t rsrc_len;
+    resource_size_t map_len;
     int rv;
 
     rv = anlogic_pci_cdev_check(__func__, cdev);
@@ -353,49 +426,95 @@ static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
 
     hw = cdev->hw;
 
-    off = vma->vm_pgoff << PAGE_SHIFT;
-    if (cdev->bar < 0 || cdev->bar >= ANLOGIC_PCI_BAR_NUM) {
-        pr_err("mmap(): bad bar %d.\n", cdev->bar);
-        return -EINVAL;
+    if (mutex_lock_interruptible(&hw->lock))
+        return -ERESTARTSYS;
+    if (atomic_read(&hw->removed)) {
+        rv = -ENODEV;
+        goto out_unlock;
     }
-    /* mmap 映射长度溢出检查：先拒掉 off >= BAR 长度，再做任何减法 */
-    rsrc_len = pci_resource_len(hw->pdev, cdev->bar);
-    if (!rsrc_len || off >= rsrc_len) {
-        pr_err("mmap(): off 0x%lx >= bar%d length 0x%llx.\n",
-               off, cdev->bar, (unsigned long long)rsrc_len);
-        return -EINVAL;
+
+    /* 只放登记过的控制/用户 BAR，其他 BAR 一律拒绝 */
+    if (cdev->bar != hw->config_bar_idx && cdev->bar != hw->user_bar_idx) {
+        pr_err("mmap(): bar %d is not a registered control/user BAR.\n",
+               cdev->bar);
+        rv = -EINVAL;
+        goto out_unlock;
     }
-    vsize = vma->vm_end - vma->vm_start;
     /*
-     * mmap 映射长度溢出检查：把 off 与 vsize 提升到 64 位后相加再比 BAR
-     * 长度，不用无符号相减表示剩余长度（上面已保证 off < rsrc_len）。
+     * 本节点是给用户态的裸 4 KB 窗口：只允许 offset 0、长度不超过一页。
+     * 逐 offset 白名单、先验 MAGIC 与全 F 熔断在这条路径上由用户态自持
+     * （cam_grab 就是刻意直接 mmap sysfs resource0 的同类做法）。
      */
-    if ((u64)off + (u64)vsize > (u64)rsrc_len) {
-        pr_err("mmap(): vsize 0x%lx exceeds remaining 0x%llx of bar%d.\n",
-               vsize, (unsigned long long)(rsrc_len - off), cdev->bar);
-        return -EINVAL;
+    if (vma->vm_pgoff || (vma->vm_end - vma->vm_start) > PAGE_SIZE) {
+        pr_err("mmap(): only offset 0 and at most one page (4 KB) allowed.\n");
+        rv = -EINVAL;
+        goto out_unlock;
     }
-    phys = pci_resource_start(hw->pdev, cdev->bar) + off;
+
+    map_len = hw->bar_map_len[cdev->bar];
+    vsize = vma->vm_end - vma->vm_start;
+    if (!map_len || (u64)vsize > (u64)map_len) {
+        pr_err("mmap(): vsize 0x%lx exceeds bar%d mapped length 0x%llx.\n",
+               vsize, cdev->bar, (unsigned long long)map_len);
+        rv = -EINVAL;
+        goto out_unlock;
+    }
+    phys = pci_resource_start(hw->pdev, cdev->bar);
 
     pr_debug("mmap(): cdev 0x%p, bar %d, hw 0x%p, pdev 0x%p\n", cdev,
              cdev->bar, hw, hw->pdev);
-    pr_debug("off = 0x%lx, start = 0x%llx, phys = 0x%lx\n", off,
+    pr_debug("off = 0x0, start = 0x%llx, phys = 0x%lx\n",
              (unsigned long long)pci_resource_start(hw->pdev, cdev->bar),
              phys);
 
     /*
      * MMIO 页不能按 cache line 访问 EP，所以映射成 noncached；
      * 同时防止这些页被换入换出或被 dump。
+     * vm_ops 的 open/close 计引用，卸载时等这条映射关闭。
      */
     vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
     vm_flags_set(vma, ANLOGIC_PCI_VMEM_FLAGS);
+    vma->vm_ops = &anlogic_pci_vm_ops;
+    vma->vm_private_data = hw;
 
     rv = io_remap_pfn_range(vma, vma->vm_start, phys >> PAGE_SHIFT,
                             vsize, vma->vm_page_prot);
     if (rv)
-        return -EAGAIN;
+        rv = -EAGAIN;
 
-    return 0;
+out_unlock:
+    mutex_unlock(&hw->lock);
+    return rv;
+}
+
+/*
+ * ioctl 入口：hw->lock 把同一实例上的 ioctl 与 remove 串行化，removed 置位后一律
+ * 拒绝。等帧最长 600 s 也在这把锁下，但等帧循环会看 removed 提前退出，所以 remove
+ * 不会被拖满 600 s。
+ */
+static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
+                                   unsigned long arg)
+{
+    struct anlogic_pci_cdev *cdev = filp->private_data;
+    struct anlogic_pci_hw *hw;
+    long rv;
+
+    rv = anlogic_pci_cdev_check(__func__, cdev);
+    if (rv < 0)
+        return rv;
+
+    hw = cdev->hw;
+    if (mutex_lock_interruptible(&hw->lock))
+        return -ERESTARTSYS;
+    if (atomic_read(&hw->removed)) {
+        mutex_unlock(&hw->lock);
+        return -ENODEV;
+    }
+
+    rv = anlogic_pci_ctrl_ioctl_body(filp, cmd, arg);
+
+    mutex_unlock(&hw->lock);
+    return rv;
 }
 
 static const struct file_operations anlogic_pci_ctrl_fops = {

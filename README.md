@@ -4,8 +4,12 @@
 由厂商 `anlogic_pci` 驱动移植而来，原先只做 PIO 寄存器访问；现在另加了一层「收帧缓冲」
 （dma_alloc_coherent 分配、物理地址/序号经 ioctl 给用户态、FPGA 侧拿它当 MWr 目标），
 真正的收帧等 FPGA 接通后再验。
-所有用户态可控的 MMIO 都在 ioctl/mmap 入口逐项校验，访问规约见
-`` —— 那些校验一条都不许放宽。
+MMIO 访问规约（先读 BAR0+0x40 验 MAGIC、单笔不超过 4 个双字、读到 0xffffffff 立即
+熔断）在两条路径上各自落实：控制节点 `/dev/ANLOGIC-PCI0_control` 的 ioctl 由内核
+`src/anlogic_pci_ctrl.c` 逐笔校验；`/dev/ANLOGIC-PCI0_user` 的 mmap 只放 offset 0 的
+一页裸窗口，逐 offset 白名单与门禁由用户态自持。`cam_grab` 为性能刻意绕过驱动、直接
+mmap sysfs 的 `resource0`（pci-sysfs 的 mmap 不查资源是否已被驱动 claim），因此它自带
+同一套校验，不经内核校验。
 
 ## 目录
 
@@ -19,7 +23,6 @@
 | `src/anlogic_pci.h` | 驱动内部头（三层共用） |
 | `include/anlogic_pci_ioctl.h` | ioctl 协议，驱动与用户态共用的唯一一份 |
 | `app/rs/` | 用户态（Rust，cargo 工程 `anlogic_pci_tools`，四个 bin）：`cam_grab` 抓帧（PIO）、`frame_grab` 从收帧缓冲取帧、`pci_bar` 单 dw 读写、`pcie_check` 链路自检 |
-| `` | 内核挂死风险审计与访问规约（只读参考） |
 
 厂商原始驱动不在本仓库（在 `~/Projects/.archive-ph1p-*/vendor_driver_original/`），
 只在需要对照移植改动时取用，避免两份代码并存分叉。
@@ -93,5 +96,11 @@ mailbox 描述符在槽区之后的一整页里，位置用 ioctl 报出来的 `
 
 ## 注意
 
+- MMIO 门禁：控制节点的 ioctl 由驱动逐笔校验（BAR0 先读 0x40 验 MAGIC、单笔不超过
+  4 个双字、读到 `0xffffffff` 立即 `-EIO` 熔断）；`_user` 节点的 mmap 与 `cam_grab` 直连
+  sysfs `resource0` 这两条路径由用户态自持同样的校验。
+- 几个用户态工具的 flock 只锁各自打开的文件（`cam_grab` 锁 sysfs `resource0`、
+  `frame_grab` 锁 `_frame`、`pci_bar` 不锁），不是跨工具的一次一个进程；`cam_grab` 与
+  `pci_bar` 可以同时跑。驱动侧只用 `hw->lock` 串行化同一实例上的 ioctl/mmap。
 - 单次 MMIO 读不超过 4 dw，只用 32 位对齐访问：FPGA 侧完成包长度未夹紧，长读会静默错数据。
 - FPGA 热重配置后主机 BAR 全部读回 `0xffffffff`，必须重启 RK3588 重新枚举才能恢复 Gen2 x2。
