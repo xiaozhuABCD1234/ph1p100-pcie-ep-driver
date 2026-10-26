@@ -259,6 +259,33 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
         return rv;
 
     /*
+     * T07: fail closed before touching any push-related register.  Probe the
+     * RKA1 extension first; a legacy image (0x118 reads DEAD_BEEF) returns
+     * -EOPNOTSUPP and the link stays in capture/diagnostic mode only, with the
+     * pusher never armed.
+     */
+    rv = anlogic_pci_rka1_probe(hw);
+    if (rv < 0) {
+        pr_err("链路：FPGA 没有 RKA1 安全扩展（fail closed），推帧不授权；"
+               "采集/DDR 诊断仍可用。\n");
+        return rv;
+    }
+
+    /*
+     * T07: authorise the DMA once, up front: capacity = the slot data region
+     * and a fresh non-zero session id.  The FPGA validates both again at ARM
+     * time, so a wrong value here cannot cause a transfer.
+     */
+    hw->rka1_session = (u32)jiffies | 0x524b0000u;   /* 'RK' + low bits of time */
+    if (!hw->rka1_session)
+        hw->rka1_session = 0x524b0001u;
+    rv = anlogic_pci_rka1_configure(hw, hw->frame_slot_bytes, hw->rka1_session);
+    if (rv < 0) {
+        pr_err("链路：RKA1 授权配置失败 %d，推帧不授权。\n", rv);
+        return rv;
+    }
+
+    /*
      * ① 推帧目标 = 槽 0 的**像素区起点** = 槽基址 + 槽头字节数（16）。
      *    槽基址那 16 字节由驱动写在看门铃时补的槽头（seq/len/flags）占用，
      *    推帧引擎若从槽基址写起，帧的头 16 字节就会被槽头盖掉；而主机
@@ -324,6 +351,17 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
         return -EIO;
     }
     armed = 1;
+
+    /*
+     * ②b T07：one-shot 授权。CTRL 只是模式使能，真正发包靠 ARM_ONE_SHOT：
+     *     一个额度最多完成一帧，推完 FPGA 进 held，等用户态核对完 R10F 再 ACK，
+     *     之后要发下一帧必须重新 ARM（见 anlogic_pci_rka1.c / rka1 ioctl）。
+     */
+    rv = anlogic_pci_rka1_arm_one_shot(hw);
+    if (rv < 0) {
+        pr_err("链路：RKA1 ARM 失败 %d（容量/会话/链路/MPS 任一项不满足都会拒）。\n", rv);
+        return rv;
+    }
 
     pr_info("链路：推帧目标 0x%llx、门铃 0x%llx（都在收帧缓冲 0x%llx 里），"
             "0x44 CTRL=0x%08x。\n",
@@ -412,6 +450,18 @@ void anlogic_pci_link_disarm(struct anlogic_pci_hw *hw)
 
     if (!hw || !hw->link_armed)
         return;
+
+    /*
+     * T07: cancel first.  CANCEL completes any TLP that was already opened
+     * (never truncates a packet), sends no success doorbell and drains the
+     * source; the helper only returns once busy/draining/held/armed are all
+     * clear.  Only then is it safe to hand the coherent buffer back.
+     */
+    if (hw->rka1_ext_ok) {
+        int crv = anlogic_pci_rka1_cancel(hw);
+        if (crv < 0)
+            pr_warn("链路：卸载时 RKA1 CANCEL 未确认（%d），下面照常关模式位。\n", crv);
+    }
 
     rv = anlogic_pci_link_read32(hw, ANLOGIC_BAR_CTRL_OFF, &ctrl);
     if (rv < 0) {
@@ -602,6 +652,46 @@ long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
                               ANLOGIC_PUSH_CFG_SET_DB)) {
                 pr_err("链路 ioctl：flags 0x%x 有不认识的位。\n", cfg.flags);
                 return -EINVAL;
+            }
+
+            /*
+             * T07: never let a caller point the DMA at an arbitrary address.
+             * Both addresses must land inside the authorised coherent
+             * allocation (frame_phys .. frame_phys+frame_size) and the doorbell
+             * must be the mailbox push_dbell word.  Also refuse while the
+             * one-shot engine is active: the RTL rejects active-config writes
+             * (0xC8=10) and we do not want a half-applied config either.
+             */
+            {
+                u32 tx_st = 0;
+                u64 phys = hw->frame_phys;
+                u64 end  = phys + hw->frame_size;
+                u64 want_dst, want_db;
+
+                rv = anlogic_pci_rka1_status(hw, &tx_st);
+                if (rv < 0)
+                    return rv;
+                if (tx_st & (ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY |
+                             ANLOGIC_RKA1_ST_HELD  | ANLOGIC_RKA1_ST_DRAINING)) {
+                    pr_err("链路 ioctl：推帧活动期间（TX_STATUS=0x%08x）拒绝改地址。\n",
+                           tx_st);
+                    return -EBUSY;
+                }
+                want_dst = ((u64)cfg.dst_hi << 32) | cfg.dst_lo;
+                want_db  = ((u64)cfg.db_hi  << 32) | cfg.db_lo;
+                if ((cfg.flags & ANLOGIC_PUSH_CFG_SET_DST) &&
+                    ((want_dst < phys) || (want_dst + ANLOGIC_FRAME_DMA_BYTES > end))) {
+                    pr_err("链路 ioctl：目标 0x%llx 不在授权缓冲 [0x%llx,0x%llx) 内。\n",
+                           (unsigned long long)want_dst,
+                           (unsigned long long)phys, (unsigned long long)end);
+                    return -EINVAL;
+                }
+                if ((cfg.flags & ANLOGIC_PUSH_CFG_SET_DB) &&
+                    ((want_db < phys) || (want_db + 4 > end))) {
+                    pr_err("链路 ioctl：门铃 0x%llx 不在授权缓冲内。\n",
+                           (unsigned long long)want_db);
+                    return -EINVAL;
+                }
             }
 
             if (cfg.flags & ANLOGIC_PUSH_CFG_SET_DST) {

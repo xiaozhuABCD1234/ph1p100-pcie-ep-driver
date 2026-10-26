@@ -43,6 +43,7 @@ use anlogic_pci_tools::ioctl::{
     ANLOGIC_FRAME_MAGIC, ANLOGIC_FRAME_MAX_WAIT_MS, ANLOGIC_IOCFRAMEINFO, ANLOGIC_IOCFRAMEWAIT,
 };
 use anlogic_pci_tools::parse::strtoul_base0;
+use anlogic_pci_tools::rka1::r10f;
 use anlogic_pci_tools::sys::{self, Mmap, PROT_READ};
 
 const DEF_DEV: &str = "/dev/ANLOGIC-PCI0_frame";
@@ -380,17 +381,21 @@ fn run() -> i32 {
     }
     img.resize(npix, 0u8);
     let mut copy = hdr_len as usize;
-    if copy > info.slot_bytes as usize {
-        eprintln!("!! 槽头 len={} 超过一帧 {} 字节，按一帧夹紧", hdr_len, info.slot_bytes);
-        copy = info.slot_bytes as usize;
-        rc = EX_INCONSISTENT;
-    }
-    if copy > npix {
+    /*
+     * T07: no silent clamping.  The slot length is the transport length agreed
+     * with the FPGA (dma_bytes); anything else means host and FPGA disagree,
+     * and a clamped copy would hand out a frame that looks fine but is not.
+     */
+    if copy != info.slot_bytes as usize {
         eprintln!(
-            "!! 槽头 len={} 大于 {}x{} 需要的 {} 字节，按图大小夹紧",
-            hdr_len, info.width, info.height, npix
+            "!! 槽头 len={} != 驱动/fpga 约定的 slot_bytes={}：拒绝发布（不再夹紧）",
+            hdr_len, info.slot_bytes
         );
-        copy = npix;
+        return EX_INCONSISTENT;
+    }
+    if copy & 0xfff != 0 {
+        eprintln!("!! slot_bytes={} 不是 4KiB 整数倍：不是本框架的传输格式", copy);
+        return EX_INCONSISTENT;
     }
     let src = map.as_ptr() as usize + slot as usize * info.stride as usize + info.hdr_bytes as usize;
     // SAFETY: 源地址在只读映射内（descriptor_check 已核对 stride/slots/mb_off 都合得上）
@@ -400,6 +405,41 @@ fn run() -> i32 {
     if copy < npix {
         eprintln!("!! 帧数据只有 {}/{} 字节，缺的用 0 补（图不完整）", copy, npix);
         rc = EX_INCONSISTENT;
+    }
+
+    // ---- 6.5 T11：内容若为 R10F（正式非压缩帧），先严格解析；不通过不发布 ----
+    //   判据与 `tools/pcie_integration/r10f_strict.py` / contract/acceptance-vectors.json
+    //   逐字段一致（magic/version/format/codec/几何三层长度/三 CRC/尾零/flags）。
+    //   ⚠ PGM 是灰度诊断输出：R10F 内容笔写出的是 packed RAW10 原始字节（8192bit/4px），
+    //   不是灰度像素；这里只为「取到、审到、可复算」留证据，不代表颜色/几何正确。
+    if img.len() >= r10f::HDR_BYTES && &img[0..4] == b"R10F" {
+        let pb = u32::from_le_bytes([img[0x30], img[0x31], img[0x32], img[0x33]]) as usize;
+        if r10f::HDR_BYTES + pb > img.len() {
+            eprintln!(
+                "!! R10F payload_bytes={} 超出槽内容（{} 字节）：拒绝发布",
+                pb,
+                img.len()
+            );
+            return EX_INCONSISTENT;
+        }
+        let (hdr, rest) = img.split_at(r10f::HDR_BYTES);
+        let (payload, tail) = rest.split_at(pb);
+        match r10f::parse(hdr, payload, tail, info.width, info.height, None) {
+            Ok(h) => {
+                println!(
+                    "  R10F      : session=0x{:08x} seq={} {}x{} stride={} flags=0x{:x}",
+                    h.session_id, h.capture_seq, h.width, h.height, h.stride, h.flags
+                );
+                println!(
+                    "  R10F CRC  : payload=0x{:08x} header=0x{:08x}（parse 内部已逐字节复算通过）",
+                    h.payload_crc32, h.header_crc32
+                );
+            }
+            Err(e) => {
+                eprintln!("!! R10F 严格解析失败：{}（拒绝发布；RC 槽头编号/长度一致也无效）", e);
+                return EX_INCONSISTENT;
+            }
+        }
     }
 
     // ---- 7. 搬运转查：只有环形缓冲绕回一圈才可能盖掉刚取的这一帧 ----

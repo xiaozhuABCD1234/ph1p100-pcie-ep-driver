@@ -13,6 +13,7 @@
 pub mod getopt;
 pub mod ioctl;
 pub mod parse;
+pub mod rka1;
 pub mod sys;
 
 /// 与 C 版一样按退出码结束进程；退出前把 stdout 冲干净（process::exit 不跑析构）。

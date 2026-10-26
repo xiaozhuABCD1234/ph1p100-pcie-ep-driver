@@ -412,6 +412,10 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
     case ANLOGIC_IOCPUSHCFG:
         return anlogic_pci_link_ioctl(cdev, cmd, (void __user *)arg);
 
+    /* T07: RKA1 safety extension (anlogic_pci_rka1.c) */
+    case ANLOGIC_IOCRKA1:
+        return anlogic_pci_rka1_ioctl(hw, arg);
+
     default:
         pr_err("UNKNOWN ioctl cmd 0x%x.\n", cmd);
         return -ENOTTY;

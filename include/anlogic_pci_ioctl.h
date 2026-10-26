@@ -113,6 +113,31 @@ typedef struct cfgwrite {
  */
 #define ANLOGIC_FRAME_MAGIC     0x4D524641u   /* 小端字节序为 'A','F','R','M' */
 
+/*
+ * T07：主机侧槽布局与 R10F 传输长度（三层长度分别命名，别再混用）。
+ *   host 侧偏移 0..15      : struct anlogic_frame_slot_hdr（16 字节，**布局不变**）
+ *   host 侧偏移 16..127    : 112 字节零 padding（驱动清零，不参与任何 CRC）
+ *   host 侧偏移 128        : R10F 头（128 字节）
+ *   之后                   : packed RAW10 有效载荷 raw_bytes = payload_bytes
+ *   末尾                   : DMA 4KiB 对齐尾零（transport tail）
+ * FPGA 的 MWr 目标 = 槽基址 + hdr_bytes(=128)；传输总量 = dma_bytes。
+ */
+#define ANLOGIC_FRAME_HDR_BYTES      128u        /* 传输数据起点（含 16B 槽头 + 112B 零 pad） */
+#define ANLOGIC_FRAME_PREFIX_PAD     112u        /* 16 + 112 = 128 */
+#define ANLOGIC_FRAME_R10F_HDR       128u        /* R10F 头长度（与 host 前缀是两层 128B） */
+#define ANLOGIC_FRAME_DEF_WIDTH      1920u
+#define ANLOGIC_FRAME_DEF_HEIGHT     1080u
+#define ANLOGIC_FRAME_RAW_BYTES      2592000u    /* 1920x1080 packed RAW10（stride 2400B/行） */
+#define ANLOGIC_FRAME_PAYLOAD_BYTES  ANLOGIC_FRAME_RAW_BYTES
+#define ANLOGIC_FRAME_DMA_BYTES      2592768u    /* ceil((128+2592000)/4096)*4096 = 633*4096 */
+#define ANLOGIC_FRAME_TAIL_PAD       (ANLOGIC_FRAME_DMA_BYTES - \
+                                      (ANLOGIC_FRAME_R10F_HDR + ANLOGIC_FRAME_PAYLOAD_BYTES)) /* 640B */
+#define ANLOGIC_FRAME_DEF_SLOT_BYTES ANLOGIC_FRAME_DMA_BYTES
+#define ANLOGIC_FRAME_DEF_SLOTS      1u
+
+/* 4KiB 对齐工具（stride/slot 计算都要求无溢出） */
+#define ANLOGIC_FRAME_ALIGN4K(x)     (((x) + 4095u) & ~4095u)
+
 /* 收帧缓冲的规模上限：驱动侧拿它们夹 module param，等待超时的上限两边共用 */
 #define ANLOGIC_FRAME_MAX_SLOTS         16
 #define ANLOGIC_FRAME_MAX_SLOT_BYTES    (64u * 1024u * 1024u)
@@ -195,26 +220,69 @@ struct anlogic_ioc_frame_wait {
 #define ANLOGIC_BAR_PUSH_ERR_OFF    0xC8u   /* 最近一次推帧错误码 */
 #define ANLOGIC_BAR_PUSH_TLP_OFF    0xCCu   /* 最近一帧发出的 MWr 数（正常 2400） */
 
-/* 本驱动要读写的寄存器里偏移最大的那个（+1），用来判 BAR0 映射长度够不够 */
-#define ANLOGIC_BAR_LINK_WIN_END    (ANLOGIC_BAR_PUSH_TLP_OFF + 4u)
+/* 本驱动要读写的寄存器里偏移最大的那个（+1），用来判 BAR0 映射长度够不够。
+ * T07：RKA1 安全扩展把窗口推到 0x12C（0x100..0x11C 合同寄存器 + 0x120..0x12C
+ * CSI 诊断），所以这里必须 >= 0x130。旧值 0xD0 会让扩展寄存器读写全部越界。 */
+#define ANLOGIC_BAR_LINK_WIN_END    0x130u
+
+/* ---- T07：RKA1 安全扩展窗口（contract/registers.json，0x100..0x11C）---- */
+#define ANLOGIC_BAR_TX_CAP_OFF      0x100u   /* DMA_CAP_BYTES：主机分配容量（字节） */
+#define ANLOGIC_BAR_TX_SESSION_OFF  0x104u   /* SESSION_ID：非零会话号 */
+#define ANLOGIC_BAR_TX_CMD_OFF      0x108u   /* TX_CMD：W1，读恒 0 */
+#define ANLOGIC_BAR_TX_ACK_SEQ_OFF  0x10Cu   /* ACK_SEQ：待匹配完成序号（门铃值） */
+#define ANLOGIC_BAR_TX_ACK_SESS_OFF 0x110u   /* ACK_SESSION：待匹配会话号 */
+#define ANLOGIC_BAR_TX_STATUS_OFF   0x114u   /* TX_STATUS：RO */
+#define ANLOGIC_BAR_EXT_MAGIC_OFF   0x118u   /* EXT_MAGIC：RO，0x31414B52 = "RKA1" */
+#define ANLOGIC_BAR_EXT_VERSION_OFF 0x11Cu   /* EXT_VERSION：RO，major<<16|minor */
+
+#define ANLOGIC_RKA1_EXT_MAGIC      0x31414B52u  /* 小端字节序 = 'R','K','A','1' */
+#define ANLOGIC_RKA1_EXT_VERSION    0x00010000u  /* major 1 / minor 0 */
+#define ANLOGIC_RKA1_EXT_VERSION_MAJOR(v) (((v) >> 16) & 0xffffu)
+
+/* TX_CMD（0x108）位：每笔写必须恰好一个 bit 置位 */
+#define ANLOGIC_RKA1_CMD_ARM        0x1u
+#define ANLOGIC_RKA1_CMD_ACK        0x2u
+#define ANLOGIC_RKA1_CMD_CANCEL     0x4u
+
+/* TX_STATUS（0x114）位 */
+#define ANLOGIC_RKA1_ST_ARMED       0x01u
+#define ANLOGIC_RKA1_ST_BUSY        0x02u
+#define ANLOGIC_RKA1_ST_HELD        0x04u
+#define ANLOGIC_RKA1_ST_REJECT      0x08u
+#define ANLOGIC_RKA1_ST_DRAINING    0x10u
+
+/* 推帧错误码（0xC8）在旧 0..4 之上新增 5..11（与 RTL ddr_frame_pusher.v 一致） */
+#define ANLOGIC_PUSH_ERR_NOT_ARMED  5u   /* 有完整帧但没有 one-shot 额度 */
+#define ANLOGIC_PUSH_ERR_ARM_REJ    6u   /* ARM 被拒（descriptor 校验失败） */
+#define ANLOGIC_PUSH_ERR_CANCEL     7u   /* CANCEL 取消 */
+#define ANLOGIC_PUSH_ERR_HELD       8u   /* HELD 期间源又出帧（忽略） */
+#define ANLOGIC_PUSH_ERR_SRC        9u   /* 源/描述符不一致 */
+#define ANLOGIC_PUSH_ERR_CFG        10u  /* 活动期写配置被拒 */
+#define ANLOGIC_PUSH_ERR_BAD_ACK    11u  /* ACK 不匹配 */
 
 /* CTRL（0x44）位定义 */
 #define ANLOGIC_CTRL_ENABLE     0x00000001u  /* bit0  总使能 */
 #define ANLOGIC_CTRL_TRIGGER    0x00000002u  /* bit1  单帧触发（自清，测试图源用） */
 #define ANLOGIC_CTRL_MCLK_SEL   0x00000004u  /* bit2  电平一变就重跑一次传感器初始化（xclr 拉放 + 201 条表） */
-#define ANLOGIC_CTRL_CAM_SEL    0x00000010u  /* bit4  帧缓存写源：1 = 相机，0 = 测试图 */
+#define ANLOGIC_CTRL_RSVD4      0x00000010u  /* bit4  保留：写 0/读 0（旧版当「帧缓存写源」用，T07 废弃） */
 #define ANLOGIC_CTRL_DDR_EN     0x00000020u  /* bit5  每完成一帧自动搬进 DDR3 */
-#define ANLOGIC_CTRL_PUSH_EN    0x00000040u  /* bit6  每有一帧就用 MWr 推给主机 */
+#define ANLOGIC_CTRL_PUSH_EN    0x00000040u  /* bit6  推帧模式使能（**不授权发包**，授权靠 RKA1 ARM） */
 #define ANLOGIC_CTRL_PUSH_SRC   0x00000080u  /* bit7  推帧数据源：0 = DDR3，1 = 片内 ERAM */
+#define ANLOGIC_CTRL_CAM_B      0x00000100u  /* bit8  推帧取哪一路（0 = A，1 = B） */
 
 /*
- * 探测时初始化链路的位：总使能 + 相机写源 + DDR 搬运 + 推帧，bit7 保持 0。
- * bit7=0 是必须的：DDR3 那一帧才是「相机 → DDR → 主机」这条链路的中间站，
- * 片内 ERAM 源会与 DDR 搬运抢帧缓存唯一的读口（见 ep_bar_win.v 的说明）。
- * bit2 不在里面：它是重触发电平，由驱动按当前值就地翻转（见 anlogic_pci_link.c）。
+ * 探测/初始化链路时使用的位：总使能 + DDR 搬运 + 推帧模式。
+ * ★ T07 变更：
+ *   · 不再包含 bit4（旧「相机写源」位，RTL 里是保留位，写 1 读回 0 ⇒ 旧 ARM 掩码
+ *     0x71 与读回必然不符，是无效旧行为）；
+ *   · bit6 只是「模式使能」，**不产生任何 DMA**：真正的发包授权是 RKA1 的
+ *     ARM_ONE_SHOT（0x108.bit0），一次授权最多完成一帧，完成后 held 直到匹配 ACK；
+ *   · bit7 保持 0（DDR3 源；ERAM 源会与 DDR 搬运抢帧缓存唯一读口）；
+ *   · B 路把 ANLOGIC_CTRL_CAM_B 一并置上（掩码 0x161）。
  */
-#define ANLOGIC_CTRL_ARM_BITS   (ANLOGIC_CTRL_ENABLE | ANLOGIC_CTRL_CAM_SEL | \
-                                 ANLOGIC_CTRL_DDR_EN | ANLOGIC_CTRL_PUSH_EN)
+#define ANLOGIC_CTRL_ARM_BITS   (ANLOGIC_CTRL_ENABLE | ANLOGIC_CTRL_DDR_EN | \
+                                 ANLOGIC_CTRL_PUSH_EN)
+#define ANLOGIC_CTRL_ARM_BITS_B (ANLOGIC_CTRL_ARM_BITS | ANLOGIC_CTRL_CAM_B)
 
 /* A 路相机状态字（0x80）里的 lane_valid：bit[4:1]，非 0 = MIPI 链路已锁 */
 #define ANLOGIC_CAM_STAT_LANE_SHIFT     1u
@@ -339,5 +407,38 @@ struct anlogic_ioc_push_cfg {
 #define ANLOGIC_IOCLINKSTATUS   _IOR(ANLOGIC_IOC_MAGIC, 12, struct anlogic_ioc_link_status)
 #define ANLOGIC_IOCLINKRETRIG   _IOWR(ANLOGIC_IOC_MAGIC, 13, struct anlogic_ioc_link_retrig)
 #define ANLOGIC_IOCPUSHCFG      _IOWR(ANLOGIC_IOC_MAGIC, 14, struct anlogic_ioc_push_cfg)
+/* T07 新增：RKA1 安全扩展操作（新结构体，不动旧结构体布局/编号） */
+#define ANLOGIC_IOCRKA1         _IOWR(ANLOGIC_IOC_MAGIC, 15, struct anlogic_ioc_rka1)
+
+/*
+ * RKA1 安全扩展操作（T07 新增）。所有返回值都先过 EXT_MAGIC/EXT_VERSION 门禁：
+ * 旧 peer FPGA 在 0x118 读回 DEAD_BEEF ⇒ probe 失败，本 ioctl 一律 -EOPNOTSUPP，
+ * 绝不退回旧「写 CTRL 就连续推帧」的行为。
+ */
+enum ANLOGIC_RKA1_OPS {
+    ANLOGIC_RKA1_OP_PROBE = 0,   /* 只探测：读 EXT_MAGIC/VERSION/TX_STATUS */
+    ANLOGIC_RKA1_OP_CONFIGURE,   /* 写 CAP/SESSION（活动期会被 RTL 拒绝） */
+    ANLOGIC_RKA1_OP_ARM,         /* 一键 ARM_ONE_SHOT（一个额度最多一帧） */
+    ANLOGIC_RKA1_OP_ACK,         /* ACK_RELEASE：必须匹配 held(session,seq) */
+    ANLOGIC_RKA1_OP_CANCEL       /* CANCEL：完成已开包、不发成功门铃、排空 */
+};
+
+struct anlogic_ioc_rka1 {
+    unsigned int op;            /* in  ANLOGIC_RKA1_OP_* */
+    unsigned int cap_bytes;     /* in  OP_CONFIGURE：主机分配容量（>= 帧 dma_bytes） */
+    unsigned int session;       /* in  OP_CONFIGURE：非零会话号 */
+    unsigned int ack_seq;       /* in  OP_ACK：门铃里收到的完成序号 */
+    unsigned int ack_session;   /* in  OP_ACK：对应的会话号 */
+    unsigned int ext_magic;     /* out 0x118 读回（必须 == ANLOGIC_RKA1_EXT_MAGIC） */
+    unsigned int ext_version;   /* out 0x11C 读回 */
+    unsigned int tx_status;     /* out 0x114 读回 */
+    unsigned int push_err;      /* out 0xC8 最近错误码 */
+    unsigned int push_status;   /* out 0xC4 推帧状态 */
+    unsigned int push_done;     /* out 0xC0 已推帧数 */
+    unsigned int armed;         /* out 1 = 本次 ARM 成功（TX_STATUS.bit0） */
+    unsigned int held;          /* out 1 = TX_STATUS.bit2（等匹配 ACK） */
+    unsigned int busy;          /* out 1 = TX_STATUS.bit1 */
+    unsigned int rejected;      /* out 1 = TX_STATUS.bit3（粘滞拒绝/错误位） */
+};
 
 #endif /* ANLOGIC_PCI_IOCTL_H */

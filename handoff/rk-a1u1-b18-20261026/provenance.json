@@ -1,0 +1,21 @@
+{
+  "source_capture": "workflow/runs/20261020-0209_singleA_aplus_closedloop/T10.b18-b17-b/r0/board/captures_full/com8_300s.bin",
+  "source_capture_sha256": "143aa87d78f720afcbac58989f6205d82d79bffb2e4cf24b7f505823a3d009e4",
+  "offset": 646526,
+  "extracted_bytes": 2594750,
+  "reference_files": {
+    "a1_ref.py": {
+      "source": "upstream/ph1p100-pcie-ep-fpga/tools/codec/a1_ref.py",
+      "sha256": "bf662a2ccd2b11e8655c31e3a33292e2fe81b18a0cf9593a5efb947b3faae5dc",
+      "packaged_sha256": "bf662a2ccd2b11e8655c31e3a33292e2fe81b18a0cf9593a5efb947b3faae5dc",
+      "packaging_change": "CRLF normalized to LF only; source SHA remains recorded"
+    },
+    "a1_inflate_strict.py": {
+      "source": "upstream/ph1p100-pcie-ep-fpga/tools/codec/a1_inflate_strict.py",
+      "sha256": "8db2b6886f77fcec52f34d5f4aa5ae15b7922592e312c625c022ef0031027e88",
+      "packaged_sha256": "8db2b6886f77fcec52f34d5f4aa5ae15b7922592e312c625c022ef0031027e88",
+      "packaging_change": "CRLF normalized to LF only; source SHA remains recorded"
+    }
+  },
+  "notes": "Historical b18 transport/decode baseline; not the new FPGA integration candidate or final PCIe transport contract."
+}

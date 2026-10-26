@@ -40,14 +40,9 @@
 
 #include "anlogic_pci.h"
 
-/* 一帧的默认几何：640x480 灰度 = 307200 字节 */
-#define ANLOGIC_FRAME_DEF_WIDTH     640u
-#define ANLOGIC_FRAME_DEF_HEIGHT    480u
-/*
- * 默认单槽。推帧引擎只往主机给的那一个目标地址写（0xB0/0xB4 由驱动探测时写好、
- * 之后不逐帧轮换），所以帧永远落在同一个槽里；多槽下用户态按 (seq-1)%slots 取槽
- * 会取到没数据的槽。要跑别的路径（PIO 0x60 / 只读 DDR3）时可以用 frame_slots 开多槽。
- */
+/* Default geometry comes from include/anlogic_pci_ioctl.h (T07: 1920x1080 RAW10,
+ * dma_bytes 2592768).  Do not redefine it locally: two different defaults in the
+ * same build is exactly how host and FPGA ended up disagreeing before. */
 #define ANLOGIC_FRAME_DEF_SLOTS     1u
 /* 轮询间隔，也是「等帧」时的睡眠粒度 */
 #define ANLOGIC_FRAME_POLL_MS       10u
@@ -63,7 +58,8 @@ static unsigned int frame_height = ANLOGIC_FRAME_DEF_HEIGHT;
 module_param(frame_height, uint, 0444);
 MODULE_PARM_DESC(frame_height, "收帧缓冲的每帧高度（像素），默认 480");
 
-/* 0 表示用 frame_width * frame_height（默认 640x480 灰度 = 307200 字节） */
+/* 0 表示用 frame_width * frame_height（T07 默认 1920x1080 = 2592000B packed RAW10，
+ * 但主机侧槽字节数是 dma_bytes 2592768，见 frame_slot_bytes 的说明） */
 static unsigned int frame_slot_bytes;
 module_param(frame_slot_bytes, uint, 0444);
 MODULE_PARM_DESC(frame_slot_bytes, "一帧像素字节数，0 = frame_width*frame_height（默认 307200）");
@@ -158,7 +154,7 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     unsigned int height = frame_height;
     unsigned int slot_bytes = frame_slot_bytes;
     unsigned int slots = frame_slots;
-    unsigned int hdr_bytes = sizeof(struct anlogic_frame_slot_hdr);
+    unsigned int hdr_bytes = ANLOGIC_FRAME_HDR_BYTES;
     unsigned int stride;
     size_t size;
 
@@ -167,31 +163,52 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
         return -EINVAL;
     }
 
-    /* 模块参数是 root 可控的，先夹到合法区间，别让 0 槽/0 字节流下去 */
+    /*
+     * T07: module params are root-controllable, but we must NOT silently clamp
+     * them any more.  A wrong geometry used to be quietly replaced with the
+     * 640x480 default, which produced frames the host could not distinguish
+     * from the requested ones.  Now an illegal value fails the allocation so
+     * the caller refuses to open the link.
+     */
     if (!width || width > ANLOGIC_FRAME_MAX_W) {
-        pr_warn("收帧缓冲：frame_width=%u 非法，改用默认 %u。\n", width,
-                ANLOGIC_FRAME_DEF_WIDTH);
-        width = ANLOGIC_FRAME_DEF_WIDTH;
+        pr_err("frame buffer: frame_width=%u out of range (max %u).\n",
+               width, ANLOGIC_FRAME_MAX_W);
+        return -EINVAL;
     }
     if (!height || height > ANLOGIC_FRAME_MAX_H) {
-        pr_warn("收帧缓冲：frame_height=%u 非法，改用默认 %u。\n", height,
-                ANLOGIC_FRAME_DEF_HEIGHT);
-        height = ANLOGIC_FRAME_DEF_HEIGHT;
+        pr_err("frame buffer: frame_height=%u out of range (max %u).\n",
+               height, ANLOGIC_FRAME_MAX_H);
+        return -EINVAL;
     }
     if (!slot_bytes)
-        slot_bytes = width * height;
+        slot_bytes = ANLOGIC_FRAME_DMA_BYTES;
     if (slot_bytes > ANLOGIC_FRAME_MAX_SLOT_BYTES) {
-        pr_warn("收帧缓冲：frame_slot_bytes=%u 超过上限 %u，夹到上限。\n",
-                slot_bytes, ANLOGIC_FRAME_MAX_SLOT_BYTES);
-        slot_bytes = ANLOGIC_FRAME_MAX_SLOT_BYTES;
+        pr_err("frame buffer: frame_slot_bytes=%u over the %u cap.\n",
+               slot_bytes, ANLOGIC_FRAME_MAX_SLOT_BYTES);
+        return -EINVAL;
+    }
+    if (slot_bytes & 0xfffu) {
+        pr_err("frame buffer: frame_slot_bytes=%u is not a 4KiB multiple.\n",
+               slot_bytes);
+        return -EINVAL;
     }
     if (!slots || slots > ANLOGIC_FRAME_MAX_SLOTS) {
-        pr_warn("收帧缓冲：frame_slots=%u 非法，改用 %u。\n", slots,
-                ANLOGIC_FRAME_DEF_SLOTS);
-        slots = ANLOGIC_FRAME_DEF_SLOTS;
+        pr_err("frame buffer: frame_slots=%u out of range (max %u).\n",
+               slots, ANLOGIC_FRAME_MAX_SLOTS);
+        return -EINVAL;
+    }
+    if (slots != 1) {
+        /*
+         * One-shot safety slot: the FPGA pusher writes every frame to the same
+         * address, so >1 slot would only ever be filled in slot 0.  Refuse
+         * instead of pretending a ring exists.
+         */
+        pr_err("frame buffer: frame_slots=%u unsupported (single slot only).\n",
+               slots);
+        return -EINVAL;
     }
 
-    /* 每槽页对齐：槽头 + 一帧像素，再向上取整到页 */
+    /* 每槽页对齐：128B 传输前缀 + 一帧 dma_bytes，再向上取整到页 */
     stride = (unsigned int)PAGE_ALIGN((size_t)hdr_bytes + slot_bytes);
     /*
      * 布局（与 include/anlogic_pci_ioctl.h 的说明一致，FPGA 按这个算 MWr 目标）：

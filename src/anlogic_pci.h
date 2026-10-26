@@ -144,6 +144,18 @@ struct anlogic_pci_hw {
     unsigned int link_armed;                  /* 推帧目标/门铃地址与使能位都已就位 */
 
     /*
+     * T07: RKA1 safety extension state (see anlogic_pci_rka1.c).
+     *   rka1_ext_ok = 0 means the FPGA image has no RKA1 extension
+     *   (0x118 != "RKA1"); every RKA1 op then returns -EOPNOTSUPP and the
+     *   driver never falls back to the legacy "write CTRL and push" path.
+     */
+    unsigned int rka1_ext_ok;
+    u32 rka1_ext_version;
+    u32 rka1_cap_bytes;
+    u32 rka1_session;
+    u32 rka1_tx_status;
+
+    /*
      * 生命周期与串行化：fd 打开的引用计数（mmap 出来的 VMA 不另计数，它在 fd 的
      * release 之前一直把文件钉着，见 anlogic_pci_hw.c 的说明）。
      */
@@ -214,6 +226,15 @@ void anlogic_pci_ctrl_init(struct anlogic_pci_cdev *cdev);
 /* anlogic_pci_link.c（相机链路 / 推帧：探测时初始化、状态查询、重触发、地址复核/重设） */
 int anlogic_pci_link_arm(struct anlogic_pci_hw *hw);
 void anlogic_pci_link_disarm(struct anlogic_pci_hw *hw);
+
+/* T07: RKA1 safety extension (anlogic_pci_rka1.c) */
+int anlogic_pci_rka1_probe(struct anlogic_pci_hw *hw);
+int anlogic_pci_rka1_configure(struct anlogic_pci_hw *hw, u32 cap_bytes, u32 session);
+int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw);
+int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session);
+int anlogic_pci_rka1_cancel(struct anlogic_pci_hw *hw);
+int anlogic_pci_rka1_status(struct anlogic_pci_hw *hw, u32 *status);
+long anlogic_pci_rka1_ioctl(struct anlogic_pci_hw *hw, unsigned long arg);
 long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
                             void __user *arg);
 

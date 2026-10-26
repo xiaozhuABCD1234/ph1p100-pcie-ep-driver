@@ -1,5 +1,8 @@
 # PH1P100 PCIe 端点（RK3588 主机侧）驱动
 
+当前入口（2026-10-27）：队友先看 [A1U1 真样例交接包](handoff/rk-a1u1-b18-20261026/README.md)，保留已经成功的 RAW/R10F 收图和解码软件，再增加文件输入。原仓 `main` 的本次同步范围、配对协议及已知接收循环/CANCEL 局限见 [同步记录](docs/PROJECT_SYNC_20261027.md)；逐文件来源与 SHA 见 [复制清单](docs/sync-20261027-files.json)。下文保留历史构建与诊断说明，不能视为本次 RK 板验通过。
+
+
 安路 PH1P100 FPGA 作 PCIe EP、RK3588 作 RC 时，RC 侧的内核模块与用户态程序。
 由厂商 `anlogic_pci` 驱动移植而来，原先只做 PIO 寄存器访问；现在另加了一层「收帧缓冲」
 （dma_alloc_coherent 分配、物理地址/序号经 ioctl 给用户态、FPGA 侧拿它当 MWr 目标），
