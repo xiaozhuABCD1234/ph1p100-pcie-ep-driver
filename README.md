@@ -214,3 +214,11 @@ ls /dev/ANLOGIC-PCI0_frame            # 必须出现，否则还是厂商版驱�
   CTRL[4] 已保留（读回 0），硬件抓帧默认直接以 EX_DEV 拒绝、不碰 BAR；只有显式
   `--legacy` 才走旧路径（老位流调试用）。`--decode` / `--selftest` 仍可离线用。
   当前收帧请用 `frame_grab`（R10F）或 `tools/r10f_view.py`（PNG）。
+
+## 代码风格
+
+- C 源文件与头文件统一 **tab 缩进（8 列）**，格式化后 `checkpatch.pl --file` 为
+  **0 error**；剩余 warning 主要是长行、跨行字符串、以及 ABI 头里的 typedef。
+- 用户态 Rust 用 rustfmt 默认风格，Python 只用标准库；日志格式见上面的“日志约定”。
+- 做完功能改动后至少跑：`make ... W=1 modules`、`cargo test --offline`、
+  `r10f_strict.py selftest`、`r10f_tools_consistency.py`、`git diff --check`。

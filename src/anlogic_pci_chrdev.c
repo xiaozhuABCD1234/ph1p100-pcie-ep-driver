@@ -18,22 +18,22 @@
 
 static struct class *anlogic_pci_class;
 
-static const char * const anlogic_pci_node_names[ANLOGIC_PCI_CDEV_TYPE_NUM] = {
-    [ANLOGIC_PCI_CDEV_USER] = ANLOGIC_PCI_NODE_NAME "%d_user",
-    [ANLOGIC_PCI_CDEV_CTRL] = ANLOGIC_PCI_NODE_NAME "%d_control",
-    [ANLOGIC_PCI_CDEV_FRAME] = ANLOGIC_PCI_NODE_NAME "%d_frame",
+static const char *const anlogic_pci_node_names[ANLOGIC_PCI_CDEV_TYPE_NUM] = {
+	[ANLOGIC_PCI_CDEV_USER] = ANLOGIC_PCI_NODE_NAME "%d_user",
+	[ANLOGIC_PCI_CDEV_CTRL] = ANLOGIC_PCI_NODE_NAME "%d_control",
+	[ANLOGIC_PCI_CDEV_FRAME] = ANLOGIC_PCI_NODE_NAME "%d_frame",
 };
 
 static inline void anlogic_pci_card_flag_set(struct anlogic_pci_card *card,
-                                             enum anlogic_pci_card_flags fbit)
+					     enum anlogic_pci_card_flags fbit)
 {
-    card->flags |= 1 << fbit;
+	card->flags |= 1 << fbit;
 }
 
 static inline int anlogic_pci_card_flag_test(struct anlogic_pci_card *card,
-                                             enum anlogic_pci_card_flags fbit)
+					     enum anlogic_pci_card_flags fbit)
 {
-    return card->flags & (1 << fbit);
+	return card->flags & (1 << fbit);
 }
 
 /*
@@ -42,308 +42,298 @@ static inline int anlogic_pci_card_flag_test(struct anlogic_pci_card *card,
  */
 int anlogic_pci_cdev_check(const char *fname, struct anlogic_pci_cdev *cdev)
 {
-    struct anlogic_pci_hw *hw;
+	struct anlogic_pci_hw *hw;
 
-    if (!cdev || cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
-        pr_err("%s, cdev 0x%p, magic 0x%lx.\n", fname, cdev,
-               cdev ? cdev->magic : 0xFFFFFFFF);
-        return -EINVAL;
-    }
+	if (!cdev || cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
+		pr_err("%s, cdev 0x%p, magic 0x%lx.\n", fname, cdev,
+		       cdev ? cdev->magic : 0xFFFFFFFF);
+		return -EINVAL;
+	}
 
-    hw = cdev->hw;
-    if (!hw || hw->magic != ANLOGIC_PCI_MAGIC_DEVICE) {
-        pr_err("%s, hw 0x%p, magic 0x%lx.\n", fname, hw,
-               hw ? hw->magic : 0xFFFFFFFF);
-        return -EINVAL;
-    }
+	hw = cdev->hw;
+	if (!hw || hw->magic != ANLOGIC_PCI_MAGIC_DEVICE) {
+		pr_err("%s, hw 0x%p, magic 0x%lx.\n", fname, hw, hw ? hw->magic : 0xFFFFFFFF);
+		return -EINVAL;
+	}
 
-    return 0;
+	return 0;
 }
 
 int anlogic_pci_cdev_open(struct inode *inode, struct file *file)
 {
-    struct anlogic_pci_cdev *cdev;
-    int rv;
+	struct anlogic_pci_cdev *cdev;
+	int rv;
 
-    /* 从 inode 找回包含它的字符设备结构 */
-    cdev = container_of(inode->i_cdev, struct anlogic_pci_cdev, cdev);
+	/* 从 inode 找回包含它的字符设备结构 */
+	cdev = container_of(inode->i_cdev, struct anlogic_pci_cdev, cdev);
 
-    if (cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
-        pr_err("cdev 0x%p inode 0x%llx magic mismatch 0x%lx\n",
-               cdev, (unsigned long long)inode->i_ino, cdev->magic);
-        return -EINVAL;
-    }
+	if (cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
+		pr_err("cdev 0x%p inode 0x%llx magic mismatch 0x%lx\n", cdev,
+		       (unsigned long long)inode->i_ino, cdev->magic);
+		return -EINVAL;
+	}
 
-    /* 取一个生命周期引用：卸载会等所有 fd/VMA 引用归零才释放 hw */
-    rv = anlogic_pci_hw_get(cdev->hw);
-    if (rv) {
-        pr_info("cdev 0x%p: device is being removed, open refused.\n", cdev);
-        return rv;
-    }
+	/* 取一个生命周期引用：卸载会等所有 fd/VMA 引用归零才释放 hw */
+	rv = anlogic_pci_hw_get(cdev->hw);
+	if (rv) {
+		pr_info("cdev 0x%p: device is being removed, open refused.\n", cdev);
+		return rv;
+	}
 
-    file->private_data = cdev;
+	file->private_data = cdev;
 
-    return 0;
+	return 0;
 }
 
 int anlogic_pci_cdev_close(struct inode *inode, struct file *file)
 {
-    struct anlogic_pci_hw *hw;
-    struct anlogic_pci_cdev *cdev = file->private_data;
+	struct anlogic_pci_hw *hw;
+	struct anlogic_pci_cdev *cdev = file->private_data;
 
-    if (!cdev) {
-        pr_err("char device with inode 0x%llx cdev NULL\n",
-               (unsigned long long)inode->i_ino);
-        return -EINVAL;
-    }
-    if (cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
-        pr_err("cdev 0x%p magic mismatch 0x%lx\n", cdev, cdev->magic);
-        return -EINVAL;
-    }
+	if (!cdev) {
+		pr_err("char device with inode 0x%llx cdev NULL\n",
+		       (unsigned long long)inode->i_ino);
+		return -EINVAL;
+	}
+	if (cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
+		pr_err("cdev 0x%p magic mismatch 0x%lx\n", cdev, cdev->magic);
+		return -EINVAL;
+	}
 
-    hw = cdev->hw;
-    if (!hw) {
-        pr_err("char device with inode 0x%llx hw NULL\n",
-               (unsigned long long)inode->i_ino);
-        return -EINVAL;
-    }
-    if (hw->magic != ANLOGIC_PCI_MAGIC_DEVICE) {
-        pr_err("hw 0x%p magic mismatch 0x%lx\n", hw, hw->magic);
-        return -EINVAL;
-    }
+	hw = cdev->hw;
+	if (!hw) {
+		pr_err("char device with inode 0x%llx hw NULL\n", (unsigned long long)inode->i_ino);
+		return -EINVAL;
+	}
+	if (hw->magic != ANLOGIC_PCI_MAGIC_DEVICE) {
+		pr_err("hw 0x%p magic mismatch 0x%lx\n", hw, hw->magic);
+		return -EINVAL;
+	}
 
-    /* 与 open 的 hw_get() 配对；这里减到 0 会唤醒等卸载的 remove 路径 */
-    anlogic_pci_hw_put(hw);
+	/* 与 open 的 hw_get() 配对；这里减到 0 会唤醒等卸载的 remove 路径 */
+	anlogic_pci_hw_put(hw);
 
-    return 0;
+	return 0;
 }
 
 /* 给 cdev 的 kobject 命名，名字与设备节点保持一致 */
-static int anlogic_pci_cdev_set_name(struct anlogic_pci_cdev *cdev,
-                                     enum anlogic_pci_cdev_type type)
+static int anlogic_pci_cdev_set_name(struct anlogic_pci_cdev *cdev, enum anlogic_pci_cdev_type type)
 {
-    struct anlogic_pci_hw *hw = cdev->hw;
-    int rv;
+	struct anlogic_pci_hw *hw = cdev->hw;
+	int rv;
 
-    rv = kobject_set_name(&cdev->cdev.kobj, anlogic_pci_node_names[type],
-                          hw->idx);
-    if (rv)
-        pr_err("%s: type 0x%x, failed %d.\n", __func__, type, rv);
+	rv = kobject_set_name(&cdev->cdev.kobj, anlogic_pci_node_names[type], hw->idx);
+	if (rv)
+		pr_err("%s: type 0x%x, failed %d.\n", __func__, type, rv);
 
-    return rv;
+	return rv;
 }
 
 static int anlogic_pci_cdev_add_sys_device(struct anlogic_pci_cdev *cdev,
-                                           enum anlogic_pci_cdev_type type)
+					   enum anlogic_pci_cdev_type type)
 {
-    struct anlogic_pci_hw *hw = cdev->hw;
+	struct anlogic_pci_hw *hw = cdev->hw;
 
-    cdev->sys_device = device_create(anlogic_pci_class, &hw->pdev->dev,
-                                     cdev->cdevno, NULL,
-                                     anlogic_pci_node_names[type], hw->idx);
-    if (!cdev->sys_device) {
-        pr_err("device_create(%s) failed\n", anlogic_pci_node_names[type]);
-        return -1;
-    }
+	cdev->sys_device = device_create(anlogic_pci_class, &hw->pdev->dev, cdev->cdevno, NULL,
+					 anlogic_pci_node_names[type], hw->idx);
+	if (!cdev->sys_device) {
+		pr_err("device_create(%s) failed\n", anlogic_pci_node_names[type]);
+		return -1;
+	}
 
-    return 0;
+	return 0;
 }
 
 static int anlogic_pci_cdev_destroy(struct anlogic_pci_cdev *cdev)
 {
-    if (!cdev) {
-        pr_warn("cdev NULL.\n");
-        return -EINVAL;
-    }
-    if (cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
-        pr_warn("cdev 0x%p magic mismatch 0x%lx\n", cdev, cdev->magic);
-        return -EINVAL;
-    }
-    if (!cdev->hw) {
-        pr_err("hw NULL\n");
-        return -EINVAL;
-    }
-    if (!anlogic_pci_class) {
-        pr_err("anlogic_pci_class NULL\n");
-        return -EINVAL;
-    }
-    if (!cdev->sys_device) {
-        pr_err("cdev sys_device NULL\n");
-        return -EINVAL;
-    }
+	if (!cdev) {
+		pr_warn("cdev NULL.\n");
+		return -EINVAL;
+	}
+	if (cdev->magic != ANLOGIC_PCI_MAGIC_CHAR) {
+		pr_warn("cdev 0x%p magic mismatch 0x%lx\n", cdev, cdev->magic);
+		return -EINVAL;
+	}
+	if (!cdev->hw) {
+		pr_err("hw NULL\n");
+		return -EINVAL;
+	}
+	if (!anlogic_pci_class) {
+		pr_err("anlogic_pci_class NULL\n");
+		return -EINVAL;
+	}
+	if (!cdev->sys_device) {
+		pr_err("cdev sys_device NULL\n");
+		return -EINVAL;
+	}
 
-    device_destroy(anlogic_pci_class, cdev->cdevno);
-    cdev_del(&cdev->cdev);
+	device_destroy(anlogic_pci_class, cdev->cdevno);
+	cdev_del(&cdev->cdev);
 
-    return 0;
+	return 0;
 }
 
 /* 建一个节点：先申请 char 区域（整卡一次），再挂这个节点 */
-static int anlogic_pci_cdev_create(struct anlogic_pci_card *card,
-                                   struct anlogic_pci_cdev *cdev, int bar,
-                                   enum anlogic_pci_cdev_type type)
+static int anlogic_pci_cdev_create(struct anlogic_pci_card *card, struct anlogic_pci_cdev *cdev,
+				   int bar, enum anlogic_pci_cdev_type type)
 {
-    struct anlogic_pci_hw *hw = card->hw;
-    dev_t dev;
-    int rv;
+	struct anlogic_pci_hw *hw = card->hw;
+	dev_t dev;
+	int rv;
 
-    if (!card->major) {
-        rv = alloc_chrdev_region(&dev, ANLOGIC_PCI_MINOR_BASE,
-                                 ANLOGIC_PCI_MINOR_COUNT,
-                                 ANLOGIC_PCI_NODE_NAME);
-        if (rv) {
-            pr_err("unable to allocate cdev region %d.\n", rv);
-            return rv;
-        }
-        card->major = MAJOR(dev);
-        pr_info("cdev region MAJOR: %d, MINOR: %d\n", card->major,
-                MINOR(dev));
-    }
+	if (!card->major) {
+		rv = alloc_chrdev_region(&dev, ANLOGIC_PCI_MINOR_BASE, ANLOGIC_PCI_MINOR_COUNT,
+					 ANLOGIC_PCI_NODE_NAME);
+		if (rv) {
+			pr_err("unable to allocate cdev region %d.\n", rv);
+			return rv;
+		}
+		card->major = MAJOR(dev);
+		pr_info("cdev region MAJOR: %d, MINOR: %d\n", card->major, MINOR(dev));
+	}
 
-    cdev->magic = ANLOGIC_PCI_MAGIC_CHAR;
-    cdev->cdev.owner = THIS_MODULE;
-    cdev->card = card;
-    cdev->hw = hw;
-    cdev->bar = bar;
+	cdev->magic = ANLOGIC_PCI_MAGIC_CHAR;
+	cdev->cdev.owner = THIS_MODULE;
+	cdev->card = card;
+	cdev->hw = hw;
+	cdev->bar = bar;
 
-    rv = anlogic_pci_cdev_set_name(cdev, type);
-    if (rv < 0)
-        return rv;
+	rv = anlogic_pci_cdev_set_name(cdev, type);
+	if (rv < 0)
+		return rv;
 
-    /* 非 SG DMA 节点用 type 当 minor：0 = _user，1 = _control，2 = _frame */
-    switch (type) {
-    case ANLOGIC_PCI_CDEV_USER:
-    case ANLOGIC_PCI_CDEV_CTRL:
-        anlogic_pci_ctrl_init(cdev);
-        break;
-    case ANLOGIC_PCI_CDEV_FRAME:
-        anlogic_pci_frame_init(cdev);
-        break;
-    default:
-        pr_info("type 0x%x NOT supported.\n", type);
-        return -EINVAL;
-    }
-    cdev->cdevno = MKDEV(card->major, type);
+	/* 非 SG DMA 节点用 type 当 minor：0 = _user，1 = _control，2 = _frame */
+	switch (type) {
+	case ANLOGIC_PCI_CDEV_USER:
+	case ANLOGIC_PCI_CDEV_CTRL:
+		anlogic_pci_ctrl_init(cdev);
+		break;
+	case ANLOGIC_PCI_CDEV_FRAME:
+		anlogic_pci_frame_init(cdev);
+		break;
+	default:
+		pr_info("type 0x%x NOT supported.\n", type);
+		return -EINVAL;
+	}
+	cdev->cdevno = MKDEV(card->major, type);
 
-    rv = cdev_add(&cdev->cdev, cdev->cdevno, 1);
-    if (rv < 0) {
-        pr_err("cdev_add failed %d, type 0x%x.\n", rv, type);
-        goto unregister_region;
-    }
+	rv = cdev_add(&cdev->cdev, cdev->cdevno, 1);
+	if (rv < 0) {
+		pr_err("cdev_add failed %d, type 0x%x.\n", rv, type);
+		goto unregister_region;
+	}
 
-    if (anlogic_pci_class) {
-        rv = anlogic_pci_cdev_add_sys_device(cdev, type);
-        if (rv < 0)
-            goto del_cdev;
-    }
+	if (anlogic_pci_class) {
+		rv = anlogic_pci_cdev_add_sys_device(cdev, type);
+		if (rv < 0)
+			goto del_cdev;
+	}
 
-    return 0;
+	return 0;
 
 del_cdev:
-    cdev_del(&cdev->cdev);
+	cdev_del(&cdev->cdev);
 unregister_region:
-    /*
-     * 这里不释放 char 区间：整卡 [major, 0..254] 的释放只在
-     * anlogic_pci_card_destroy_interfaces() 一处做，失败后调用方一定会走到那里。
-     * 否则按 cdev->cdevno = MKDEV(major, type) 去 unregister，既只放掉区间的一部分，
-     * 又会去放从未申请的 minor 255，造成区间记账错乱与重复释放。
-     */
-    return rv;
+	/*
+	 * 这里不释放 char 区间：整卡 [major, 0..254] 的释放只在
+	 * anlogic_pci_card_destroy_interfaces() 一处做，失败后调用方一定会走到那里。
+	 * 否则按 cdev->cdevno = MKDEV(major, type) 去 unregister，既只放掉区间的一部分，
+	 * 又会去放从未申请的 minor 255，造成区间记账错乱与重复释放。
+	 */
+	return rv;
 }
 
 int anlogic_pci_card_create_interfaces(struct anlogic_pci_card *card)
 {
-    struct anlogic_pci_hw *hw = card->hw;
-    int rv;
+	struct anlogic_pci_hw *hw = card->hw;
+	int rv;
 
-    /* 控制节点绑在寄存器窗（BAR0） */
-    rv = anlogic_pci_cdev_create(card, &card->ctrl_cdev, hw->config_bar_idx,
-                                 ANLOGIC_PCI_CDEV_CTRL);
-    if (rv < 0) {
-        pr_err("create_char(ctrl_cdev) failed\n");
-        goto fail;
-    }
-    anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_CTRL);
+	/* 控制节点绑在寄存器窗（BAR0） */
+	rv = anlogic_pci_cdev_create(card, &card->ctrl_cdev, hw->config_bar_idx,
+				     ANLOGIC_PCI_CDEV_CTRL);
+	if (rv < 0) {
+		pr_err("create_char(ctrl_cdev) failed\n");
+		goto fail;
+	}
+	anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_CTRL);
 
-    /* 用户 BAR 窗口节点，只有探测到 user BAR 时才建 */
-    if (hw->user_bar_idx >= 0) {
-        rv = anlogic_pci_cdev_create(card, &card->user_cdev,
-                                     hw->user_bar_idx,
-                                     ANLOGIC_PCI_CDEV_USER);
-        if (rv < 0) {
-            pr_err("create_char(user_cdev) failed\n");
-            goto fail;
-        }
-        anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_USER);
-    }
+	/* 用户 BAR 窗口节点，只有探测到 user BAR 时才建 */
+	if (hw->user_bar_idx >= 0) {
+		rv = anlogic_pci_cdev_create(card, &card->user_cdev, hw->user_bar_idx,
+					     ANLOGIC_PCI_CDEV_USER);
+		if (rv < 0) {
+			pr_err("create_char(user_cdev) failed\n");
+			goto fail;
+		}
+		anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_USER);
+	}
 
-    /*
-     * 收帧缓冲节点（minor 2，节点名 _frame）：只用于帧缓冲的 ioctl 与只读 mmap，
-     * 不绑任何 BAR（bar = -1，所以 ctrl 那套 BAR mmap 路径用不到它）。
-     */
-    if (hw->frame_virt) {
-        rv = anlogic_pci_cdev_create(card, &card->frame_cdev, -1,
-                                     ANLOGIC_PCI_CDEV_FRAME);
-        if (rv < 0) {
-            pr_err("create_char(frame_cdev) failed\n");
-            goto fail;
-        }
-        anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_FRAME);
-    }
+	/*
+	 * 收帧缓冲节点（minor 2，节点名 _frame）：只用于帧缓冲的 ioctl 与只读 mmap，
+	 * 不绑任何 BAR（bar = -1，所以 ctrl 那套 BAR mmap 路径用不到它）。
+	 */
+	if (hw->frame_virt) {
+		rv = anlogic_pci_cdev_create(card, &card->frame_cdev, -1, ANLOGIC_PCI_CDEV_FRAME);
+		if (rv < 0) {
+			pr_err("create_char(frame_cdev) failed\n");
+			goto fail;
+		}
+		anlogic_pci_card_flag_set(card, ANLOGIC_PCI_CARD_CDEV_FRAME);
+	}
 
-    return 0;
+	return 0;
 
 fail:
-    anlogic_pci_card_destroy_interfaces(card);
-    return -1;
+	anlogic_pci_card_destroy_interfaces(card);
+	return -1;
 }
 
 void anlogic_pci_card_destroy_interfaces(struct anlogic_pci_card *card)
 {
-    int rv;
+	int rv;
 
-    if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_CTRL)) {
-        rv = anlogic_pci_cdev_destroy(&card->ctrl_cdev);
-        if (rv < 0)
-            pr_err("Failed to destroy cdev ctrl, error 0x%x\n", rv);
-    }
+	if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_CTRL)) {
+		rv = anlogic_pci_cdev_destroy(&card->ctrl_cdev);
+		if (rv < 0)
+			pr_err("Failed to destroy cdev ctrl, error 0x%x\n", rv);
+	}
 
-    if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_USER)) {
-        rv = anlogic_pci_cdev_destroy(&card->user_cdev);
-        if (rv < 0)
-            pr_err("Failed to destroy cdev user, error 0x%x\n", rv);
-    }
+	if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_USER)) {
+		rv = anlogic_pci_cdev_destroy(&card->user_cdev);
+		if (rv < 0)
+			pr_err("Failed to destroy cdev user, error 0x%x\n", rv);
+	}
 
-    if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_FRAME)) {
-        rv = anlogic_pci_cdev_destroy(&card->frame_cdev);
-        if (rv < 0)
-            pr_err("Failed to destroy cdev frame, error 0x%x\n", rv);
-    }
+	if (anlogic_pci_card_flag_test(card, ANLOGIC_PCI_CARD_CDEV_FRAME)) {
+		rv = anlogic_pci_cdev_destroy(&card->frame_cdev);
+		if (rv < 0)
+			pr_err("Failed to destroy cdev frame, error 0x%x\n", rv);
+	}
 
-    if (card->major)
-        unregister_chrdev_region(MKDEV(card->major, ANLOGIC_PCI_MINOR_BASE),
-                                 ANLOGIC_PCI_MINOR_COUNT);
+	if (card->major)
+		unregister_chrdev_region(MKDEV(card->major, ANLOGIC_PCI_MINOR_BASE),
+					 ANLOGIC_PCI_MINOR_COUNT);
 }
 
 int anlogic_pci_chrdev_init(void)
 {
-    long err;
+	long err;
 
-    anlogic_pci_class = class_create(ANLOGIC_PCI_NODE_NAME);
-    if (IS_ERR(anlogic_pci_class)) {
-        err = PTR_ERR(anlogic_pci_class);
-        anlogic_pci_class = NULL;
-        pr_err("failed to create class %s, %ld.\n", ANLOGIC_PCI_NODE_NAME, err);
-        return (int)err;
-    }
+	anlogic_pci_class = class_create(ANLOGIC_PCI_NODE_NAME);
+	if (IS_ERR(anlogic_pci_class)) {
+		err = PTR_ERR(anlogic_pci_class);
+		anlogic_pci_class = NULL;
+		pr_err("failed to create class %s, %ld.\n", ANLOGIC_PCI_NODE_NAME, err);
+		return (int)err;
+	}
 
-    return 0;
+	return 0;
 }
 
 void anlogic_pci_chrdev_cleanup(void)
 {
-    if (anlogic_pci_class) {
-        class_destroy(anlogic_pci_class);
-        anlogic_pci_class = NULL;
-    }
+	if (anlogic_pci_class) {
+		class_destroy(anlogic_pci_class);
+		anlogic_pci_class = NULL;
+	}
 }
