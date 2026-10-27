@@ -16,3 +16,6 @@ modules.order
 /app/rs/target/
 
 *.zip
+
+# Local synchronization verification outputs
+/out-sync-20261027/

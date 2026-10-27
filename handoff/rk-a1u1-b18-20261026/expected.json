@@ -1,0 +1,23 @@
+{
+  "source_kind": "real_fpga_uart_capture",
+  "source_camera": "B",
+  "source_camera_evidence": "b18 candidate and sysstat bit12=1; A1U1 header has no camera field",
+  "frame_id": 1,
+  "width": 1920,
+  "height": 1080,
+  "stride": 2400,
+  "flags": 3,
+  "header_bytes": 44,
+  "frame_bytes": 2594750,
+  "raw_bytes": 2592000,
+  "stream_bytes": 2594706,
+  "input_sha256": "2892b3fb66654aa68e4a10609e97bc8737c3b5fb86a9fc4d5cdffc4ae5349d05",
+  "raw_sha256": "4f97a0d5ab9973b45d3e20fd56667deea50df857f2dd14496b5218abfc1ddfd7",
+  "header_crc32": "4a8152d1",
+  "stream_crc32": "57104336",
+  "xform_crc32": "744607dd",
+  "raw_crc32": "a879d080",
+  "sensor_pixel_oracle_verified": false,
+  "physical_bayer_phase": "unknown",
+  "compression_note": "540 stored fallback blocks; no compression gain"
+}

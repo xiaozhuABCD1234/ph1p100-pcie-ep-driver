@@ -1,0 +1,346 @@
+{
+  "schema_version": 1,
+  "pinned_fpga_commit": "2a4b253d9f2e56a943f1667b2a7a366824dcba34",
+  "pinned_driver_commit": "a0215c5a2fcb95bfc867a4768d4831d68edf64a2",
+  "registers": [
+    {
+      "offset": 64,
+      "offset_hex": "0x040",
+      "name": "MAGIC",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:350`"
+    },
+    {
+      "offset": 68,
+      "offset_hex": "0x044",
+      "name": "CTRL",
+      "access": "RW",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:354`"
+    },
+    {
+      "offset": 72,
+      "offset_hex": "0x048",
+      "name": "IMG_STATUS",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:356`"
+    },
+    {
+      "offset": 76,
+      "offset_hex": "0x04C",
+      "name": "TEST_FRAME_CNT",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:357`"
+    },
+    {
+      "offset": 100,
+      "offset_hex": "0x064",
+      "name": "LEGACY_VERSION",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:363`"
+    },
+    {
+      "offset": 160,
+      "offset_hex": "0x0A0",
+      "name": "DDR_SEQ_A",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:394`"
+    },
+    {
+      "offset": 164,
+      "offset_hex": "0x0A4",
+      "name": "DDR_BASE_A",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:395`"
+    },
+    {
+      "offset": 168,
+      "offset_hex": "0x0A8",
+      "name": "DDR_STATUS_A",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:396`"
+    },
+    {
+      "offset": 172,
+      "offset_hex": "0x0AC",
+      "name": "DDR_LEN_A",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:397`"
+    },
+    {
+      "offset": 176,
+      "offset_hex": "0x0B0",
+      "name": "PUSH_DST_LO",
+      "access": "RW",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:399`"
+    },
+    {
+      "offset": 180,
+      "offset_hex": "0x0B4",
+      "name": "PUSH_DST_HI",
+      "access": "RW",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:400`"
+    },
+    {
+      "offset": 184,
+      "offset_hex": "0x0B8",
+      "name": "PUSH_DB_LO",
+      "access": "RW",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:401`"
+    },
+    {
+      "offset": 188,
+      "offset_hex": "0x0BC",
+      "name": "PUSH_DB_HI",
+      "access": "RW",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:402`"
+    },
+    {
+      "offset": 192,
+      "offset_hex": "0x0C0",
+      "name": "PUSH_DONE",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:403`"
+    },
+    {
+      "offset": 196,
+      "offset_hex": "0x0C4",
+      "name": "PUSH_STATUS",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:404`"
+    },
+    {
+      "offset": 200,
+      "offset_hex": "0x0C8",
+      "name": "PUSH_ERR",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:405`"
+    },
+    {
+      "offset": 204,
+      "offset_hex": "0x0CC",
+      "name": "PUSH_TLP_CNT",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:406`"
+    },
+    {
+      "offset": 208,
+      "offset_hex": "0x0D0",
+      "name": "CAM_DIAG_A",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:392`"
+    },
+    {
+      "offset": 212,
+      "offset_hex": "0x0D4",
+      "name": "CAM_TAP_B",
+      "access": "RW",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:378`"
+    },
+    {
+      "offset": 216,
+      "offset_hex": "0x0D8",
+      "name": "CAM_DIAG_B",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:379`"
+    },
+    {
+      "offset": 220,
+      "offset_hex": "0x0DC",
+      "name": "CAM_DROP_A",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:381`"
+    },
+    {
+      "offset": 224,
+      "offset_hex": "0x0E0",
+      "name": "DDR_SEQ_B",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:384`"
+    },
+    {
+      "offset": 228,
+      "offset_hex": "0x0E4",
+      "name": "DDR_BASE_B",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:385`"
+    },
+    {
+      "offset": 232,
+      "offset_hex": "0x0E8",
+      "name": "DDR_STATUS_B",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:386`"
+    },
+    {
+      "offset": 236,
+      "offset_hex": "0x0EC",
+      "name": "DDR_LEN_B",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:387`"
+    },
+    {
+      "offset": 240,
+      "offset_hex": "0x0F0",
+      "name": "CAM_DROP_A2",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:382`"
+    },
+    {
+      "offset": 244,
+      "offset_hex": "0x0F4",
+      "name": "CAM_DROP_A3",
+      "access": "RO",
+      "status": "implemented in pinned peer; unchanged by this package",
+      "evidence": "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:383`"
+    }
+  ],
+  "ctrl_bits": [
+    {
+      "bit": 0,
+      "name": "enable",
+      "semantics": "mode enable, not ownership permission"
+    },
+    {
+      "bit": 1,
+      "name": "trigger",
+      "semantics": "one-cycle test trigger; self-clearing"
+    },
+    {
+      "bit": 2,
+      "name": "reinit_toggle",
+      "semantics": "legacy pattern[0] routed to sensor reinit toggle"
+    },
+    {
+      "bit": 3,
+      "name": "test_pattern",
+      "semantics": "legacy pattern[1], test-source mode"
+    },
+    {
+      "bit": 4,
+      "name": "reserved",
+      "semantics": "write ignored/read0"
+    },
+    {
+      "bit": 5,
+      "name": "ddr_enable",
+      "semantics": "capture-to-DDR enable"
+    },
+    {
+      "bit": 6,
+      "name": "push_enable",
+      "semantics": "mode enable only; extension grant still required"
+    },
+    {
+      "bit": 7,
+      "name": "push_source",
+      "semantics": "0 DDR, 1 ERAM diagnostic source"
+    },
+    {
+      "bit": 8,
+      "name": "camera_ab",
+      "semantics": "0 A, 1 B; latch for whole transfer"
+    }
+  ],
+  "ctrl_evidence": [
+    "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:253`",
+    "`references/peer-fpga-2a4b253/rtl/ep_side/img/ep_bar_win.v:355`"
+  ],
+  "required_rk_arm_bits": 97,
+  "required_rk_arm_bits_b": 353,
+  "legacy_driver_arm_bits": 113,
+  "extension_status": "proposed next-backend input ONLY; not implemented, compiled, applied or hardware tested in this package",
+  "extension_registers": [
+    {
+      "offset": 256,
+      "name": "DMA_CAP_BYTES",
+      "access": "RW",
+      "reset": 0,
+      "semantics": "u32 allocated transport capacity in bytes; only config staging; require >= frame dma_bytes"
+    },
+    {
+      "offset": 260,
+      "name": "SESSION_ID",
+      "access": "RW",
+      "reset": 0,
+      "semantics": "nonzero new session identity; staging only; reset/unload/reconnect changes session"
+    },
+    {
+      "offset": 264,
+      "name": "TX_CMD",
+      "access": "W1 command, reads 0",
+      "reset": 0,
+      "semantics": "bit0 ARM_ONE_SHOT; bit1 ACK_RELEASE; bit2 CANCEL. Exactly one bit per write; invalid combinations rejected. ARM latches destination, capacity, doorbell, session, camera and immutable complete-source descriptor atomically; disallowed busy/held/draining. CANCEL disarms, completes any already opened TLP without success doorbell, then drains outstanding source responses before idle."
+    },
+    {
+      "offset": 268,
+      "name": "ACK_SEQ",
+      "access": "RW",
+      "reset": 0,
+      "semantics": "staged held completion sequence, used only by ACK_RELEASE"
+    },
+    {
+      "offset": 272,
+      "name": "ACK_SESSION",
+      "access": "RW",
+      "reset": 0,
+      "semantics": "staged held session; ACK_RELEASE requires exact held seq AND session, no active DMA/drain"
+    },
+    {
+      "offset": 276,
+      "name": "TX_STATUS",
+      "access": "RO",
+      "reset": 0,
+      "semantics": "bit0 armed, bit1 busy, bit2 held, bit3 rejected/error, bit4 draining; reserved bits zero"
+    },
+    {
+      "offset": 280,
+      "name": "EXT_MAGIC",
+      "access": "RO",
+      "reset": 826362706,
+      "semantics": "little-endian ASCII RKA1; absent legacy read DEAD_BEEF must fail closed"
+    },
+    {
+      "offset": 284,
+      "name": "EXT_VERSION",
+      "access": "RO",
+      "reset": 65536,
+      "semantics": "proposed safety interface major1 minor0; checked before any arm"
+    }
+  ],
+  "default_policy": "reset cap=0 session=0 armed=0. CTRL=0x61 alone MUST NOT transmit; no legacy fallback in formal mode; every accepted grant gives at most one completed frame and holds the slot until matching ACK.",
+  "host_abi": {
+    "slot_header_struct_bytes": 16,
+    "hdr_bytes_transport_offset": 128,
+    "host_prefix_padding_bytes": 112,
+    "r10f_header_bytes": 128,
+    "mailbox_bytes": 64,
+    "mailbox_push_dbell_offset": 32,
+    "ioctl_layout_policy": "existing structs and ioctl numbers unchanged; future ACK uses existing privileged BAR control path; reject incompatible EXT_MAGIC/VERSION rather than reinterpreting old bit4"
+  }
+}

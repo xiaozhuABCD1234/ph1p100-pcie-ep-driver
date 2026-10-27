@@ -12,7 +12,8 @@ anlogic_pci-y := src/anlogic_pci_main.o \
                  src/anlogic_pci_frame.o \
                  src/anlogic_pci_chrdev.o \
                  src/anlogic_pci_ctrl.o \
-                 src/anlogic_pci_link.o
+                 src/anlogic_pci_link.o \
+                 src/anlogic_pci_rka1.o
 
 ccflags-y += -I$(src)/include
 

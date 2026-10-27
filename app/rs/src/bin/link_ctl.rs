@@ -40,11 +40,10 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use anlogic_pci_tools::getopt::{Getopt, LongOpt};
 use anlogic_pci_tools::ioctl::{
-    IocLinkRetrig, IocLinkStatus, IocPushCfg, IocPushCfgB, ANLOGIC_CAM_LANE_ALL,
+    IocLinkRetrig, IocLinkStatus, IocPushCfg, ANLOGIC_CAM_LANE_ALL, ANLOGIC_CTRL_CAM_SEL,
     ANLOGIC_CTRL_DDR_EN, ANLOGIC_CTRL_ENABLE, ANLOGIC_CTRL_MCLK_SEL, ANLOGIC_CTRL_PUSH_EN,
-    ANLOGIC_CTRL_PUSH_EN_B, ANLOGIC_CTRL_PUSH_SRC, ANLOGIC_DDR_STATUS_ALIVE,
-    ANLOGIC_DDR_STATUS_CAL_DONE, ANLOGIC_IOCLINKRETRIG, ANLOGIC_IOCLINKSTATUS,
-    ANLOGIC_IOCPUSHCFG, ANLOGIC_IOCPUSHCFGB, ANLOGIC_PUSH_CFG_SET_DB,
+    ANLOGIC_CTRL_PUSH_SRC, ANLOGIC_DDR_STATUS_ALIVE, ANLOGIC_DDR_STATUS_CAL_DONE,
+    ANLOGIC_IOCLINKRETRIG, ANLOGIC_IOCLINKSTATUS, ANLOGIC_IOCPUSHCFG, ANLOGIC_PUSH_CFG_SET_DB,
     ANLOGIC_PUSH_CFG_SET_DST, ANLOGIC_PUSH_ERR_NAMES, ANLOGIC_PUSH_STATUS_BUSY,
     ANLOGIC_PUSH_STATUS_DB_SENT, ANLOGIC_PUSH_STATUS_LAST_OK,
 };
@@ -157,15 +156,15 @@ fn print_status(st: &IocLinkStatus, quiet: bool) {
     println!("收帧缓冲: mailbox seq={} count={}（驱动按门铃补齐）", st.seq, st.count);
     if !quiet {
         println!(
-            "CTRL    : 0x{:08x}（使能={} 触发={} 重触发电平={} DDR搬运={} 推帧A={} 推帧源={} 推帧B={}）",
+            "CTRL    : 0x{:08x}（使能={} 触发={} 重触发电平={} 相机写源={} DDR搬运={} 推帧={} 推帧源={}）",
             st.ctrl,
             bit(st.ctrl, ANLOGIC_CTRL_ENABLE),
             bit(st.ctrl, 2),
             bit(st.ctrl, ANLOGIC_CTRL_MCLK_SEL),
+            bit(st.ctrl, ANLOGIC_CTRL_CAM_SEL),
             bit(st.ctrl, ANLOGIC_CTRL_DDR_EN),
             bit(st.ctrl, ANLOGIC_CTRL_PUSH_EN),
-            bit(st.ctrl, ANLOGIC_CTRL_PUSH_SRC),
-            bit(st.ctrl, ANLOGIC_CTRL_PUSH_EN_B)
+            bit(st.ctrl, ANLOGIC_CTRL_PUSH_SRC)
         );
     }
     println!(
@@ -208,53 +207,6 @@ fn push_cfg(
     Ok(cfg)
 }
 
-/// B 路推帧目标/门铃（0x100~0x10C）：与 A 路同一套语义，只是另一组寄存器
-fn pushb_cfg(
-    fd: RawFd,
-    set_dst: Option<(u32, u32)>,
-    set_db: Option<(u32, u32)>,
-) -> Result<IocPushCfgB, std::io::Error> {
-    let mut cfg = IocPushCfgB::default();
-    if let Some((lo, hi)) = set_dst {
-        cfg.flags |= ANLOGIC_PUSH_CFG_SET_DST;
-        cfg.dst_lo = lo;
-        cfg.dst_hi = hi;
-    }
-    if let Some((lo, hi)) = set_db {
-        cfg.flags |= ANLOGIC_PUSH_CFG_SET_DB;
-        cfg.db_lo = lo;
-        cfg.db_hi = hi;
-    }
-    // SAFETY: cfg 就是 ANLOGIC_IOCPUSHCFGB 对应的结构体
-    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCPUSHCFGB, &mut cfg as *mut IocPushCfgB as *mut c_void) }?;
-    Ok(cfg)
-}
-
-fn print_push_cfg_b(cfg: &IocPushCfgB) {
-    println!(
-        "B 路推帧目标: 0x{:016x}（0x100/0x104 = 0x{:08x}/0x{:08x}）",
-        addr64(cfg.dst_lo, cfg.dst_hi),
-        cfg.dst_lo,
-        cfg.dst_hi
-    );
-    println!(
-        "B 路门铃地址: 0x{:016x}（0x108/0x10C = 0x{:08x}/0x{:08x}）",
-        addr64(cfg.db_lo, cfg.db_hi),
-        cfg.db_lo,
-        cfg.db_hi
-    );
-    println!(
-        "本次写入: {}（applied=0x{:x}）  B 路推帧使能={}  驱动初始化过={}",
-        if cfg.applied == 0 { "无（只复核）" } else { "已写并回读复核通过" },
-        cfg.applied,
-        cfg.push_en,
-        cfg.armed
-    );
-    if cfg.applied != 0 && cfg.armed == 0 {
-        eprintln!("!! 注意：地址写进去了，但驱动记的初始化状态是「没成」——看 dmesg 里驱动报的错。");
-    }
-}
-
 fn print_push_cfg(cfg: &IocPushCfg) {
     println!(
         "推帧目标: 0x{:016x}（0xB0/0xB4 = 0x{:08x}/0x{:08x}）",
@@ -283,13 +235,12 @@ fn print_push_cfg(cfg: &IocPushCfg) {
 
 fn usage(prog: &str) {
     eprint!(
-        "用法: {} [选项] [status|retrig|push|pushb]\n\
+        "用法: {} [选项] [status|retrig|push]\n\
          \n\
          查/改 PH1P100 的相机链路与推帧通路（都走驱动 ioctl，本工具不 mmap BAR）。\n\
          \x20 status  查链路与推帧状态（默认）\n\
          \x20 retrig  手动重新触发一次相机初始化（链路掉了之后恢复用）\n\
-         \x20 push    复核 A 路推帧目标/门铃地址；给了 --dst-*/--db-* 就是重设\n\
-         \x20 pushb   同上，但打 B 路那组寄存器（0x100~0x10C）\n\
+         \x20 push    复核推帧目标/门铃地址；给了 --dst-*/--db-* 就是重设\n\
          \n\
          选项:\n\
          \x20 -d <节点>     控制节点，默认 {}\n\
@@ -396,7 +347,7 @@ fn run() -> i32 {
         usage(&argv[0]);
         return EX_USAGE;
     }
-    if cmd != "status" && cmd != "retrig" && cmd != "push" && cmd != "pushb" {
+    if cmd != "status" && cmd != "retrig" && cmd != "push" {
         eprintln!("!! 不认识的动作 '{}'（只有 status / retrig / push）", cmd);
         usage(&argv[0]);
         return EX_USAGE;
@@ -499,29 +450,6 @@ fn run() -> i32 {
             Err(e) => {
                 eprintln!("!! ANLOGIC_IOCPUSHCFG 失败：{}", sys::errno_str(&e));
                 eprintln!("   （-EIO：写进去读回不一致 / 读到全 F；-EINVAL：flags 有未知位）");
-                EX_DEV
-            }
-        };
-    }
-
-    if cmd == "pushb" {
-        let dst = match (dst_lo, dst_hi) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
-            _ => None,
-        };
-        let db = match (db_lo, db_hi) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
-            _ => None,
-        };
-        println!("=== B 路推帧目标 / 门铃地址 ===");
-        return match pushb_cfg(fd, dst, db) {
-            Ok(cfg) => {
-                print_push_cfg_b(&cfg);
-                EX_OK
-            }
-            Err(e) => {
-                eprintln!("!! ANLOGIC_IOCPUSHCFGB 失败：{}", sys::errno_str(&e));
-                eprintln!("   （-EIO：写进去读回不一致 / 读到全 F（老映像没有 0x100~0x10C 这组寄存器））");
                 EX_DEV
             }
         };

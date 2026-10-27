@@ -1,0 +1,266 @@
+{
+  "date": "2026-10-16",
+  "evidence_meta": {
+    "generated_utc": "2026-10-16T03:21:00Z",
+    "script": "run_frame_contract.py",
+    "script_sha256": "e4105121d62dbe59f6a37162ef9fc32b3304f0ff4218ed7130d3a78c279e2eaa"
+  },
+  "kind": "frame-metadata-contract-vectors",
+  "scope_boundary": "non-compressed frame/metadata/transport only; compression codec fields reserved for F2",
+  "selftest": [
+    {
+      "name": "crc32_check_123456789",
+      "ok": true
+    },
+    {
+      "name": "crc32_matches_rtl_definition",
+      "ok": true
+    },
+    {
+      "name": "raw10_pack_roundtrip_allvalues",
+      "ok": true
+    },
+    {
+      "name": "header_roundtrip_crc",
+      "ok": true
+    },
+    {
+      "name": "header_tamper_detected",
+      "ok": true
+    },
+    {
+      "name": "malformed_truncated_returns_flags",
+      "ok": true
+    },
+    {
+      "name": "malformed_format_id_returns_flags",
+      "ok": true
+    },
+    {
+      "name": "malformed_width_not_mult4_returns_flags",
+      "ok": true
+    },
+    {
+      "name": "wellformed_still_passes",
+      "ok": true
+    }
+  ],
+  "vectors_big": [
+    {
+      "file": "frame_64x48_packed.bin",
+      "bytes": 3968,
+      "verify_ok": true,
+      "raw_crc32": 888766991,
+      "payload_crc32": 888766991,
+      "header_crc32": 1558081652
+    },
+    {
+      "file": "frame_64x48_u16le.bin",
+      "bytes": 6272,
+      "verify_ok": true,
+      "raw_crc32": 1715300613,
+      "payload_crc32": 1715300613,
+      "header_crc32": 4087051747
+    }
+  ],
+  "vectors_small": [
+    {
+      "file": "frame_8x4_packed.bin",
+      "bytes": 192,
+      "verify_ok": true,
+      "raw_crc32": 763220710,
+      "payload_crc32": 1107334702,
+      "header_crc32": 628906374
+    },
+    {
+      "file": "frame_8x4_u16le.bin",
+      "bytes": 192,
+      "verify_ok": true,
+      "raw_crc32": 186161856,
+      "payload_crc32": 186161856,
+      "header_crc32": 3754688272
+    }
+  ],
+  "header_field_table": [
+    {
+      "offset": "0x00",
+      "name": "magic",
+      "fmt": "4s"
+    },
+    {
+      "offset": "0x04",
+      "name": "version_major",
+      "fmt": "<H"
+    },
+    {
+      "offset": "0x06",
+      "name": "version_minor",
+      "fmt": "<H"
+    },
+    {
+      "offset": "0x08",
+      "name": "header_bytes",
+      "fmt": "<H"
+    },
+    {
+      "offset": "0x0A",
+      "name": "camera_id",
+      "fmt": "<B"
+    },
+    {
+      "offset": "0x0B",
+      "name": "format_id",
+      "fmt": "<B"
+    },
+    {
+      "offset": "0x0C",
+      "name": "codec_id",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x10",
+      "name": "session_id",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x14",
+      "name": "capture_seq",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x18",
+      "name": "mode_id",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x1C",
+      "name": "width",
+      "fmt": "<H"
+    },
+    {
+      "offset": "0x1E",
+      "name": "height",
+      "fmt": "<H"
+    },
+    {
+      "offset": "0x20",
+      "name": "stride_bytes",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x24",
+      "name": "roi_x",
+      "fmt": "<H"
+    },
+    {
+      "offset": "0x26",
+      "name": "roi_y",
+      "fmt": "<H"
+    },
+    {
+      "offset": "0x28",
+      "name": "bayer_phase",
+      "fmt": "<B"
+    },
+    {
+      "offset": "0x29",
+      "name": "bayer_dir",
+      "fmt": "<B"
+    },
+    {
+      "offset": "0x2A",
+      "name": "valid_bits",
+      "fmt": "<B"
+    },
+    {
+      "offset": "0x2B",
+      "name": "packing",
+      "fmt": "<B"
+    },
+    {
+      "offset": "0x2C",
+      "name": "raw_bytes",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x30",
+      "name": "payload_bytes",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x34",
+      "name": "block_count",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x38",
+      "name": "exposure_code",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x3C",
+      "name": "gain_code",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x40",
+      "name": "sof_timestamp",
+      "fmt": "<Q"
+    },
+    {
+      "offset": "0x48",
+      "name": "timestamp_hz",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x4C",
+      "name": "flags",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x50",
+      "name": "raw_crc32",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x54",
+      "name": "payload_crc32",
+      "fmt": "<I"
+    },
+    {
+      "offset": "0x58",
+      "name": "header_crc32",
+      "fmt": "<I"
+    }
+  ],
+  "stride_64_packed": 80,
+  "stride_64_u16": 128,
+  "key_pixels_8x4": {
+    "corner_00": 0,
+    "corner_07": 1023,
+    "corner_30": 512,
+    "corner_37": 1,
+    "first_row": [
+      0,
+      3,
+      6,
+      9,
+      12,
+      15,
+      18,
+      1023
+    ],
+    "row1": [
+      5,
+      8,
+      11,
+      14,
+      17,
+      20,
+      23,
+      26
+    ]
+  },
+  "crc32_check_123456789": "0xcbf43926",
+  "result": "pass"
+}

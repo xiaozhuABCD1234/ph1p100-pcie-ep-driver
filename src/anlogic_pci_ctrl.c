@@ -404,15 +404,17 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
         return anlogic_pci_frame_ioctl(cdev, cmd, (void __user *)arg);
 
     /*
-     * 相机链路 / 推帧的命令（实现在 anlogic_pci_link.c，同样只做转发）：
-     * 查状态、手动重触发传感器初始化、复核/重设推帧目标与门铃地址
-     * （A 路 = PUSHCFG，B 路 = PUSHCFGB）。
+     * 相机链路 / 推帧的三条命令（实现在 anlogic_pci_link.c，同样只做转发）：
+     * 查状态、手动重触发传感器初始化、复核/重设推帧目标与门铃地址。
      */
     case ANLOGIC_IOCLINKSTATUS:
     case ANLOGIC_IOCLINKRETRIG:
     case ANLOGIC_IOCPUSHCFG:
-    case ANLOGIC_IOCPUSHCFGB:
         return anlogic_pci_link_ioctl(cdev, cmd, (void __user *)arg);
+
+    /* T07: RKA1 safety extension (anlogic_pci_rka1.c) */
+    case ANLOGIC_IOCRKA1:
+        return anlogic_pci_rka1_ioctl(hw, arg);
 
     default:
         pr_err("UNKNOWN ioctl cmd 0x%x.\n", cmd);

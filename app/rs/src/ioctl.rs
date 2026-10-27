@@ -175,13 +175,10 @@ pub const ANLOGIC_BAR_PUSH_TLP_OFF: u32 = 0xCC;
 pub const ANLOGIC_CTRL_ENABLE: u32 = 1 << 0;
 pub const ANLOGIC_CTRL_TRIGGER: u32 = 1 << 1;
 pub const ANLOGIC_CTRL_MCLK_SEL: u32 = 1 << 2;
-/// bit4：保留位（写 0、读回 0；原来那位的含义已经取消）
-pub const ANLOGIC_CTRL_RESERVED4: u32 = 1 << 4;
+pub const ANLOGIC_CTRL_CAM_SEL: u32 = 1 << 4;
 pub const ANLOGIC_CTRL_DDR_EN: u32 = 1 << 5;
 pub const ANLOGIC_CTRL_PUSH_EN: u32 = 1 << 6;
 pub const ANLOGIC_CTRL_PUSH_SRC: u32 = 1 << 7;
-/// bit8 = B 路推帧使能（与 bit6 的 A 路各自独立；两路同时推就把两位都置 1）
-pub const ANLOGIC_CTRL_PUSH_EN_B: u32 = 1 << 8;
 
 /// `ANLOGIC_CAM_STAT_LANE_MASK` / `ANLOGIC_CAM_LANE_VALID()` / `ANLOGIC_CAM_LANE_ALL`
 pub const ANLOGIC_CAM_STAT_LANE_MASK: u32 = 0x1e;
@@ -270,22 +267,6 @@ pub struct IocPushCfg {
     pub applied: u32,
 }
 
-/// `struct anlogic_ioc_push_cfg_b`（ANLOGIC_IOCPUSHCFGB 的出入参）：字段与 A 路逐项相同，
-/// 只是打到 B 路那组寄存器（0x100~0x10C）。
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct IocPushCfgB {
-    pub flags: u32,
-    pub dst_lo: u32,
-    pub dst_hi: u32,
-    pub db_lo: u32,
-    pub db_hi: u32,
-    pub push_en: u32,
-    pub reserved: u32,
-    pub armed: u32,
-    pub applied: u32,
-}
-
 // 全零即「驱动侧还没填」的合法初值；这些都是纯 POD，直接零初始化。
 macro_rules! impl_default_zeroed {
     ($($t:ty),* $(,)?) => { $(
@@ -298,7 +279,7 @@ macro_rules! impl_default_zeroed {
     )* };
 }
 impl_default_zeroed!(IocBase, IocInfo, IocBar, CfgWrite, FrameMailbox, FrameSlotHdr, IocFrame, IocFrameWait,
-                     IocLinkStatus, IocLinkRetrig, IocPushCfg, IocPushCfgB);
+                     IocLinkStatus, IocLinkRetrig, IocPushCfg);
 
 // 与头文件一致：sizeof 与关键字段偏移必须钉死（缓冲布局算错就会取到错数据）。
 const _: () = {
@@ -356,9 +337,6 @@ const _: () = {
     assert!(std::mem::size_of::<IocPushCfg>() == 36);
     assert!(std::mem::offset_of!(IocPushCfg, db_lo) == 12);
     assert!(std::mem::offset_of!(IocPushCfg, applied) == 32);
-    assert!(std::mem::size_of::<IocPushCfgB>() == 36);
-    assert!(std::mem::offset_of!(IocPushCfgB, db_lo) == 12);
-    assert!(std::mem::offset_of!(IocPushCfgB, applied) == 32);
 };
 
 // -------------------------------------------------------------- IOCTL 编号
@@ -382,8 +360,6 @@ pub const ANLOGIC_IOCLINKSTATUS: u64 = ioc(IOC_READ, ANLOGIC_IOC_MAGIC, 12, 92);
 pub const ANLOGIC_IOCLINKRETRIG: u64 = ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, 13, 32);
 /// `ANLOGIC_IOCPUSHCFG = _IOWR(ANLOGIC_IOC_MAGIC, 14, struct anlogic_ioc_push_cfg)`
 pub const ANLOGIC_IOCPUSHCFG: u64 = ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, 14, 36);
-/// `ANLOGIC_IOCPUSHCFGB = _IOWR(ANLOGIC_IOC_MAGIC, 15, struct anlogic_ioc_push_cfg_b)`
-pub const ANLOGIC_IOCPUSHCFGB: u64 = ioc(IOC_READ | IOC_WRITE, ANLOGIC_IOC_MAGIC, 15, 36);
 
 #[cfg(test)]
 mod tests {
@@ -400,6 +376,5 @@ mod tests {
         assert_eq!(ANLOGIC_IOCLINKSTATUS, 0x805c_780c);
         assert_eq!(ANLOGIC_IOCLINKRETRIG, 0xc020_780d);
         assert_eq!(ANLOGIC_IOCPUSHCFG, 0xc024_780e);
-        assert_eq!(ANLOGIC_IOCPUSHCFGB, 0xc024_780f);
     }
 }

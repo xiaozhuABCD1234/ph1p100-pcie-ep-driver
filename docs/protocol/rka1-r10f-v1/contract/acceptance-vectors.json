@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "scope": "executable contract fixtures only; not RTL/driver/hardware validation",
+  "datasets": [
+    {
+      "name": "small",
+      "identity": "synthetic diagnostic ONLY; not CSI capture or Bayer phase proof",
+      "path": "artifacts/r10f-small-synthetic.dma",
+      "sha256": "c855e03def94dea1686cb74f1a75356077377f4106cf3de9fd081f4aed8be6e0",
+      "width": 8,
+      "height": 4,
+      "stride_bytes": 10,
+      "raw_bytes": 40,
+      "payload_bytes": 40,
+      "r10f_header_bytes": 128,
+      "content_bytes": 168,
+      "dma_bytes": 4096,
+      "tail_pad": 3928,
+      "mwr_packets": 32,
+      "ddr_read_bursts": 1,
+      "host_hdr_bytes": 128,
+      "host_stride": 8192,
+      "host_total_alloc": 12288,
+      "page_size_assumption": 4096,
+      "pixel_group": [
+        0,
+        1,
+        1022,
+        1023
+      ],
+      "packed_group_hex": "0000ffffe4",
+      "raw_crc32": 2548473314,
+      "payload_crc32": 2548473314,
+      "header_crc32": 1851548142
+    },
+    {
+      "name": "1080p",
+      "identity": "synthetic diagnostic ONLY; not CSI capture or Bayer phase proof",
+      "path": "artifacts/r10f-1080p-synthetic.dma",
+      "sha256": "646ebaedc19bdd6feb595430989b736f01913bb23caee26a132c922cfe5e9bff",
+      "width": 1920,
+      "height": 1080,
+      "stride_bytes": 2400,
+      "raw_bytes": 2592000,
+      "payload_bytes": 2592000,
+      "r10f_header_bytes": 128,
+      "content_bytes": 2592128,
+      "dma_bytes": 2592768,
+      "tail_pad": 640,
+      "mwr_packets": 20256,
+      "ddr_read_bursts": 633,
+      "host_hdr_bytes": 128,
+      "host_stride": 2596864,
+      "host_total_alloc": 2600960,
+      "page_size_assumption": 4096,
+      "pixel_group": [
+        0,
+        1,
+        1022,
+        1023
+      ],
+      "packed_group_hex": "0000ffffe4",
+      "raw_crc32": 3491449518,
+      "payload_crc32": 3491449518,
+      "header_crc32": 108710859
+    }
+  ],
+  "control": [
+    {
+      "id": "legacy-bit4-arm-reject",
+      "written": 113,
+      "readback": 97,
+      "required_mask": 113,
+      "expected": false
+    },
+    {
+      "id": "new-A-arm-bits",
+      "written": 97,
+      "readback": 97,
+      "required_mask": 97,
+      "expected": true
+    },
+    {
+      "id": "new-B-select",
+      "written": 353,
+      "readback": 353,
+      "required_mask": 353,
+      "expected": true
+    }
+  ],
+  "dma_boundaries": [
+    {
+      "id": "old-plus16-crosses4k",
+      "base": 4294967312,
+      "bytes": 2592768,
+      "packet_bytes": 128,
+      "expected": false,
+      "first_crossing_packet_index": 31,
+      "first_crossing_address": 4294971280
+    },
+    {
+      "id": "new-plus128-aligned",
+      "base": 4294967424,
+      "bytes": 2592768,
+      "packet_bytes": 128,
+      "expected": true
+    }
+  ],
+  "authorization_cases": [
+    {
+      "id": "reset-default-no-grant",
+      "authorized": false,
+      "capacity": 2592768,
+      "expected": false
+    },
+    {
+      "id": "short-capacity",
+      "authorized": true,
+      "capacity": 2592767,
+      "expected": false
+    },
+    {
+      "id": "exact-capacity",
+      "authorized": true,
+      "capacity": 2592768,
+      "expected": true
+    }
+  ],
+  "frame_mutations": [
+    {
+      "id": "valid",
+      "operation": "none",
+      "expected": true
+    },
+    {
+      "id": "truncated",
+      "operation": "drop_last_byte",
+      "expected": false
+    },
+    {
+      "id": "nonzero-tail",
+      "operation": "tail_nonzero",
+      "expected": false
+    },
+    {
+      "id": "bad-payload-crc",
+      "operation": "payload_flip",
+      "expected": false
+    },
+    {
+      "id": "bad-header-crc",
+      "operation": "header_flip",
+      "expected": false
+    },
+    {
+      "id": "unknown-codec",
+      "operation": "set_codec_1_recrc",
+      "expected": false
+    },
+    {
+      "id": "bad-frame",
+      "operation": "set_bad_recrc",
+      "expected": false
+    },
+    {
+      "id": "partial-frame",
+      "operation": "set_partial_recrc",
+      "expected": false
+    },
+    {
+      "id": "oversize-frame",
+      "operation": "set_oversize_recrc",
+      "expected": false
+    },
+    {
+      "id": "illegal-payload-length",
+      "operation": "set_length_recrc",
+      "expected": false
+    }
+  ],
+  "safety_required_cases": [
+    "destination zero, unaligned or u64 end overflow => no TLP",
+    "doorbell zero, unaligned, overlapping allocated frame transport => no TLP",
+    "source base not 4KiB aligned, high bits above controller address space, or base+dma_bytes over DDR capacity => no TLP",
+    "busy/held grant => rejected, no overwrite",
+    "wrong ACK session/sequence => no release",
+    "mode/camera/address changes during transfer => affect next grant only",
+    "cancel/reset => no success doorbell; drain old session before rearm",
+    "stall each packet beat beyond WAIT_LIMIT => preserve open TLP and output until handshake; error diagnostic cannot truncate packet"
+  ]
+}

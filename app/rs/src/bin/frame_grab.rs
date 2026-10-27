@@ -9,10 +9,8 @@
  *   3) 把那一槽像素写成 P5 灰度 PGM。
  *
  * 缓冲布局与 FPGA 的握手约定（握手时序、槽头字段）写在 include/anlogic_pci_ioctl.h：
- * 每一路自己的「槽区 + mailbox 页」：槽 n 在本路起点 + stride*n（槽头后才是像素），
- * mailbox 在本路槽区之后（由 ioctl 报的 mb_off 定位，整页，不与槽区重叠）。
- * 本路起点 = mb_off - stride*slots（单路缓冲 = 0；A/B 两路时 B 路 = 第 1 路起点），
- * 而 mmap 映射的是整块缓冲，所以槽地址要加上这个起点。本工具只读：
+ * 槽区从缓冲起点开始，槽 n 在 phys_addr + stride*n（槽头后才是像素），mailbox
+ * 描述符在槽区之后、由 ioctl 报的 mb_off 定位（整页，不与槽区重叠）。本工具只读：
  *   - 打开设备用只读；mmap 用 PROT_READ（驱动也会拒绝可写映射）；
  *   - 不碰任何 BAR 寄存器，所以寄存器访问规约在这一层没有适用对象
  *     （该规约管的是对 EP 的 MMIO，本层读写的是系统内存）。
@@ -45,6 +43,7 @@ use anlogic_pci_tools::ioctl::{
     ANLOGIC_FRAME_MAGIC, ANLOGIC_FRAME_MAX_WAIT_MS, ANLOGIC_IOCFRAMEINFO, ANLOGIC_IOCFRAMEWAIT,
 };
 use anlogic_pci_tools::parse::strtoul_base0;
+use anlogic_pci_tools::rka1::r10f;
 use anlogic_pci_tools::sys::{self, Mmap, PROT_READ};
 
 const DEF_DEV: &str = "/dev/ANLOGIC-PCI0_frame";
@@ -95,13 +94,6 @@ fn mb_field(p: *const u32) -> u32 {
     let v = unsafe { sys::rd32(p) };
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     v
-}
-
-/// 本路在整块缓冲里的起点：每路都是「槽区在路首、mailbox 紧随其后」，
-/// 所以 路首 = mb_off - stride*slots（A 路 = 0，B 路 = 第 1 路起点）。
-/// 单路缓冲（frame_streams=1）时结果恒为 0，与改双路之前完全一致。
-fn stream_base(info: &IocFrame) -> usize {
-    (info.mb_off as usize).wrapping_sub(info.stride as usize * info.slots as usize)
 }
 
 fn frame_info(fd: RawFd, info: &mut IocFrame) -> Result<(), ()> {
@@ -347,8 +339,7 @@ fn run() -> i32 {
         eprintln!("!! 驱动报的槽位 {} 越界（共 {} 槽）", slot, info.slots);
         return EX_INCONSISTENT;
     }
-    let hdr = (map.as_ptr() as usize + stream_base(&info) +
-               slot as usize * info.stride as usize) as *const FrameSlotHdr;
+    let hdr = (map.as_ptr() as usize + slot as usize * info.stride as usize) as *const FrameSlotHdr;
     let hdr_seq = mb_field(hdr as *const u32);
     let hdr_len = mb_field(unsafe { hdr.cast::<u32>().add(1) });
     let hdr_flags = mb_field(unsafe { hdr.cast::<u32>().add(2) });
@@ -390,20 +381,23 @@ fn run() -> i32 {
     }
     img.resize(npix, 0u8);
     let mut copy = hdr_len as usize;
-    if copy > info.slot_bytes as usize {
-        eprintln!("!! 槽头 len={} 超过一帧 {} 字节，按一帧夹紧", hdr_len, info.slot_bytes);
-        copy = info.slot_bytes as usize;
-        rc = EX_INCONSISTENT;
-    }
-    if copy > npix {
+    /*
+     * T07: no silent clamping.  The slot length is the transport length agreed
+     * with the FPGA (dma_bytes); anything else means host and FPGA disagree,
+     * and a clamped copy would hand out a frame that looks fine but is not.
+     */
+    if copy != info.slot_bytes as usize {
         eprintln!(
-            "!! 槽头 len={} 大于 {}x{} 需要的 {} 字节，按图大小夹紧",
-            hdr_len, info.width, info.height, npix
+            "!! 槽头 len={} != 驱动/fpga 约定的 slot_bytes={}：拒绝发布（不再夹紧）",
+            hdr_len, info.slot_bytes
         );
-        copy = npix;
+        return EX_INCONSISTENT;
     }
-    let src = map.as_ptr() as usize + stream_base(&info) +
-              slot as usize * info.stride as usize + info.hdr_bytes as usize;
+    if copy & 0xfff != 0 {
+        eprintln!("!! slot_bytes={} 不是 4KiB 整数倍：不是本框架的传输格式", copy);
+        return EX_INCONSISTENT;
+    }
+    let src = map.as_ptr() as usize + slot as usize * info.stride as usize + info.hdr_bytes as usize;
     // SAFETY: 源地址在只读映射内（descriptor_check 已核对 stride/slots/mb_off 都合得上）
     unsafe {
         std::ptr::copy_nonoverlapping(src as *const u8, img.as_mut_ptr(), copy);
@@ -411,6 +405,41 @@ fn run() -> i32 {
     if copy < npix {
         eprintln!("!! 帧数据只有 {}/{} 字节，缺的用 0 补（图不完整）", copy, npix);
         rc = EX_INCONSISTENT;
+    }
+
+    // ---- 6.5 T11：内容若为 R10F（正式非压缩帧），先严格解析；不通过不发布 ----
+    //   判据与 `tools/pcie_integration/r10f_strict.py` / contract/acceptance-vectors.json
+    //   逐字段一致（magic/version/format/codec/几何三层长度/三 CRC/尾零/flags）。
+    //   ⚠ PGM 是灰度诊断输出：R10F 内容笔写出的是 packed RAW10 原始字节（8192bit/4px），
+    //   不是灰度像素；这里只为「取到、审到、可复算」留证据，不代表颜色/几何正确。
+    if img.len() >= r10f::HDR_BYTES && &img[0..4] == b"R10F" {
+        let pb = u32::from_le_bytes([img[0x30], img[0x31], img[0x32], img[0x33]]) as usize;
+        if r10f::HDR_BYTES + pb > img.len() {
+            eprintln!(
+                "!! R10F payload_bytes={} 超出槽内容（{} 字节）：拒绝发布",
+                pb,
+                img.len()
+            );
+            return EX_INCONSISTENT;
+        }
+        let (hdr, rest) = img.split_at(r10f::HDR_BYTES);
+        let (payload, tail) = rest.split_at(pb);
+        match r10f::parse(hdr, payload, tail, info.width, info.height, None) {
+            Ok(h) => {
+                println!(
+                    "  R10F      : session=0x{:08x} seq={} {}x{} stride={} flags=0x{:x}",
+                    h.session_id, h.capture_seq, h.width, h.height, h.stride, h.flags
+                );
+                println!(
+                    "  R10F CRC  : payload=0x{:08x} header=0x{:08x}（parse 内部已逐字节复算通过）",
+                    h.payload_crc32, h.header_crc32
+                );
+            }
+            Err(e) => {
+                eprintln!("!! R10F 严格解析失败：{}（拒绝发布；RC 槽头编号/长度一致也无效）", e);
+                return EX_INCONSISTENT;
+            }
+        }
     }
 
     // ---- 7. 搬运转查：只有环形缓冲绕回一圈才可能盖掉刚取的这一帧 ----
