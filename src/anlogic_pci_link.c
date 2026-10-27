@@ -240,6 +240,7 @@ static void anlogic_pci_link_print(const struct anlogic_pci_hw *hw, u32 cam_stat
 int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
 {
     u32 ctrl, cam_stat = 0, ddr_status = 0, ddr_seq = 0, pushed = 0, frame_cnt = 0;
+    u32 tx_st = 0;
     u32 dst_lo, dst_hi, db_lo, db_hi;
     u64 dst, db;
     unsigned int waited = 0;
@@ -270,6 +271,29 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
         pr_err("链路：FPGA 没有 RKA1 安全扩展（fail closed），推帧不授权；"
                "采集/DDR 诊断仍可用。\n");
         return rv;
+    }
+
+    /*
+     * 上一次运行可能把 FPGA 留在 busy/held（进程没 ACK 就退出、模块重装、
+     * 上一个驱动版本留下的状态）。活动期写授权配置会被 RTL 拒（cfg_reject，
+     * ioctl 侧表现为 -EBUSY），所以先把状态收回 IDLE 再配置。
+     * CANCEL 是特权撤销：已开始的包补完整、不发成功门铃、排空后才返回，
+     * 不会把半包写进主机内存。
+     */
+    rv = anlogic_pci_rka1_status(hw, &tx_st);
+    if (rv < 0) {
+        pr_err("链路：读 RKA1 TX_STATUS 失败 %d。\n", rv);
+        return rv;
+    }
+    if (tx_st & (ANLOGIC_RKA1_ST_BUSY | ANLOGIC_RKA1_ST_HELD |
+                 ANLOGIC_RKA1_ST_DRAINING)) {
+        pr_info("链路：FPGA 还停在 TX_STATUS=0x%08x（上一次没 ACK 就结束了），先 CANCEL 收回 IDLE。\n",
+                tx_st);
+        rv = anlogic_pci_rka1_cancel(hw);
+        if (rv < 0) {
+            pr_err("链路：CANCEL 失败 %d，推帧不授权。\n", rv);
+            return rv;
+        }
     }
 
     /*
