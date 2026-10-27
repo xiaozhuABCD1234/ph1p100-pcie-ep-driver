@@ -15,18 +15,20 @@
  *   4) 生命周期：卸载/离线先 CANCEL，再等 TX_STATUS 的 busy/draining 清零，最后才
  *      允许释放收帧内存；链路重建必须换新 session，旧门铃/ACK 一律不认。
  */
-#include <linux/kernel.h>
-#include <linux/module.h>
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/delay.h>
 #include <linux/errno.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
 
 #include "anlogic_pci.h"
-#include "anlogic_pci_ioctl.h"
 
 /* RTL 里私有寄存器的常量（与 include/anlogic_pci_ioctl.h 里的偏移一起用） */
 #define RKA1_CANCEL_WAIT_MS      50u    /* CANCEL 后等 busy/draining 清零的上限 */
 #define RKA1_CANCEL_POLL_US      200u   /* 轮询间隔 */
-#define RKA1_ACK_POLL_MS         20u    /* ACK 后等 held 释放的上限 */
+#define RKA1_ACK_WAIT_MS         20u    /* ACK 后等 held 释放的上限（每轮睡 1~2ms） */
+#define RKA1_QUIESCE_WAIT_MS     60u    /* ARM 前把 armed/held/busy 收回 IDLE 的上限 */
 
 static int rka1_read(struct anlogic_pci_hw *hw, u32 off, u32 *val)
 {
@@ -150,9 +152,57 @@ int anlogic_pci_rka1_configure(struct anlogic_pci_hw *hw, u32 cap_bytes, u32 ses
 }
 
 /*
+ * 把 TX 引擎收回 IDLE（ARM 幂等用）。
+ *   HELD       → 先用 (0xC0, 驱动会话) 做一次 ACK：RTL 的 held_seq 就是门铃值
+ *                （claim 时 db_val = st_done+1，推完 st_done 自增），0xC0 逐位匹配；
+ *                比直接 CANCEL 温和（不产生 E_CANCEL、不置 bit3）。
+ *   ARMED      → CANCEL：额度还没开始任何传输，丢弃零代价。
+ *   BUSY/DRAIN → CANCEL：RTL 会把已开始的包补完再排空，绝不截半包。
+ * 返回 0 表示 armed/busy/held/draining 已全清。
+ */
+static int rka1_quiesce_to_idle(struct anlogic_pci_hw *hw, u32 st)
+{
+    const u32 busy_mask = ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY |
+                          ANLOGIC_RKA1_ST_HELD  | ANLOGIC_RKA1_ST_DRAINING;
+    unsigned int waited = 0;
+    u32 done = 0;
+    int rv;
+
+    /*
+     * 用「读状态 → 按状态动作 → 再读」的轮询，而不是按调用方传进来的 st 一次性决策：
+     * 板上实测出现过 st 读到 HELD、几微秒后 ACK 内部再读已经是 ARMED 的竞态，
+     * 一次性决策会走错分支（结果 E_CANCEL=7 而 held 没释放，ARM 一直被拒）。
+     */
+    while (waited < RKA1_QUIESCE_WAIT_MS) {
+        if (!(st & busy_mask))
+            return 0;
+        if (st & ANLOGIC_RKA1_ST_HELD) {
+            rv = rka1_read(hw, ANLOGIC_BAR_PUSH_DONE_OFF, &done);
+            if (!rv && done)
+                (void)anlogic_pci_rka1_ack_release(hw, done, hw->rka1_session);
+            else
+                (void)anlogic_pci_rka1_cancel(hw);
+        } else {
+            (void)anlogic_pci_rka1_cancel(hw);
+        }
+        usleep_range(2000, 3000);
+        waited += 2;
+        rv = anlogic_pci_rka1_status(hw, &st);
+        if (rv < 0)
+            return rv;
+    }
+    if (st & busy_mask) {
+        pr_err("RKA1：收回 IDLE 超时（%u ms，TX_STATUS=0x%08x）。\n",
+               waited, st);
+        return -EBUSY;
+    }
+    return 0;
+}
+
+/*
  * 一键 ARM_ONE_SHOT：写 0x108 = 0x1（W1，读恒 0）。
- *   · 写前：TX_STATUS 必须没有 armed/busy/held/draining（否则 FPGA 也会拒，但先在
- *     驱动侧挡掉，错误信息更清楚）；
+ *   · 写前：TX_STATUS 必须没有 armed/busy/held/draining（否则先自愈回 IDLE，
+ *     自愈失败才拒绝，错误信息更清楚）；
  *   · 写后立刻读 TX_STATUS：armed 必须置起；若 rejected 置起说明 FPGA 校验拒绝
  *    （容量/session/对齐/链路/MPS 等），返回 -EINVAL 并把 0xC8 打出来。
  * 返回 0 只表示「额度已给」；是否真的推完要看 held 或 0xC0/0xC8。
@@ -176,9 +226,32 @@ int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw)
         return rv;
     if (st & (ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY |
               ANLOGIC_RKA1_ST_HELD   | ANLOGIC_RKA1_ST_DRAINING)) {
-        pr_err("RKA1：TX_STATUS=0x%08x 不是空闲（armed/busy/held/draining），拒绝 ARM。\n",
-               st);
-        return -EBUSY;
+        /*
+         * 2026-10-28：原来这里直接 -EBUSY 硬拒，于是「上一次没 ACK / 没 CANCEL」
+         * 会让之后所有抓帧都失败（板上实测：第二次抓帧 0xC0 不涨、落盘还是旧缓冲）。
+         * 改成先自愈回 IDLE、重写授权，再照常 ARM。
+         */
+        pr_info("RKA1：ARM 前 TX_STATUS=0x%08x 不是空闲，先收回 IDLE（幂等）。\n", st);
+        rv = rka1_quiesce_to_idle(hw, st);
+        if (rv < 0) {
+            pr_err("RKA1：收回 IDLE 失败 %d，拒绝 ARM。\n", rv);
+            return rv;
+        }
+        /* 活动期的 CONFIGURE 可能被 RTL 以 cfg_reject 拒过（0xC8=10），
+         * 暂存寄存器里还是旧值，这里重写一遍再 ARM。 */
+        rv = rka1_write(hw, ANLOGIC_BAR_TX_CAP_OFF, hw->rka1_cap_bytes);
+        if (!rv)
+            rv = rka1_write(hw, ANLOGIC_BAR_TX_SESSION_OFF, hw->rka1_session);
+        if (rv < 0)
+            return rv;
+        rv = anlogic_pci_rka1_status(hw, &st);
+        if (rv < 0)
+            return rv;
+        if (st & (ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY |
+                  ANLOGIC_RKA1_ST_HELD   | ANLOGIC_RKA1_ST_DRAINING)) {
+            pr_err("RKA1：收回 IDLE 后 TX_STATUS=0x%08x 仍不空闲，拒绝 ARM。\n", st);
+            return -EBUSY;
+        }
     }
 
     rv = rka1_write(hw, ANLOGIC_BAR_TX_CMD_OFF, ANLOGIC_RKA1_CMD_ARM);
@@ -222,8 +295,17 @@ int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session
     if (rv < 0)
         return rv;
     if (!(st & ANLOGIC_RKA1_ST_HELD)) {
-        pr_err("RKA1：ACK 时 FPGA 不在 held（TX_STATUS=0x%08x），拒绝。\n", st);
-        return -EINVAL;
+        /*
+         * 幂等：本来就没有 held 槽可释放。若还停在 ARMED，说明这个额度一帧都没推
+         * （源没再发布 / claim 被拒），顺手 CANCEL 收回，别留给下一次 ARM；
+         * 其余情况直接成功返回，让上层用 0xC0 增量判「这次到底推没推」。
+         */
+        if (st & ANLOGIC_RKA1_ST_ARMED) {
+            pr_info("RKA1：ACK 时还在 ARMED（该额度未推任何帧），改为 CANCEL 收回。\n");
+            return anlogic_pci_rka1_cancel(hw);
+        }
+        pr_info("RKA1：ACK 时不在 held（TX_STATUS=0x%08x），视为已释放。\n", st);
+        return 0;
     }
 
     rv = rka1_write(hw, ANLOGIC_BAR_TX_ACK_SESS_OFF, session);
@@ -234,7 +316,7 @@ int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session
     if (rv < 0)
         return rv;
 
-    while (waited < RKA1_ACK_POLL_MS) {
+    while (waited < RKA1_ACK_WAIT_MS) {
         rv = anlogic_pci_rka1_status(hw, &st);
         if (rv < 0)
             return rv;

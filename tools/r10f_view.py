@@ -57,6 +57,18 @@ class IocFrameWait(ctypes.Structure):
 IOCFRAMEINFO = ior(10, ctypes.sizeof(IocFrame))
 IOCFRAMEWAIT = iowr(11, ctypes.sizeof(IocFrameWait))
 
+# ---- 方向修正（相机可能被倒装）----
+#   none = 原样；h = 左右翻；v = 上下翻；180 = 上下左右都翻（相机旋转 180° 安装时用这个）
+def apply_flip(gray, w, h, mode):
+    if mode in (None, "", "none"):
+        return gray
+    rows = [gray[y * w:(y + 1) * w] for y in range(h)]
+    if mode in ("h", "180"):
+        rows = [r[::-1] for r in rows]
+    if mode in ("v", "180"):
+        rows = rows[::-1]
+    return b"".join(rows)
+
 # ---- 纯标准库 PNG 写出（灰度 8bit）----
 def write_png_gray(path, data, w, h):
     raw = bytearray()
@@ -117,8 +129,9 @@ def cmd_convert(args):
     w, h, stride, pay = parse_header(slot)
     print("R10F %dx%d stride=%d payload=%d" % (w, h, stride, pay), file=sys.stderr)
     gray, ow, oh = unpack_raw10(slot[R10F_HDR:R10F_HDR + pay], w, h, stride, args.scale)
+    gray = apply_flip(gray, ow, oh, args.flip)
     write_png_gray(args.out, gray, ow, oh)
-    print("已写出 %s (%dx%d)" % (args.out, ow, oh))
+    print("已写出 %s (%dx%d) flip=%s" % (args.out, ow, oh, args.flip))
 
 def cmd_snapshot(args):
     ctrl = os.open(args.dev + "_control", os.O_RDWR)
@@ -142,7 +155,12 @@ def cmd_snapshot(args):
     slotb = m[off:off + fi.slot_bytes]
     w, h, stride, pay = parse_header(slotb)
     gray, ow, oh = unpack_raw10(slotb[R10F_HDR:R10F_HDR + pay], w, h, stride, args.scale)
+    gray = apply_flip(gray, ow, oh, args.flip)
     write_png_gray(args.out, gray, ow, oh)
+    if args.raw:
+        with open(args.raw, "wb") as f:
+            f.write(slotb)
+        print("原始槽已写出 %s (%d 字节)" % (args.raw, len(slotb)))
     m.close(); os.close(frame); os.close(ctrl)
     print("已写出 %s (%dx%d)，帧号 %d" % (args.out, ow, oh, fw.seq))
 
@@ -154,6 +172,8 @@ def main():
     c.add_argument("file")
     c.add_argument("-o", "--out", required=True)
     c.add_argument("--scale", type=int, default=1, choices=(1, 2, 4))
+    c.add_argument("--flip", default="none", choices=("none", "h", "v", "180"),
+                   help="相机倒装时用 180（上下左右同时翻）")
     c.set_defaults(func=cmd_convert)
 
     s = sub.add_parser("snapshot", help="从设备直接抓一帧")
@@ -161,7 +181,10 @@ def main():
     s.add_argument("--dev", default="/dev/ANLOGIC-PCI0")
     s.add_argument("--timeout", type=int, default=5000)
     s.add_argument("--last-seq", type=int, default=-1)
+    s.add_argument("--raw", default="", help="同时把原始槽字节写到该文件（给 r10f_strict 用）")
     s.add_argument("--scale", type=int, default=1, choices=(1, 2, 4))
+    s.add_argument("--flip", default="none", choices=("none", "h", "v", "180"),
+                   help="相机倒装时用 180（上下左右同时翻）")
     s.set_defaults(func=cmd_snapshot)
 
     args = ap.parse_args()
