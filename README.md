@@ -218,7 +218,7 @@ ls /dev/ANLOGIC-PCI0_frame            # 必须出现，否则还是厂商版驱�
 ## 代码风格
 
 - C 源文件与头文件统一 **tab 缩进（8 列）**，格式化后 `checkpatch.pl --file` 为
-  **0 error**；剩余 warning 主要是长行、跨行字符串、以及 ABI 头里的 typedef。
+  **0 error**；剩余 warning 主要是长行（中文日志/注释按字节计）和 ABI 头里的 typedef。
 - 用户态 Rust 用 rustfmt 默认风格，Python 只用标准库；日志格式见上面的“日志约定”。
 - 做完功能改动后至少跑：`make ... W=1 modules`、`cargo test --offline`、
   `r10f_strict.py selftest`、`r10f_tools_consistency.py`、`git diff --check`。
