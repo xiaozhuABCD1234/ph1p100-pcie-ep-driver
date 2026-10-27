@@ -319,7 +319,9 @@ def cmd_gen(args):
                         mode_id=args.mode, flags=fl)
     Path(args.out).write_bytes(frame)
     ok, errs, _ = strict_validate(frame)
-    assert ok, errs
+    if not ok:
+        print("!! 生成的样例未通过严格校验：%s" % errs, file=sys.stderr)
+        return 1
     print(json.dumps({"out": str(args.out), "size": len(frame),
                       "sha256": hashlib.sha256(frame).hexdigest(),
                       "marker": "R10F_GEN_OK"}, ensure_ascii=False))
@@ -328,7 +330,12 @@ def cmd_gen(args):
 
 def cmd_selftest(args):
     run = Path(args.run_dir).resolve()
-    vectors = json.loads((run / "contract" / "acceptance-vectors.json").read_text(encoding="utf-8"))
+    vectors_path = run / "contract" / "acceptance-vectors.json"
+    if not vectors_path.is_file():
+        print("!! 找不到 %s；请用 --run-dir 指向含 contract/ 的目录" % vectors_path,
+              file=sys.stderr)
+        return 1
+    vectors = json.loads(vectors_path.read_text(encoding="utf-8"))
     results = []
 
     def chk(name, cond):
@@ -414,7 +421,7 @@ def main():
 
     s = sub.add_parser("selftest", help="复算合同验收向量 + 全部负例 + gen 可复现性")
     s.add_argument("--run-dir", default=str(Path(__file__).resolve().parents[2] /
-                                            "workflow/runs/20261017-011744-rk-fpga-align"))
+                                            "docs/protocol/rka1-r10f-v1"))
     s.add_argument("--json-out", default=None)
     s.set_defaults(func=cmd_selftest)
 

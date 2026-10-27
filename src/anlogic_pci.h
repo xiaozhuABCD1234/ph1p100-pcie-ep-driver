@@ -2,10 +2,12 @@
 /*
  * Anlogic PH1P100 PCIe 端点（RK3588 主机侧）驱动内部头。
  *
- * 分三层：
- *   anlogic_pci_main.c   —— 模块与 PCI 驱动骨架（probe/remove/错误处理）
+ * 分四层：
+ *   anlogic_pci_main.c   —— 模块与 PCI 驱动骨架（probe/remove/AER 错误处理）
  *   anlogic_pci_hw.c     —— 资源与寄存器访问层（BAR、区间、DMA 掩码、中断、通道）
  *   anlogic_pci_chrdev.c / anlogic_pci_ctrl.c —— 字符设备与 ioctl 层
+ *   anlogic_pci_frame.c / anlogic_pci_link.c / anlogic_pci_rka1.c
+ *                        —— 收帧缓冲、相机链路/推帧初始化、RKA1 安全扩展
  *
  * 与用户态共用的 ioctl 协议只有 include/anlogic_pci_ioctl.h 一份。
  */
@@ -74,10 +76,9 @@ enum anlogic_pci_card_flags {
 struct anlogic_pci_engine {
     unsigned long magic;
     struct anlogic_pci_hw *hw;
-    char name[16];
+    char name[32];
     enum dma_data_direction dir;
     int channel;
-    u32 irq_bitmask;
     int msix_irq_line;
     int irq_registered;     /* 该通道的中断确实申请成功过 */
 };
@@ -108,7 +109,6 @@ struct anlogic_pci_hw {
     int msi_enabled;
     int msix_enabled;
 
-    int engines_num;
     struct anlogic_pci_engine engine_h2c[ANLOGIC_PCI_MAX_CHANNELS];
     struct anlogic_pci_engine engine_c2h[ANLOGIC_PCI_MAX_CHANNELS];
 
@@ -140,8 +140,8 @@ struct anlogic_pci_hw {
      */
     u64 link_push_dst;                        /* 0xB0/0xB4 当前值（主机物理地址） */
     u64 link_push_db;                         /* 0xB8/0xBC 当前值（帧缓冲 mailbox 页里的门铃字） */
-    u32 link_ctrl;                            /* 探测时写进 0x44 的值 */
-    unsigned int link_armed;                  /* 推帧目标/门铃地址与使能位都已就位 */
+    unsigned int link_armed;                  /* 推帧目标/门铃地址与使能位都已就位；ARM 前必须为 1 */
+    unsigned int link_cam_b;                  /* CTRL[8] 当前选中的推帧相机（0 = A，1 = B） */
 
     /*
      * T07: RKA1 safety extension state (see anlogic_pci_rka1.c).
@@ -216,8 +216,13 @@ int anlogic_pci_cdev_close(struct inode *inode, struct file *file);
 /* anlogic_pci_frame.c（收帧缓冲层：分配/释放、帧就绪轮询、取帧节点的 ioctl 与 mmap） */
 int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw);
 void anlogic_pci_frame_free(struct anlogic_pci_hw *hw);
+/* 看门铃并把槽头/mailbox.seq/count 补齐（frame 与 link status 共用） */
+void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw);
 long anlogic_pci_frame_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
                              void __user *arg);
+/* 等帧入口：轮询之间释放 hw->lock，必须由包装层在取锁之前分流过来 */
+long anlogic_pci_frame_wait_ioctl(struct anlogic_pci_cdev *cdev,
+                                  void __user *arg);
 void anlogic_pci_frame_init(struct anlogic_pci_cdev *cdev);
 
 /* anlogic_pci_ctrl.c */

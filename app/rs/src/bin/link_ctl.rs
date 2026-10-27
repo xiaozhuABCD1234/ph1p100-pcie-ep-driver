@@ -20,9 +20,9 @@
  * 选项：
  *   -d <节点>      控制节点，默认 /dev/ANLOGIC-PCI0_control
  *   -t <毫秒>      retrig 触发后最多等多久等链路锁定（默认 2000，0 = 不等，上限 5000）
- *   --dst-lo <v>   推帧目标地址低 32 位（与 --dst-hi 一起给）
+ *   --dst-lo <v>   推帧目标地址低 32 位（与 --dst-hi 一起给；必须等于驱动分配的槽 0 数据起点）
  *   --dst-hi <v>   推帧目标地址高 32 位
- *   --db-lo <v>    门铃地址低 32 位（与 --db-hi 一起给）
+ *   --db-lo <v>    门铃地址低 32 位（与 --db-hi 一起给；必须等于 mailbox.push_dbell）
  *   --db-hi <v>    门铃地址高 32 位
  *   -q             少打几行
  *   -h             用法
@@ -40,7 +40,7 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use anlogic_pci_tools::getopt::{Getopt, LongOpt};
 use anlogic_pci_tools::ioctl::{
-    IocLinkRetrig, IocLinkStatus, IocPushCfg, ANLOGIC_CAM_LANE_ALL, ANLOGIC_CTRL_CAM_SEL,
+    IocLinkRetrig, IocLinkStatus, IocPushCfg, ANLOGIC_CAM_LANE_ALL, ANLOGIC_CTRL_CAM_B,
     ANLOGIC_CTRL_DDR_EN, ANLOGIC_CTRL_ENABLE, ANLOGIC_CTRL_MCLK_SEL, ANLOGIC_CTRL_PUSH_EN,
     ANLOGIC_CTRL_PUSH_SRC, ANLOGIC_DDR_STATUS_ALIVE, ANLOGIC_DDR_STATUS_CAL_DONE,
     ANLOGIC_IOCLINKRETRIG, ANLOGIC_IOCLINKSTATUS, ANLOGIC_IOCPUSHCFG, ANLOGIC_PUSH_CFG_SET_DB,
@@ -99,8 +99,10 @@ fn link_status(fd: RawFd) -> Result<IocLinkStatus, std::io::Error> {
 }
 
 fn print_status(st: &IocLinkStatus, quiet: bool) {
+    let cam = if st.ctrl & ANLOGIC_CTRL_CAM_B != 0 { "B" } else { "A" };
     println!(
-        "链路    : 相机 A 路 {}（lane_valid=0x{:x}，四条全对齐 = 0x{:x}）  状态字 0x{:08x}  0x4C 帧计数 {}",
+        "链路    : 相机 {} 路（CTRL[8]）{}（lane_valid=0x{:x}，四条全对齐 = 0x{:x}）  状态字 0x{:08x}  0x4C 帧计数 {}",
+        cam,
         if st.lane_valid == ANLOGIC_CAM_LANE_ALL {
             "已锁"
         } else if st.lane_valid != 0 {
@@ -156,12 +158,12 @@ fn print_status(st: &IocLinkStatus, quiet: bool) {
     println!("收帧缓冲: mailbox seq={} count={}（驱动按门铃补齐）", st.seq, st.count);
     if !quiet {
         println!(
-            "CTRL    : 0x{:08x}（使能={} 触发={} 重触发电平={} 相机写源={} DDR搬运={} 推帧={} 推帧源={}）",
+            "CTRL    : 0x{:08x}（使能={} 触发={} 重触发电平={} 推帧取B路={} DDR搬运={} 推帧={} 推帧源={}）",
             st.ctrl,
             bit(st.ctrl, ANLOGIC_CTRL_ENABLE),
             bit(st.ctrl, 2),
             bit(st.ctrl, ANLOGIC_CTRL_MCLK_SEL),
-            bit(st.ctrl, ANLOGIC_CTRL_CAM_SEL),
+            bit(st.ctrl, ANLOGIC_CTRL_CAM_B),
             bit(st.ctrl, ANLOGIC_CTRL_DDR_EN),
             bit(st.ctrl, ANLOGIC_CTRL_PUSH_EN),
             bit(st.ctrl, ANLOGIC_CTRL_PUSH_SRC)
@@ -240,14 +242,14 @@ fn usage(prog: &str) {
          查/改 PH1P100 的相机链路与推帧通路（都走驱动 ioctl，本工具不 mmap BAR）。\n\
          \x20 status  查链路与推帧状态（默认）\n\
          \x20 retrig  手动重新触发一次相机初始化（链路掉了之后恢复用）\n\
-         \x20 push    复核推帧目标/门铃地址；给了 --dst-*/--db-* 就是重设\n\
+         \x20 push    复核推帧目标/门铃地址；--dst/--db 必须与驱动分配的槽 0/门铃完全一致\n\
          \n\
          选项:\n\
          \x20 -d <节点>     控制节点，默认 {}\n\
          \x20 -t <毫秒>     retrig 后最多等多久等锁定，默认 {}（0..{}，0 = 不等）\n\
-         \x20 --dst-lo <v>  推帧目标地址低 32 位\n\
+         \x20 --dst-lo <v>  推帧目标低 32 位（= 驱动槽 0 数据起点）\n\
          \x20 --dst-hi <v>  推帧目标地址高 32 位\n\
-         \x20 --db-lo <v>   门铃地址低 32 位\n\
+         \x20 --db-lo <v>   门铃低 32 位（= mailbox.push_dbell）\n\
          \x20 --db-hi <v>   门铃地址高 32 位\n\
          \x20 -q            少打几行\n\
          \x20 -h            用法\n\
@@ -396,7 +398,8 @@ fn run() -> i32 {
             rt.waited_ms
         );
         println!(
-            "  A 路状态字 0x{:08x}，lane_valid=0x{:x}（四条全对齐 = 0x{:x}）、0x4C 帧计数 {}{}",
+            "  {} 路状态字 0x{:08x}，lane_valid=0x{:x}（四条全对齐 = 0x{:x}）、0x4C 帧计数 {}{}",
+            if rt.ctrl & ANLOGIC_CTRL_CAM_B != 0 { "B" } else { "A" },
             rt.cam_stat,
             rt.lane_valid,
             ANLOGIC_CAM_LANE_ALL,
@@ -420,6 +423,17 @@ fn run() -> i32 {
         match link_status(fd) {
             Ok(st) => {
                 print_status(&st, quiet);
+                /*
+                 * 重触发返回时 lane 可能还在逐步对齐；但如果复核时仍没锁、
+                 * 且 0x4C 帧计数相对 ioctl 返回时没有再增加，就说明这次
+                 * 重触发没有把链路救回来，别用 0 骗脚本。
+                 */
+                if st.lane_valid != ANLOGIC_CAM_LANE_ALL &&
+                    st.frame_cnt == rt.frame_cnt {
+                    eprintln!("!! 重触发后链路仍未锁，且 0x4C 帧计数没有再增加");
+                    eprintln!("   （传感器/接线/供电/参考时钟侧；可再跑 retrig 或 status 复核）");
+                    return EX_NO_LOCK;
+                }
                 if st.push_en == 0 || st.armed == 0 {
                     return EX_NOT_ARMED;
                 }
@@ -449,7 +463,7 @@ fn run() -> i32 {
             }
             Err(e) => {
                 eprintln!("!! ANLOGIC_IOCPUSHCFG 失败：{}", sys::errno_str(&e));
-                eprintln!("   （-EIO：写进去读回不一致 / 读到全 F；-EINVAL：flags 有未知位）");
+                eprintln!("   （-EIO：写进去读回不一致 / 读到全 F；-EINVAL：flags 有未知位，或地址不是驱动分配的槽 0/门铃）");
                 EX_DEV
             }
         };

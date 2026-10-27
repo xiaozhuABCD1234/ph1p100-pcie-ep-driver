@@ -129,6 +129,7 @@ typedef struct cfgwrite {
 #define ANLOGIC_FRAME_DEF_HEIGHT     1080u
 #define ANLOGIC_FRAME_RAW_BYTES      2592000u    /* 1920x1080 packed RAW10（stride 2400B/行） */
 #define ANLOGIC_FRAME_PAYLOAD_BYTES  ANLOGIC_FRAME_RAW_BYTES
+/* 1920x1080 的参考值；驱动现在按 frame_width/height 现算，其他几何不要用这个常量。 */
 #define ANLOGIC_FRAME_DMA_BYTES      2592768u    /* ceil((128+2592000)/4096)*4096 = 633*4096 */
 #define ANLOGIC_FRAME_TAIL_PAD       (ANLOGIC_FRAME_DMA_BYTES - \
                                       (ANLOGIC_FRAME_R10F_HDR + ANLOGIC_FRAME_PAYLOAD_BYTES)) /* 640B */
@@ -170,8 +171,8 @@ struct anlogic_ioc_frame {
     unsigned long long  phys_addr;  /* 缓冲起始物理（PCIe 总线）地址 */
     unsigned long long  size;       /* 缓冲总字节数（页对齐） */
     unsigned int        stride;     /* 槽位步长 */
-    unsigned int        slot_bytes; /* 一帧像素字节数 */
-    unsigned int        hdr_bytes;  /* 槽头字节数（sizeof(anlogic_frame_slot_hdr)） */
+    unsigned int        slot_bytes; /* 一帧传输字节数（R10F：128B 头 + payload + 4KiB 尾） */
+    unsigned int        hdr_bytes;  /* 槽内传输数据起点（T07 = 128：16B 槽头 + 112B zero pad） */
     unsigned int        slots;      /* 槽位数 */
     unsigned int        width;      /* 每帧宽度（像素） */
     unsigned int        height;     /* 每帧高度（像素） */
@@ -323,7 +324,7 @@ struct anlogic_ioc_frame_wait {
 struct anlogic_ioc_link_status {
     unsigned int ctrl;          /* 0x44 读回 */
     unsigned int frame_cnt;     /* 0x4C 帧缓存已完成帧数 */
-    unsigned int cam_stat;      /* 0x80 A 路状态字原始值 */
+    unsigned int cam_stat;      /* 当前选中路（CTRL[8]：0=A 读 0x80，1=B 读 0x84）状态字原始值 */
     unsigned int lane_valid;    /* cam_stat[4:1] */
     unsigned int cam_locked;    /* 1 = lane_valid != 0（MIPI 链路已锁） */
     unsigned int ddr_seq;       /* 0xA0 */
@@ -377,8 +378,10 @@ struct anlogic_ioc_link_retrig {
 
 /*
  * 复核 / 重设推帧目标与门铃地址（ANLOGIC_IOCPUSHCFG）。
- * flags = 0 只复核（out 字段填当前寄存器读回值）；置了 SET_ 位才写对应地址，
- * 写完必读回复核，读回与写入不一致时返回 -EIO。
+ * flags = 0 只复核（out 字段填当前寄存器读回值）；置了 SET_ 位才写对应地址。
+ * 只接受驱动分配的唯一合法值：dst = frame_phys + hdr_bytes（槽 0 的 R10F 起点），
+ * db = frame_phys + mb_off + offsetof(push_dbell)；其它值一律 -EINVAL。
+ * 写完必读回 LO/HI 两半复核，不一致返回 -EIO。
  */
 struct anlogic_ioc_push_cfg {
     unsigned int flags;         /* in  ANLOGIC_PUSH_CFG_SET_* 的组合，0 = 只复核 */

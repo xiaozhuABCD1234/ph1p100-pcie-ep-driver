@@ -41,11 +41,15 @@ def rust_offsets(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--python-src", default=str(ROOT / "tools/pcie_integration/r10f_strict.py"))
-    ap.add_argument("--rust-src", default=str(ROOT / "workflow/runs/20261017-011744-rk-fpga-align/"
-                                             "raw/rk-driver-src/app/rs/src/rka1.rs"))
+    ap.add_argument("--rust-src", default=str(ROOT / "app/rs/src/rka1.rs"))
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
 
+    for path in (Path(args.python_src), Path(args.rust_src)):
+        if not path.is_file():
+            print("!! 找不到源文件 %s；用 --python-src/--rust-src 指定" % path,
+                  file=sys.stderr)
+            return 1
     py = python_offsets(Path(args.python_src))
     rs = rust_offsets(Path(args.rust_src))
     alias = {"stride": "stride_bytes"}

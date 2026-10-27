@@ -3,6 +3,12 @@
  * cam_grab —— 从 PH1P100 PCIe EP 的 BAR0 抓一帧 640x480 灰度图，写成 PGM
  * （原 app/cam_grab.c 的 Rust 版，抓帧时序/寄存器语义/输出格式都不变）
  *
+ * ⚠ LEGACY：本工具对应 T07 之前“测试图/相机 → fb[] → 0x5C/0x60 PIO”的
+ * 640×480 通路。当前 T07 RTL 把 CTRL[4] 保留（写 0/读 0），相机整帧走
+ * DDR3 + one-shot 推帧；在当前位流上 -s cam 会因 bit4 回读 0 以 EX_DEV 退出。
+ * 因此硬件抓帧默认直接拒绝（不碰 BAR），只有显式 --legacy 才走旧路径；
+ * 当前收帧请用 frame_grab（R10F 解包）或 tools/r10f_view.py（PNG）。
+ *
  * --------------------------------------------------------------------------
  * 一、寄存器语义（依据 fpga/rtl/ep_side/img/ep_bar_win.v 的读 mux :215-241）
  * --------------------------------------------------------------------------
@@ -625,7 +631,8 @@ fn usage(prog: &str) {
     println!(
         "用法: {} [选项] [输出.pgm]\n\
          \n\
-         从 PH1P100 PCIe EP 的 BAR0 寄存器表抓一帧 640x480 灰度图并存成 PGM。\n\
+         从 PH1P100 PCIe EP 的 BAR0 抓一帧 640x480 灰度图（LEGACY；当前位流默认拒绝，\n\
+         需要 --legacy 才走旧路径）。\n\
          访问规矩：先读 0x40 MAGIC 自检、只碰登记过的\n\
          offset、单次单 dw、任一读拿到 0xffffffff 立即熔断退出。\n\
          \n\
@@ -636,6 +643,7 @@ fn usage(prog: &str) {
          \x20     --decode 0xXXXXXXXX    只把相机状态字逐位解码成人话，不碰任何硬件\n\
          \x20                            （可给多个；0x80=A 路、0x84=B 路）\n\
          \x20     --selftest             离线自证主机侧像素映射/自检逻辑（合成帧，不碰硬件）\n\
+         \x20     --legacy               强制走 T07 之前的 640x480 PIO 旧路径（当前位流不要用）\n\
          \x20 -h, --help                 本说明\n\
          \n\
          测试图源是「单帧触发」：CTRL=[3:2]|bit1（enable=0，出一帧就静止），\n\
@@ -669,6 +677,7 @@ fn run() -> i32 {
         LongOpt { name: "timeout", has_arg: true, val: b't' as u32 },
         LongOpt { name: "decode", has_arg: true, val: 1 },
         LongOpt { name: "selftest", has_arg: false, val: 2 },
+        LongOpt { name: "legacy", has_arg: false, val: 3 },
         LongOpt { name: "help", has_arg: false, val: b'h' as u32 },
     ];
 
@@ -680,6 +689,7 @@ fn run() -> i32 {
     let mut timeout_ms: u32 = DEF_TIMEOUT_MS;
     let mut decode_vals: Vec<u32> = Vec::new();
     let mut want_selftest = false;
+    let mut legacy = false;
 
     while let Some(item) = getopt.next() {
         let (id, arg) = match item {
@@ -731,6 +741,7 @@ fn run() -> i32 {
                 return EX_OK;
             }
             2 => want_selftest = true,
+            3 => legacy = true,
             _ => {
                 usage(&argv[0]);
                 return EX_USAGE;
@@ -767,6 +778,19 @@ fn run() -> i32 {
             println!();
         }
         return EX_OK;
+    }
+
+    /*
+     * 当前 RTL 已经没有 640x480 fb[] → PIO 这条路（CTRL[4] 保留、读回 0），
+     * 默认直接拒绝，免得用户以为工具坏了或者把链路写乱。老位流调试才加
+     * --legacy 强制走下面的旧路径。
+     */
+    if !legacy {
+        eprintln!("!! cam_grab 的 640x480 PIO 抓帧是 T07 之前的 LEGACY 通路");
+        eprintln!("   当前 RTL 的 CTRL[4] 已保留（读回 0），不会再有 fb[] 帧。");
+        eprintln!("   当前收帧请用 frame_grab（R10F）或 tools/r10f_view.py（PNG）；");
+        eprintln!("   只有确认在老位流上调试才加 --legacy。");
+        return EX_DEV;
     }
 
     // ---- 1. 打开并映射 BAR0 前 4KB（offset=0、length ≤ 4KB）----

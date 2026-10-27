@@ -175,7 +175,10 @@ pub const ANLOGIC_BAR_PUSH_TLP_OFF: u32 = 0xCC;
 pub const ANLOGIC_CTRL_ENABLE: u32 = 1 << 0;
 pub const ANLOGIC_CTRL_TRIGGER: u32 = 1 << 1;
 pub const ANLOGIC_CTRL_MCLK_SEL: u32 = 1 << 2;
+/// 旧 RTL 的 CTRL[4]“相机写源”，T07 起保留（写 0/读 0）；不要再用。
 pub const ANLOGIC_CTRL_CAM_SEL: u32 = 1 << 4;
+/// T07：推帧取哪一路（0 = A，1 = B）
+pub const ANLOGIC_CTRL_CAM_B: u32 = 1 << 8;
 pub const ANLOGIC_CTRL_DDR_EN: u32 = 1 << 5;
 pub const ANLOGIC_CTRL_PUSH_EN: u32 = 1 << 6;
 pub const ANLOGIC_CTRL_PUSH_SRC: u32 = 1 << 7;
@@ -197,12 +200,19 @@ pub const ANLOGIC_PUSH_STATUS_LAST_OK: u32 = 1 << 1;
 pub const ANLOGIC_PUSH_STATUS_DB_SENT: u32 = 1 << 2;
 
 /// `ANLOGIC_PUSH_ERR_*`（0xC8 的取值）
-pub const ANLOGIC_PUSH_ERR_NAMES: [&str; 5] = [
+pub const ANLOGIC_PUSH_ERR_NAMES: [&str; 12] = [
     "正常（数据与门铃都发了）",
     "目标地址未配置（整帧没发）",
     "等 tl_tx_wait 超时（本帧停发）",
     "AXI 读响应非 OKAY（本帧停发）",
     "门铃地址未配置（数据推了、门铃没发）",
+    "有完整帧但没有 one-shot 额度（未 ARM）",
+    "ARM 被拒（描述符/cap/session 校验失败）",
+    "CANCEL 取消",
+    "HELD 期间源又出帧（已忽略）",
+    "源/描述符不一致",
+    "活动期写配置被拒",
+    "ACK 不匹配（session/seq 与 held 不符）",
 ];
 
 /// `struct anlogic_ioc_link_status`（ANLOGIC_IOCLINKSTATUS 的出参）

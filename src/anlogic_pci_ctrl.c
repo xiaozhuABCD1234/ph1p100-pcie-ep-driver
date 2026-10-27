@@ -19,8 +19,11 @@
  * 节点的 mmap 映射的是驱动自己分配的收帧内存，不走这里。
  *
  * 生命周期：ioctl/mmap 入口都用 hw->lock 串行化，并在 remove 置 removed 之后
- * 拒绝执行（见 anlogic_pci_hw_get / anlogic_pci_hw_quiesce）。
+ * 拒绝执行（见 anlogic_pci_hw_get / anlogic_pci_hw_quiesce）。唯一例外是
+ * ANLOGIC_IOCFRAMEWAIT：它在轮询之间放开 hw->lock，见文件末尾的 ioctl 入口。
  */
+#define pr_fmt(fmt) KBUILD_MODNAME ": [ctrl] " fmt
+
 #include <linux/ioctl.h>
 #include <linux/minmax.h>
 #include <linux/mm.h>
@@ -32,26 +35,24 @@
 /* 一次连续 MMIO 访问的双字上限（超过就分块），与访问规约一致 */
 #define ANLOGIC_CTRL_MMIO_CHUNK_DW  4u
 
-static u32 anlogic_pci_read_cfg_dword(struct pci_dev *pdev, u32 off)
+static int anlogic_pci_read_cfg_dword(struct pci_dev *pdev, u32 off, u32 *val)
 {
-    u32 val;
+    int rv = pci_read_config_dword(pdev, off, val);
 
-    if (pci_read_config_dword(pdev, off, &val) < 0) {
+    if (rv < 0)
         pr_err("reading PCI config 0x%x failed.\n", off);
-        return (u32)-1;
-    }
 
-    return val;
+    return rv;
 }
 
-static u32 anlogic_pci_write_cfg_dword(struct pci_dev *pdev, u32 off, u32 val)
+static int anlogic_pci_write_cfg_dword(struct pci_dev *pdev, u32 off, u32 val)
 {
-    if (pci_write_config_dword(pdev, off, val) < 0) {
-        pr_err("writing PCI config 0x%x failed.\n", off);
-        return (u32)-1;
-    }
+    int rv = pci_write_config_dword(pdev, off, val);
 
-    return 1;
+    if (rv < 0)
+        pr_err("writing PCI config 0x%x failed.\n", off);
+
+    return rv;
 }
 
 static long anlogic_pci_version_ioctl(struct anlogic_pci_cdev *cdev,
@@ -60,19 +61,23 @@ static long anlogic_pci_version_ioctl(struct anlogic_pci_cdev *cdev,
     struct anlogic_ioc_info obj;
     struct anlogic_pci_hw *hw = cdev->hw;
 
-    if (copy_from_user((void *)&obj, arg, sizeof(struct anlogic_ioc_info))) {
-        pr_err("copy_from_user failed %ld.\n",
-               sizeof(struct anlogic_ioc_info));
+    /*
+     * 保留入参 base（magic/command）：_IOWR 是 in/out，旧实现会把用户填的
+     * base 原样带回去；直接 memset 会让复用了同一块缓冲的用户态看到
+     * base.magic 变成 0。其余字段由驱动覆盖。
+     */
+    if (copy_from_user(&obj, arg, sizeof(obj))) {
+        pr_debug("copy_from_user(info) failed.\n");
         return -EFAULT;
     }
-    memset(&obj, 0, sizeof(obj));
+    obj.dma_engine_version = 0;   /* 本 EP 没有可读的 XDMA 配置 BAR */
     obj.vendor = hw->pdev->vendor;
     obj.device = hw->pdev->device;
     obj.subsystem_vendor = hw->pdev->subsystem_vendor;
     obj.subsystem_device = hw->pdev->subsystem_device;
     obj.feature_id = hw->feature_id;
     obj.driver_version = ANLOGIC_PCI_DRV_VERSION_NUMBER;
-    obj.domain = 0;
+    obj.domain = (unsigned short)pci_domain_nr(hw->pdev->bus);
     obj.bus = PCI_BUS_NUM(hw->pdev->devfn);
     obj.dev = PCI_SLOT(hw->pdev->devfn);
     obj.func = PCI_FUNC(hw->pdev->devfn);
@@ -97,16 +102,16 @@ static int anlogic_pci_ctrl_bar_range_check(struct anlogic_pci_hw *hw,
     resource_size_t map_len;
 
     if (bar_id >= ANLOGIC_PCI_BAR_NUM) {
-        pr_err("ioctl: bar_id %u >= ANLOGIC_PCI_BAR_NUM %d.\n", bar_id,
-               ANLOGIC_PCI_BAR_NUM);
+        pr_debug("ioctl: bar_id %u >= ANLOGIC_PCI_BAR_NUM %d.\n", bar_id,
+                 ANLOGIC_PCI_BAR_NUM);
         return -EINVAL;
     }
     if (!hw->bar[bar_id]) {
-        pr_err("ioctl: bar_id %u is not mapped.\n", bar_id);
+        pr_debug("ioctl: bar_id %u is not mapped.\n", bar_id);
         return -EINVAL;
     }
     if (off & 3) {
-        pr_err("ioctl: bar_offaddr 0x%x is not 4-byte aligned.\n", off);
+        pr_debug("ioctl: bar_offaddr 0x%x is not 4-byte aligned.\n", off);
         return -EINVAL;
     }
     /*
@@ -115,14 +120,38 @@ static int anlogic_pci_ctrl_bar_range_check(struct anlogic_pci_hw *hw,
      */
     map_len = hw->bar_map_len[bar_id];
     if (!map_len) {
-        pr_err("ioctl: bar_id %u mapped length is 0.\n", bar_id);
+        pr_debug("ioctl: bar_id %u mapped length is 0.\n", bar_id);
         return -EINVAL;
     }
     if ((u64)off + len > (u64)map_len) {
-        pr_err("ioctl: bar%u [0x%x, +0x%llx) exceeds mapped length 0x%llx.\n",
-               bar_id, off, (unsigned long long)len,
-               (unsigned long long)map_len);
+        pr_debug("ioctl: bar%u [0x%x, +0x%llx) exceeds mapped length 0x%llx.\n",
+                 bar_id, off, (unsigned long long)len,
+                 (unsigned long long)map_len);
         return -EINVAL;
+    }
+
+    return 0;
+}
+
+/*
+ * BAR0 的 0x40 MAGIC 门禁。读、写两条路径共用：设备被重新配置/拔掉之后
+ * BAR 会读回全 F 或别的值，此时后面的偏移就不再是“本 EP 的寄存器”了。
+ */
+static int anlogic_pci_ctrl_magic_check(struct anlogic_pci_hw *hw,
+                                        unsigned int bar_id)
+{
+    u32 magic;
+
+    if ((int)bar_id != hw->config_bar_idx)
+        return 0;
+    if (hw->bar_map_len[bar_id] < ANLOGIC_BAR_MAGIC_OFF + sizeof(u32))
+        return 0;
+
+    magic = ioread32(hw->bar[bar_id] + ANLOGIC_BAR_MAGIC_OFF);
+    if (magic != ANLOGIC_BAR_MAGIC_VAL) {
+        pr_err("ioctl: bar%u MAGIC 0x%08x != 0x%08x, refuse access.\n",
+               bar_id, magic, ANLOGIC_BAR_MAGIC_VAL);
+        return -EIO;
     }
 
     return 0;
@@ -138,17 +167,11 @@ static int anlogic_pci_ctrl_read32(struct anlogic_pci_hw *hw,
                                    unsigned int bar_id, unsigned int off,
                                    u32 *val)
 {
-    if ((int)bar_id == hw->config_bar_idx &&
-        hw->bar_map_len[bar_id] >=
-                ANLOGIC_BAR_MAGIC_OFF + sizeof(u32)) {
-        u32 magic = ioread32(hw->bar[bar_id] + ANLOGIC_BAR_MAGIC_OFF);
+    int rv;
 
-        if (magic != ANLOGIC_BAR_MAGIC_VAL) {
-            pr_err("ioctl: bar%u MAGIC 0x%08x != 0x%08x, refuse read of 0x%x.\n",
-                   bar_id, magic, ANLOGIC_BAR_MAGIC_VAL, off);
-            return -EIO;
-        }
-    }
+    rv = anlogic_pci_ctrl_magic_check(hw, bar_id);
+    if (rv < 0)
+        return rv;
 
     *val = ioread32(hw->bar[bar_id] + off);
     if (*val == ANLOGIC_MMIO_ALL_F) {
@@ -179,14 +202,14 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
 
     hw = cdev->hw;
     if (!hw) {
-        pr_info("cmd %u, hw NULL.\n", cmd);
+        pr_err("cmd %u, hw NULL.\n", cmd);
         return -EINVAL;
     }
     pr_debug("cmd 0x%x, hw 0x%p, pdev 0x%p.\n", cmd, hw, hw->pdev);
 
     if (_IOC_TYPE(cmd) != ANLOGIC_IOC_MAGIC) {
-        pr_err("cmd %u, bad magic 0x%x/0x%x.\n", cmd, _IOC_TYPE(cmd),
-               ANLOGIC_IOC_MAGIC);
+        pr_debug("cmd %u, bad magic 0x%x/0x%x.\n", cmd, _IOC_TYPE(cmd),
+                 ANLOGIC_IOC_MAGIC);
         return -ENOTTY;
     }
 
@@ -196,7 +219,7 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
         result = !access_ok((void __user *)arg, _IOC_SIZE(cmd));
 
     if (result) {
-        pr_err("bad access %ld.\n", result);
+        pr_debug("bad access %ld.\n", result);
         return -EFAULT;
     }
 
@@ -204,12 +227,12 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
     case ANLOGIC_IOCINFO:
         if (copy_from_user((void *)&ioctl_obj, (void __user *)arg,
                            sizeof(struct anlogic_ioc_base))) {
-            pr_err("copy_from_user failed.\n");
+            pr_debug("copy_from_user failed.\n");
             return -EFAULT;
         }
         if (ioctl_obj.magic != ANLOGIC_XCL_MAGIC) {
-            pr_err("magic 0x%x != ANLOGIC_XCL_MAGIC (0x%x).\n",
-                   ioctl_obj.magic, ANLOGIC_XCL_MAGIC);
+            pr_debug("magic 0x%x != ANLOGIC_XCL_MAGIC (0x%x).\n",
+                     ioctl_obj.magic, ANLOGIC_XCL_MAGIC);
             return -ENOTTY;
         }
         return anlogic_pci_version_ioctl(cdev, (void __user *)arg);
@@ -222,7 +245,7 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
     case ANLOGIC_IOCW:
         if (copy_from_user((void *)&ioctl_bar, (void __user *)arg,
                            sizeof(struct anlogic_ioc_bar))) {
-            pr_err("copy_from_user failed.\n");
+            pr_debug("copy_from_user failed.\n");
             return -EFAULT;
         }
         /* 写入前先校验：bar id 合法、bar_offaddr 4 字节对齐、
@@ -230,6 +253,9 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
         rv = anlogic_pci_ctrl_bar_range_check(hw, ioctl_bar.bar_id,
                                               ioctl_bar.bar_offaddr,
                                               sizeof(u32));
+        if (rv < 0)
+            return rv;
+        rv = anlogic_pci_ctrl_magic_check(hw, ioctl_bar.bar_id);
         if (rv < 0)
             return rv;
 
@@ -240,7 +266,7 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
     case ANLOGIC_IOCR:
         if (copy_from_user((void *)&ioctl_bar, (void __user *)arg,
                            sizeof(struct anlogic_ioc_bar))) {
-            pr_err("copy_from_user failed.\n");
+            pr_debug("copy_from_user failed.\n");
             return -EFAULT;
         }
         /* 读取前先校验：bar id 合法、bar_offaddr 4 字节对齐、
@@ -258,7 +284,7 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
             return rv;
         if (copy_to_user((void __user *)arg, &ioctl_bar,
                          sizeof(struct anlogic_ioc_bar))) {
-            pr_err("copy_to_user failed.\n");
+            pr_debug("copy_to_user failed.\n");
             return -EFAULT;
         }
         break;
@@ -266,20 +292,23 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
     case ANLOGIC_IOCBULKW:
         if (copy_from_user((void *)&ioctl_bar_bulk, (void __user *)arg,
                            sizeof(struct anlogic_ioc_bar_bulk))) {
-            pr_err("copy_from_user failed.\n");
+            pr_debug("copy_from_user failed.\n");
             return -EFAULT;
         }
         /* 批量写前先校验：bar id 合法、bar_offaddr 4 字节对齐、
          * 整段 bar_len 个双字不越 BAR 边界 */
         if (ioctl_bar_bulk.bar_len > MAX_DATA_SIZE) {
-            pr_err("bar_len %u > MAX_DATA_SIZE %d.\n",
-                   ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
+            pr_debug("bar_len %u > MAX_DATA_SIZE %d.\n",
+                     ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
             return -EINVAL;
         }
         rv = anlogic_pci_ctrl_bar_range_check(hw, ioctl_bar_bulk.bar_id,
                                               ioctl_bar_bulk.bar_offaddr,
                                               (u64)ioctl_bar_bulk.bar_len *
                                               sizeof(u32));
+        if (rv < 0)
+            return rv;
+        rv = anlogic_pci_ctrl_magic_check(hw, ioctl_bar_bulk.bar_id);
         if (rv < 0)
             return rv;
 
@@ -304,14 +333,14 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
     case ANLOGIC_IOCBULKR:
         if (copy_from_user((void *)&ioctl_bar_bulk, (void __user *)arg,
                            sizeof(struct anlogic_ioc_bar_bulk))) {
-            pr_err("copy_from_user failed.\n");
+            pr_debug("copy_from_user failed.\n");
             return -EFAULT;
         }
         /* 批量读前先校验：bar id 合法、bar_offaddr 4 字节对齐、
          * 整段 bar_len 个双字不越 BAR 边界 */
         if (ioctl_bar_bulk.bar_len > MAX_DATA_SIZE) {
-            pr_err("bar_len %u > MAX_DATA_SIZE %d.\n",
-                   ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
+            pr_debug("bar_len %u > MAX_DATA_SIZE %d.\n",
+                     ioctl_bar_bulk.bar_len, MAX_DATA_SIZE);
             return -EINVAL;
         }
         rv = anlogic_pci_ctrl_bar_range_check(hw, ioctl_bar_bulk.bar_id,
@@ -343,7 +372,7 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
 
         if (copy_to_user((void __user *)arg, &ioctl_bar_bulk,
                          sizeof(struct anlogic_ioc_bar_bulk))) {
-            pr_err("copy_to_user failed.\n");
+            pr_debug("copy_to_user failed.\n");
             return -EFAULT;
         }
         break;
@@ -354,7 +383,7 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
 
             if (copy_from_user((void *)&cfg, (void __user *)arg,
                                sizeof(cfg))) {
-                pr_err("copy_from_user failed.\n");
+                pr_debug("copy_from_user failed.\n");
                 return -EFAULT;
             }
             /*
@@ -362,11 +391,13 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
              * 只把整数偏移交给 pci_write_config_dword，绝不解引用用户指针。
              */
             if (cfg.reg < 0 || (cfg.reg & 3) || cfg.reg >= 0x1000) {
-                pr_err("bad config offset 0x%x.\n", cfg.reg);
+                pr_debug("bad config offset 0x%x.\n", cfg.reg);
                 return -EINVAL;
             }
-            anlogic_pci_write_cfg_dword(hw->pdev, (u32)cfg.reg,
-                                        (u32)cfg.value);
+            rv = anlogic_pci_write_cfg_dword(hw->pdev, (u32)cfg.reg,
+                                             (u32)cfg.value);
+            if (rv < 0)
+                return rv;
             pr_debug("cfg write: reg 0x%x = 0x%x.\n", cfg.reg, cfg.value);
         }
         break;
@@ -378,29 +409,32 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
 
             if (copy_from_user((void *)&cfg_off, (void __user *)arg,
                                sizeof(cfg_off))) {
-                pr_err("copy_from_user failed.\n");
+                pr_debug("copy_from_user failed.\n");
                 return -EFAULT;
             }
             /* 配置空间读：与写路径同样的范围与对齐限制 */
             if ((cfg_off & 3) || cfg_off >= 0x1000) {
-                pr_err("bad config offset 0x%x.\n", cfg_off);
+                pr_debug("bad config offset 0x%x.\n", cfg_off);
                 return -EINVAL;
             }
-            regx = anlogic_pci_read_cfg_dword(hw->pdev, cfg_off);
+            rv = anlogic_pci_read_cfg_dword(hw->pdev, cfg_off, &regx);
+            if (rv < 0)
+                return rv;
             if (copy_to_user((void __user *)arg, &regx, sizeof(regx))) {
-                pr_err("copy_to_user failed.\n");
+                pr_debug("copy_to_user failed.\n");
                 return -EFAULT;
             }
         }
         break;
 
     /*
-     * 收帧缓冲的命令也允许从控制节点发（两条命令的实现在 anlogic_pci_frame.c，
+     * 收帧缓冲的 FRAMEINFO 也允许从控制节点发（实现在 anlogic_pci_frame.c，
      * 本节点只做转发；上面的类型/access_ok 校验照旧先跑一遍）。
+     * FRAMEWAIT 在 anlogic_pci_ctrl_ioctl() 入口就被分流了，不会走到这里：
+     * 它必须在轮询之间放开 hw->lock，不能由本函数在持锁状态下处理。
      * 帧数据本身在 /dev/ANLOGIC-PCI0_frame 上只读 mmap 取。
      */
     case ANLOGIC_IOCFRAMEINFO:
-    case ANLOGIC_IOCFRAMEWAIT:
         return anlogic_pci_frame_ioctl(cdev, cmd, (void __user *)arg);
 
     /*
@@ -417,7 +451,7 @@ static long anlogic_pci_ctrl_ioctl_body(struct file *filp, unsigned int cmd,
         return anlogic_pci_rka1_ioctl(hw, arg);
 
     default:
-        pr_err("UNKNOWN ioctl cmd 0x%x.\n", cmd);
+        pr_debug("UNKNOWN ioctl cmd 0x%x.\n", cmd);
         return -ENOTTY;
     }
 
@@ -449,8 +483,8 @@ static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
 
     /* 只放登记过的控制/用户 BAR，其他 BAR 一律拒绝 */
     if (cdev->bar != hw->config_bar_idx && cdev->bar != hw->user_bar_idx) {
-        pr_err("mmap(): bar %d is not a registered control/user BAR.\n",
-               cdev->bar);
+        pr_debug("mmap(): bar %d is not a registered control/user BAR.\n",
+                 cdev->bar);
         rv = -EINVAL;
         goto out_unlock;
     }
@@ -460,7 +494,7 @@ static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
      * （cam_grab 就是刻意直接 mmap sysfs resource0 的同类做法）。
      */
     if (vma->vm_pgoff || (vma->vm_end - vma->vm_start) > PAGE_SIZE) {
-        pr_err("mmap(): only offset 0 and at most one page (4 KB) allowed.\n");
+        pr_debug("mmap(): only offset 0 and at most one page (4 KB) allowed.\n");
         rv = -EINVAL;
         goto out_unlock;
     }
@@ -468,8 +502,8 @@ static int anlogic_pci_ctrl_mmap(struct file *file, struct vm_area_struct *vma)
     map_len = hw->bar_map_len[cdev->bar];
     vsize = vma->vm_end - vma->vm_start;
     if (!map_len || (u64)vsize > (u64)map_len) {
-        pr_err("mmap(): vsize 0x%lx exceeds bar%d mapped length 0x%llx.\n",
-               vsize, cdev->bar, (unsigned long long)map_len);
+        pr_debug("mmap(): vsize 0x%lx exceeds bar%d mapped length 0x%llx.\n",
+                 vsize, cdev->bar, (unsigned long long)map_len);
         rv = -EINVAL;
         goto out_unlock;
     }
@@ -502,8 +536,11 @@ out_unlock:
 
 /*
  * ioctl 入口：hw->lock 把同一实例上的 ioctl 与 remove 串行化，removed 置位后一律
- * 拒绝。等帧最长 600 s 也在这把锁下，但等帧循环会看 removed 提前退出，所以 remove
- * 不会被拖满 600 s。
+ * 拒绝。
+ *
+ * ANLOGIC_IOCFRAMEWAIT 是唯一的例外：它最长等 600 s，必须**在取 hw->lock 之前**
+ * 分流到 anlogic_pci_frame_wait_ioctl()，由那边在每次轮询时短暂取锁、睡眠时放开。
+ * 否则一个等帧进程会把同实例上的其它 ioctl、open、mmap 全部堵住。
  */
 static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
                                    unsigned long arg)
@@ -517,6 +554,12 @@ static long anlogic_pci_ctrl_ioctl(struct file *filp, unsigned int cmd,
         return rv;
 
     hw = cdev->hw;
+    if (!hw)
+        return -EINVAL;
+
+    if (cmd == ANLOGIC_IOCFRAMEWAIT)
+        return anlogic_pci_frame_wait_ioctl(cdev, (void __user *)arg);
+
     if (mutex_lock_interruptible(&hw->lock))
         return -ERESTARTSYS;
     if (atomic_read(&hw->removed)) {

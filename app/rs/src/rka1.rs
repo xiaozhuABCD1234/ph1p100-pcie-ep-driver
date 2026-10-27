@@ -18,6 +18,8 @@
 //! 布局（magic "R10F"、version 1.0、header_bytes 128、codec_id=0 …），并补齐
 //! reserved/flags/几何自洽检查；离线对照实现见 `tools/pcie_integration/r10f_strict.py`。
 
+use std::ffi::c_void;
+
 use crate::ioctl::*;
 use crate::sys;
 
@@ -74,9 +76,11 @@ impl Rka1 {
     }
 
     fn call(&self, rq: &mut IocRka1) -> Result<(), (i32, String)> {
-        let rv = unsafe { sys::ioctl(self.fd, ANLOGIC_IOCRKA1, rq as *mut IocRka1) };
-        if rv < 0 {
-            let err = sys::errno();
+        // SAFETY: rq 就是 ANLOGIC_IOCRKA1 对应的结构体（与头文件逐字段一致）
+        if let Err(e) = unsafe {
+            sys::ioctl_ptr(self.fd, ANLOGIC_IOCRKA1, rq as *mut IocRka1 as *mut c_void)
+        } {
+            let err = e.raw_os_error().unwrap_or(0);
             return Err((err, describe(rq, err)));
         }
         Ok(())
@@ -222,6 +226,11 @@ pub mod r10f {
         u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
     }
 
+    /// R10F 传输长度：128B 头 + payload，再按 4KiB 向上取整。
+    pub fn dma_bytes(payload_bytes: u32) -> u64 {
+        ((HDR_BYTES as u64 + payload_bytes as u64 + 4095) / 4096) * 4096
+    }
+
     pub fn crc32_ieee(data: &[u8]) -> u32 {
         let mut crc: u32 = 0xffff_ffff;
         for &byte in data {
@@ -298,14 +307,17 @@ pub mod r10f {
         if h.width == 0 || h.height == 0 || (h.width & 3) != 0 {
             return Err(format!("R10F geometry {}x{} 非法（width 必须为 4 的倍数）", h.width, h.height));
         }
-        let expect_stride = (h.width as u32) / 4 * 5;
-        if h.stride != expect_stride {
+        let expect_stride = (h.width as u64) / 4 * 5;
+        if h.stride as u64 != expect_stride {
             return Err(format!("R10F stride {} != width*5/4 {}", h.stride, expect_stride));
         }
         if h.raw_bytes != h.payload_bytes {
             return Err(format!("R10F raw_bytes {} != payload_bytes {}", h.raw_bytes, h.payload_bytes));
         }
-        if h.payload_bytes != h.stride * h.height as u32 {
+        let raw_len = (h.stride as u64)
+            .checked_mul(h.height as u64)
+            .ok_or_else(|| "R10F stride*height 溢出".to_string())?;
+        if h.payload_bytes as u64 != raw_len || raw_len > u32::MAX as u64 {
             return Err(format!(
                 "R10F payload {} != stride {} * height {}",
                 h.payload_bytes, h.stride, h.height
@@ -330,6 +342,21 @@ pub mod r10f {
             return Err(format!(
                 "payload len {} != payload_bytes {}",
                 payload.len(), h.payload_bytes
+            ));
+        }
+        /*
+         * 传输长度必须精确到 dma_bytes：128B 头 + payload + 4KiB 对齐尾。
+         * 只检查“尾全 0”会让一个被截掉尾巴的文件通过（tail=0B 也“全 0”），
+         * Python 严格实现会因长度不符拒绝，两边必须一致。
+         */
+        let expect_tail = dma_bytes(h.payload_bytes)
+            .saturating_sub(HDR_BYTES as u64 + h.payload_bytes as u64);
+        if transport_tail.len() as u64 != expect_tail {
+            return Err(format!(
+                "transport tail {}B != 应有 {}B（dma_bytes={}）",
+                transport_tail.len(),
+                expect_tail,
+                dma_bytes(h.payload_bytes)
             ));
         }
         if !transport_tail.iter().all(|b| *b == 0) {
@@ -362,5 +389,19 @@ pub mod r10f {
             ));
         }
         Ok(h)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::dma_bytes;
+
+        #[test]
+        fn dma_bytes_matches_driver_geometry() {
+            // 与 src/anlogic_pci_frame.c::anlogic_pci_frame_r10f_bytes() 同一公式
+            assert_eq!(dma_bytes(1_920 * 1_080 * 10 / 8), 2_592_768);
+            assert_eq!(dma_bytes((3_840 / 4 * 5) * 2_160), 10_371_072);
+            // 640x480 packed RAW10 载荷 = 800B/行 × 480 = 384000（不是 640×480 灰度）
+            assert_eq!(dma_bytes((640 / 4 * 5) * 480), 385_024);
+        }
     }
 }

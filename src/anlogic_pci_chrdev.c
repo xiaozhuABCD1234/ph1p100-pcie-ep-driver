@@ -7,6 +7,8 @@
  * 与 /dev/ANLOGIC-PCI<n>_frame（收帧缓冲，只读 mmap + 帧就绪 ioctl）。
  * 文件操作实现在 anlogic_pci_ctrl.c（前两个）与 anlogic_pci_frame.c（收帧缓冲）。
  */
+#define pr_fmt(fmt) KBUILD_MODNAME ": [chrdev] " fmt
+
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/fs.h>
@@ -325,10 +327,14 @@ void anlogic_pci_card_destroy_interfaces(struct anlogic_pci_card *card)
 
 int anlogic_pci_chrdev_init(void)
 {
+    long err;
+
     anlogic_pci_class = class_create(ANLOGIC_PCI_NODE_NAME);
     if (IS_ERR(anlogic_pci_class)) {
-        pr_err(ANLOGIC_PCI_NODE_NAME ": failed to create class");
-        return -1;
+        err = PTR_ERR(anlogic_pci_class);
+        anlogic_pci_class = NULL;
+        pr_err("failed to create class %s, %ld.\n", ANLOGIC_PCI_NODE_NAME, err);
+        return (int)err;
     }
 
     return 0;

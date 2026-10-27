@@ -94,8 +94,10 @@ def parse_header(buf):
     h = struct.unpack_from("<H", buf, 0x1E)[0]
     stride = struct.unpack_from("<I", buf, 0x20)[0]
     pay = struct.unpack_from("<I", buf, 0x30)[0]
-    if w == 0 or h == 0 or stride != w // 4 * 5:
+    if w == 0 or h == 0 or w % 4 != 0 or stride != w // 4 * 5:
         raise SystemExit("头里的几何不自洽：%dx%d stride=%d" % (w, h, stride))
+    if pay < stride * h:
+        raise SystemExit("载荷比几何小：payload=%d < stride*h=%d" % (pay, stride * h))
     if len(buf) < R10F_HDR + pay:
         raise SystemExit("载荷不够：需要 %d，实际 %d" % (R10F_HDR + pay, len(buf)))
     return w, h, stride, pay
@@ -134,11 +136,23 @@ def cmd_convert(args):
     print("已写出 %s (%dx%d) flip=%s" % (args.out, ow, oh, args.flip))
 
 def cmd_snapshot(args):
-    ctrl = os.open(args.dev + "_control", os.O_RDWR)
-    frame = os.open(args.dev + "_frame", os.O_RDWR)
+    # 只打开 _frame；控制节点不参与抓帧，少开一个 fd 也少一处权限问题。
+    frame = os.open(args.dev + "_frame", os.O_RDONLY)
     fi = IocFrame()
     fcntl.ioctl(frame, IOCFRAMEINFO, fi, True)
-    print("缓冲 %dx%d stride=%d slot_bytes=%d seq=%d" % (fi.width, fi.height, fi.stride, fi.slot_bytes, fi.seq),
+    if (not fi.width or not fi.height or not fi.stride or
+            not fi.slot_bytes or not fi.slots):
+        raise SystemExit("驱动报的缓冲几何不完整：%dx%d stride=%d slot_bytes=%d slots=%d"
+                         % (fi.width, fi.height, fi.stride, fi.slot_bytes, fi.slots))
+    if fi.hdr_bytes != HDR_BYTES:
+        raise SystemExit("驱动的 hdr_bytes=%d，本工具按 %d 解析" % (fi.hdr_bytes, HDR_BYTES))
+    if fi.stride < fi.hdr_bytes + fi.slot_bytes:
+        raise SystemExit("stride=%d 装不下一槽（hdr %d + slot %d）"
+                         % (fi.stride, fi.hdr_bytes, fi.slot_bytes))
+    if fi.mb_off + 64 > fi.size:
+        raise SystemExit("mailbox 偏移 %d + 64 超出缓冲 %d" % (fi.mb_off, fi.size))
+    print("缓冲 %dx%d stride=%d slot_bytes=%d slots=%d seq=%d" %
+          (fi.width, fi.height, fi.stride, fi.slot_bytes, fi.slots, fi.seq),
           file=sys.stderr)
     last = args.last_seq if args.last_seq >= 0 else fi.seq
     waited = 0
@@ -150,8 +164,13 @@ def cmd_snapshot(args):
         waited += 200
     else:
         raise SystemExit("等帧超时（%d ms，last_seq=%d）" % (args.timeout, last))
-    m = mmap.mmap(frame, fi.size, mmap.MAP_SHARED, mmap.PROT_READ)
+    if fw.slot >= fi.slots:
+        raise SystemExit("等帧返回槽 %d，但驱动只报了 %d 槽" % (fw.slot, fi.slots))
     off = fw.slot * fi.stride + fi.hdr_bytes
+    if off + fi.slot_bytes > fi.size:
+        raise SystemExit("槽 %d 的 [%d,+%d) 超出缓冲 %d"
+                         % (fw.slot, off, fi.slot_bytes, fi.size))
+    m = mmap.mmap(frame, fi.size, mmap.MAP_SHARED, mmap.PROT_READ)
     slotb = m[off:off + fi.slot_bytes]
     w, h, stride, pay = parse_header(slotb)
     gray, ow, oh = unpack_raw10(slotb[R10F_HDR:R10F_HDR + pay], w, h, stride, args.scale)
@@ -161,7 +180,7 @@ def cmd_snapshot(args):
         with open(args.raw, "wb") as f:
             f.write(slotb)
         print("原始槽已写出 %s (%d 字节)" % (args.raw, len(slotb)))
-    m.close(); os.close(frame); os.close(ctrl)
+    m.close(); os.close(frame)
     print("已写出 %s (%dx%d)，帧号 %d" % (args.out, ow, oh, fw.seq))
 
 def main():

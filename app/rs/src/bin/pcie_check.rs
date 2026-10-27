@@ -207,6 +207,10 @@ fn main() {
         "    /dev/ANLOGIC-PCI0_user       : {}",
         if Path::new("/dev/ANLOGIC-PCI0_user").exists() { "存在" } else { "不存在" }
     );
+    println!(
+        "    /dev/ANLOGIC-PCI0_frame      : {}",
+        if Path::new("/dev/ANLOGIC-PCI0_frame").exists() { "存在" } else { "不存在" }
+    );
 
     if !found {
         println!("\n!! 没找到 {:04x}:* 设备 —— EP 未枚举", EP_VENDOR_ID);

@@ -8,6 +8,10 @@
  *   2) ANLOGIC_IOCFRAMEWAIT 等一帧就绪（轮询序号，本 EP 没有 MSI，不走中断）；
  *   3) 把那一槽像素写成 P5 灰度 PGM。
  *
+ * 槽内容若以 R10F 开头（128B 头 + packed RAW10 + 4KiB 对齐零尾），先走 r10f::parse
+ * 严格校验，再把 packed RAW10 解成 8bit 灰度预览（每采样取高 8 位）写 PGM；旧的
+ * 8bit 槽内容仍按原样直拷，行为不变。
+ *
  * 缓冲布局与 FPGA 的握手约定（握手时序、槽头字段）写在 include/anlogic_pci_ioctl.h：
  * 槽区从缓冲起点开始，槽 n 在 phys_addr + stride*n（槽头后才是像素），mailbox
  * 描述符在槽区之后、由 ioctl 报的 mb_off 定位（整页，不与槽区重叠）。本工具只读：
@@ -33,6 +37,7 @@
  *       -n        只在出现比当前更新的帧时返回（默认：缓冲里已有帧就直接取最新一帧）
  *       --info    只打印缓冲的物理地址与几何，不取帧（空转自检用）
  */
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::io::Write;
 use std::os::fd::{AsRawFd, RawFd};
@@ -134,7 +139,7 @@ fn descriptor_check(info: &IocFrame) -> bool {
         return false;
     }
     // 槽区 [0, stride*slots) 必须装得下所有槽，且不能压到 mailbox
-    if info.size < info.hdr_bytes as u64 + info.stride as u64 * info.slots as u64 {
+    if info.size < info.stride as u64 * info.slots as u64 {
         eprintln!(
             "!! 缓冲 {} 字节装不下 {} 槽 × 步长 {}",
             info.size, info.slots, info.stride
@@ -177,7 +182,7 @@ fn print_info(info: &IocFrame) {
         info.size / 1024
     );
     println!(
-        "  槽位                        : {} 槽，步长 {} 字节，槽头 {} 字节（槽 n 在 phys + {}×n）",
+        "  槽位                        : {} 槽，步长 {} 字节，槽内数据偏移 {} 字节（槽 n 在 phys + {}×n）",
         info.slots, info.stride, info.hdr_bytes, info.stride
     );
     println!(
@@ -185,15 +190,119 @@ fn print_info(info: &IocFrame) {
         info.mb_off
     );
     println!(
-        "  每帧                        : {}x{} 灰度 = {} 字节",
+        "  每帧传输                    : {}x{} R10F = {} 字节（槽内容，不是灰度像素数）",
         info.width, info.height, info.slot_bytes
     );
     println!(
-        "  序号/计数（FPGA 写）        : seq={} count={}{}",
+        "  序号/计数（驱动看门铃补齐） : seq={} count={}{}",
         info.seq,
         info.count,
-        if info.seq != 0 { "" } else { "（seq 还是 0：FPGA 还没往这块缓冲写过帧）" }
+        if info.seq != 0 { "" } else { "（seq 还是 0：还没有推来的帧）" }
     );
+}
+
+/// packed RAW10（MIPI CSI-2，4 像素/5 字节）→ 8bit 灰度预览。
+///
+/// 字节序与 `app/reference/stereo/parallel/frame/frame_contract.py::unpack_raw10` /
+/// `tools/pcie_integration/r10f_strict.py` 一致：每组 `P0[9:2] P1[9:2] P2[9:2] P3[9:2]
+/// {P3[1:0],P2[1:0],P1[1:0],P0[1:0]}`。预览取每个 10bit 采样的**高 8 位**（`>> 2`，
+/// 截断不四舍五入；也就是每组前 4 个字节）。
+///
+/// `stride` 是 R10F 头里的**行字节数**（1920 宽时 2400）；行尾填充不会进图。
+/// 返回恰好 `width*height` 字节；长度/几何不符一律 `Err`，不越界读、不静默夹紧。
+fn raw10_to_gray8(
+    packed: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 {
+        return Err(format!("几何 {}x{} 非法", width, height));
+    }
+    if width % 4 != 0 {
+        return Err(format!("width {} 不是 4 的倍数（packed RAW10 是 4px/5B）", width));
+    }
+    let row_bytes = width / 4 * 5;
+    if stride < row_bytes {
+        return Err(format!(
+            "stride {} 装不下一行 packed RAW10（需要 {} 字节）",
+            stride, row_bytes
+        ));
+    }
+    // 最后一行只需要 row_bytes：行尾 padding（例如 4KiB 对齐）不读
+    let need = stride
+        .checked_mul(height - 1)
+        .and_then(|v| v.checked_add(row_bytes))
+        .ok_or_else(|| "packed 长度计算溢出".to_string())?;
+    if packed.len() < need {
+        return Err(format!(
+            "packed 载荷 {} 字节不够 {} 行 × stride {}（至少 {} 字节）",
+            packed.len(),
+            height,
+            stride,
+            need
+        ));
+    }
+    let npix = width
+        .checked_mul(height)
+        .ok_or_else(|| "像素数溢出".to_string())?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(npix)
+        .map_err(|e| format!("分配 {} 字节预览失败：{}", npix, e))?;
+    out.resize(npix, 0u8);
+    for y in 0..height {
+        let src = &packed[y * stride..y * stride + row_bytes];
+        let dst = &mut out[y * width..(y + 1) * width];
+        for (g, d) in src.chunks_exact(5).zip(dst.chunks_exact_mut(4)) {
+            let b4 = g[4] as u16;
+            let p0 = ((g[0] as u16) << 2) | (b4 & 0x3);
+            let p1 = ((g[1] as u16) << 2) | ((b4 >> 2) & 0x3);
+            let p2 = ((g[2] as u16) << 2) | ((b4 >> 4) & 0x3);
+            let p3 = ((g[3] as u16) << 2) | ((b4 >> 6) & 0x3);
+            d[0] = (p0 >> 2) as u8;
+            d[1] = (p1 >> 2) as u8;
+            d[2] = (p2 >> 2) as u8;
+            d[3] = (p3 >> 2) as u8;
+        }
+    }
+    Ok(out)
+}
+
+/// 槽内容若是 R10F：严格解析（[`r10f::parse`]）并解包成 8bit 预览。
+///
+/// · `Ok(None)`：不是 R10F（旧 8bit 槽内容），调用方走原来的直拷路径；
+/// · `Ok(Some((头, 预览)))`：R10F 通过严格校验，预览恰好 `width*height` 字节；
+/// · `Err`：确实是 R10F 但头/CRC/尾零/几何/长度不过 —— 一律拒绝发布。
+fn r10f_gray8(
+    content: &[u8],
+    expect_w: u32,
+    expect_h: u32,
+) -> Result<Option<(r10f::R10fHeader, Vec<u8>)>, String> {
+    if content.len() < r10f::HDR_BYTES || &content[0..4] != b"R10F" {
+        return Ok(None);
+    }
+    if expect_w > u16::MAX as u32 || expect_h > u16::MAX as u32 {
+        return Err(format!(
+            "已授权几何 {}x{} 超出 R10F 头的 u16 字段，不可能匹配",
+            expect_w, expect_h
+        ));
+    }
+    let pb = r10f::le32(content, 0x30) as usize;
+    let need = r10f::HDR_BYTES
+        .checked_add(pb)
+        .ok_or_else(|| format!("payload_bytes={} 溢出", pb))?;
+    if need > content.len() {
+        return Err(format!(
+            "payload_bytes={} 超出槽内容（{} 字节）：拒绝发布",
+            pb,
+            content.len()
+        ));
+    }
+    let (hdr, rest) = content.split_at(r10f::HDR_BYTES);
+    let (payload, tail) = rest.split_at(pb);
+    let h = r10f::parse(hdr, payload, tail, expect_w as u16, expect_h as u16, None)?;
+    let preview = raw10_to_gray8(payload, h.width as usize, h.height as usize, h.stride as usize)?;
+    Ok(Some((h, preview)))
 }
 
 fn run() -> i32 {
@@ -364,23 +473,17 @@ fn run() -> i32 {
         rc = EX_INCONSISTENT;
     }
 
-    // ---- 6. 搬像素（不整帧就补 0 并告警）----
-    let npix = info.width as usize * info.height as usize;
+    // ---- 6. 搬槽内容（长度 = slot_bytes，不是 width*height）----
     /*
-     * width/height 来自 module param，最大分别可到 65535（乘积可达约 4.29 GB）。
-     * 直接 `vec![0u8; npix]` 在分配失败时是 abort（退出码 134），不在文件头声明的
-     * 0..6 里。改用 try_reserve，失败按 EX_OUTPUT 返回。
+     * T07 R10F 的槽内容 = 128B 头 + packed RAW10（5B/4px）+ 4KiB 对齐零尾：
+     * 1920x1080 时是 2,592,768 字节，而 width*height 只有 2,073,600。
+     * 旧代码按 npix 分配、却按槽头 len（= slot_bytes）拷贝，两者不等就写穿堆。
+     * 现在**分配长度 = 拷贝长度 = slot_bytes**，再把「槽基址 + 槽头 + 内容」钉在映射内。
+     * width/height 来自 module param，最大分别可到 65535；分配失败一律按 EX_OUTPUT 返回
+     * （直接 vec! 在失败时是 abort，退出码 134，不在文件头声明的 0..6 里）。
      */
-    let mut img: Vec<u8> = Vec::new();
-    if img.try_reserve_exact(npix).is_err() {
-        eprintln!(
-            "!! 分配 {} 字节帧缓冲失败（几何 {}x{} 过大或内存不足）",
-            npix, info.width, info.height
-        );
-        return EX_OUTPUT;
-    }
-    img.resize(npix, 0u8);
-    let mut copy = hdr_len as usize;
+    let npix = info.width as usize * info.height as usize;
+    let copy = hdr_len as usize;
     /*
      * T07: no silent clamping.  The slot length is the transport length agreed
      * with the FPGA (dma_bytes); anything else means host and FPGA disagree,
@@ -397,48 +500,68 @@ fn run() -> i32 {
         eprintln!("!! slot_bytes={} 不是 4KiB 整数倍：不是本框架的传输格式", copy);
         return EX_INCONSISTENT;
     }
-    let src = map.as_ptr() as usize + slot as usize * info.stride as usize + info.hdr_bytes as usize;
-    // SAFETY: 源地址在只读映射内（descriptor_check 已核对 stride/slots/mb_off 都合得上）
-    unsafe {
-        std::ptr::copy_nonoverlapping(src as *const u8, img.as_mut_ptr(), copy);
+    let src_off = slot as u64 * info.stride as u64 + info.hdr_bytes as u64;
+    if src_off + copy as u64 > info.size {
+        eprintln!(
+            "!! 槽内容 [{}, {}) 超出缓冲 {} 字节：拒绝读（会越界）",
+            src_off,
+            src_off + copy as u64,
+            info.size
+        );
+        return EX_INCONSISTENT;
     }
-    if copy < npix {
-        eprintln!("!! 帧数据只有 {}/{} 字节，缺的用 0 补（图不完整）", copy, npix);
-        rc = EX_INCONSISTENT;
+    let mut raw: Vec<u8> = Vec::new();
+    if raw.try_reserve_exact(copy).is_err() {
+        eprintln!("!! 分配 {} 字节槽内容缓冲失败（内存不足）", copy);
+        return EX_OUTPUT;
+    }
+    raw.resize(copy, 0u8);
+    let src = map.as_ptr() as usize + src_off as usize;
+    // SAFETY: 上面已核对 [src_off, src_off+copy) 落在 mmap 的 [0, info.size) 内
+    unsafe {
+        std::ptr::copy_nonoverlapping(src as *const u8, raw.as_mut_ptr(), copy);
     }
 
-    // ---- 6.5 T11：内容若为 R10F（正式非压缩帧），先严格解析；不通过不发布 ----
+    // ---- 6.5 按内容分派：R10F → 严格解析 + 解包预览；否则旧 8bit 直拷 ----
     //   判据与 `tools/pcie_integration/r10f_strict.py` / contract/acceptance-vectors.json
     //   逐字段一致（magic/version/format/codec/几何三层长度/三 CRC/尾零/flags）。
-    //   ⚠ PGM 是灰度诊断输出：R10F 内容笔写出的是 packed RAW10 原始字节（8192bit/4px），
-    //   不是灰度像素；这里只为「取到、审到、可复算」留证据，不代表颜色/几何正确。
-    if img.len() >= r10f::HDR_BYTES && &img[0..4] == b"R10F" {
-        let pb = u32::from_le_bytes([img[0x30], img[0x31], img[0x32], img[0x33]]) as usize;
-        if r10f::HDR_BYTES + pb > img.len() {
+    //   ⚠ R10F 的载荷是 packed RAW10（4px/5B），不是灰度像素：旧实现把它原样写进 PGM
+    //   （图是错的）；现在解成 width*height 的 8bit 预览（每采样高 8 位）再写。
+    let gray: Cow<'_, [u8]>;
+    match r10f_gray8(&raw, info.width, info.height) {
+        Ok(Some((h, preview))) => {
+            println!(
+                "  R10F      : session=0x{:08x} seq={} {}x{} stride={} flags=0x{:x}",
+                h.session_id, h.capture_seq, h.width, h.height, h.stride, h.flags
+            );
+            println!(
+                "  R10F CRC  : payload=0x{:08x} header=0x{:08x}（parse 内部已逐字节复算通过）",
+                h.payload_crc32, h.header_crc32
+            );
+            println!(
+                "  R10F 预览 : packed {}B → 8bit {}x{} = {}B（每采样取高 8 位 >>2）",
+                h.payload_bytes, h.width, h.height, preview.len()
+            );
+            gray = Cow::Owned(preview);
+        }
+        Ok(None) => {
+            // 旧 8bit 路径：槽内容前 width*height 字节就是像素；不足补 0 并告警。
+            if copy < npix {
+                eprintln!("!! 帧数据只有 {}/{} 字节，缺的用 0 补（图不完整）", copy, npix);
+                rc = EX_INCONSISTENT;
+                let mut v = raw.clone();
+                v.resize(npix, 0);
+                gray = Cow::Owned(v);
+            } else {
+                gray = Cow::Borrowed(&raw[..npix]);
+            }
+        }
+        Err(e) => {
             eprintln!(
-                "!! R10F payload_bytes={} 超出槽内容（{} 字节）：拒绝发布",
-                pb,
-                img.len()
+                "!! R10F 严格解析/解包失败：{}（拒绝发布；槽头编号/长度一致也无效）",
+                e
             );
             return EX_INCONSISTENT;
-        }
-        let (hdr, rest) = img.split_at(r10f::HDR_BYTES);
-        let (payload, tail) = rest.split_at(pb);
-        match r10f::parse(hdr, payload, tail, info.width, info.height, None) {
-            Ok(h) => {
-                println!(
-                    "  R10F      : session=0x{:08x} seq={} {}x{} stride={} flags=0x{:x}",
-                    h.session_id, h.capture_seq, h.width, h.height, h.stride, h.flags
-                );
-                println!(
-                    "  R10F CRC  : payload=0x{:08x} header=0x{:08x}（parse 内部已逐字节复算通过）",
-                    h.payload_crc32, h.header_crc32
-                );
-            }
-            Err(e) => {
-                eprintln!("!! R10F 严格解析失败：{}（拒绝发布；RC 槽头编号/长度一致也无效）", e);
-                return EX_INCONSISTENT;
-            }
         }
     }
 
@@ -478,7 +601,7 @@ fn run() -> i32 {
     let header = format!("P5\n{} {}\n255\n", info.width, info.height);
     let written = fp
         .write_all(header.as_bytes())
-        .and_then(|_| fp.write_all(&img))
+        .and_then(|_| fp.write_all(&gray))
         .and_then(|_| fp.flush());
     if let Err(e) = written {
         eprintln!("!! 写 {} 失败：{}", out_path, sys::errno_str(&e));
@@ -488,7 +611,7 @@ fn run() -> i32 {
     println!("=== 结果 ===");
     println!("  输出文件  : {}（P5 灰度 {}x{}，{} 字节像素）", out_path, info.width, info.height, npix);
     println!(
-        "  取自      : 物理 0x{:x} + 槽 {}（偏移 {}）+ 槽头 {}",
+        "  取自      : 物理 0x{:x} + 槽 {}（偏移 {}）+ 数据偏移 {}",
         info.phys_addr,
         slot,
         slot as u64 * info.stride as u64,
@@ -510,4 +633,149 @@ fn run() -> i32 {
 fn main() {
     let code = run();
     anlogic_pci_tools::exit_with(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{r10f_gray8, raw10_to_gray8};
+    use anlogic_pci_tools::rka1::r10f;
+
+    /// 4 个 10bit 样本 → 5 字节（与
+    /// `app/reference/stereo/parallel/frame/frame_contract.py::pack_raw10` 同字节序）
+    fn pack_group(p: [u16; 4]) -> [u8; 5] {
+        [
+            (p[0] >> 2) as u8,
+            (p[1] >> 2) as u8,
+            (p[2] >> 2) as u8,
+            (p[3] >> 2) as u8,
+            (((p[3] & 3) << 6) | ((p[2] & 3) << 4) | ((p[1] & 3) << 2) | (p[0] & 3)) as u8,
+        ]
+    }
+
+    /// 造一帧小的合法 R10F：128B 头 + payload + 尾零（CRC 按合同算法现算）
+    fn synthetic_r10f(payload: &[u8], w: u16, h: u16, stride: u32, tail: &[u8]) -> Vec<u8> {
+        let mut hdr = vec![0u8; r10f::HDR_BYTES];
+        hdr[0..4].copy_from_slice(b"R10F");
+        hdr[0x04..0x06].copy_from_slice(&1u16.to_le_bytes()); // version 1.0
+        hdr[0x06..0x08].copy_from_slice(&0u16.to_le_bytes());
+        hdr[0x08..0x0A].copy_from_slice(&(r10f::HDR_BYTES as u16).to_le_bytes());
+        hdr[0x0B] = r10f::FORMAT_RAW10_PACKED as u8;
+        hdr[0x10..0x14].copy_from_slice(&0x2026_1027u32.to_le_bytes()); // session
+        hdr[0x14..0x18].copy_from_slice(&7u32.to_le_bytes()); // capture_seq
+        hdr[0x18..0x1C].copy_from_slice(&1u32.to_le_bytes()); // mode_id
+        hdr[0x1C..0x1E].copy_from_slice(&w.to_le_bytes());
+        hdr[0x1E..0x20].copy_from_slice(&h.to_le_bytes());
+        hdr[0x20..0x24].copy_from_slice(&stride.to_le_bytes());
+        hdr[0x2A] = r10f::VALID_BITS;
+        hdr[0x2C..0x30].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // raw_bytes
+        hdr[0x30..0x34].copy_from_slice(&(payload.len() as u32).to_le_bytes()); // payload_bytes
+        hdr[0x34..0x38].copy_from_slice(&1u32.to_le_bytes()); // block_count
+        let pc = r10f::crc32_ieee(payload);
+        hdr[0x50..0x54].copy_from_slice(&pc.to_le_bytes()); // raw_crc32
+        hdr[0x54..0x58].copy_from_slice(&pc.to_le_bytes()); // payload_crc32
+        // header_crc32：自身 4 字节先清 0 再算
+        let hc = r10f::crc32_ieee(&hdr);
+        hdr[0x58..0x5C].copy_from_slice(&hc.to_le_bytes());
+        let mut content = hdr;
+        content.extend_from_slice(payload);
+        content.extend_from_slice(tail);
+        content
+    }
+
+    /// 2 行 × 8px、stride 10 的 packed 载荷；每行取值不同，行错位会被断言抓到
+    fn ramp_payload() -> Vec<u8> {
+        let mut payload = Vec::new();
+        for row in 0u16..2 {
+            for g in 0u16..2 {
+                let b = row * 8 + g * 4;
+                payload.extend_from_slice(&pack_group([b, b + 1, 1022 - b, 1023 - b]));
+            }
+        }
+        payload
+    }
+
+    #[test]
+    fn raw10_high8_length_and_values() {
+        let packed = ramp_payload();
+        assert_eq!(packed.len(), 20);
+        let out = raw10_to_gray8(&packed, 8, 2, 10).expect("解包应成功");
+        assert_eq!(out.len(), 8 * 2, "输出像素数必须是 width*height，不含行填充");
+        let want: Vec<u8> = (0u16..2)
+            .flat_map(|row| {
+                (0u16..2).flat_map(move |g| {
+                    let b = row * 8 + g * 4;
+                    [
+                        (b >> 2) as u8,
+                        ((b + 1) >> 2) as u8,
+                        ((1022 - b) >> 2) as u8,
+                        ((1023 - b) >> 2) as u8,
+                    ]
+                })
+            })
+            .collect();
+        assert_eq!(out, want);
+        // 10bit 0x2AB(683) 的高 8 位 = 0xAA；低 2 位不会漏进预览
+        assert_eq!(pack_group([683, 0, 1023, 1])[0], 0xAA);
+        assert_eq!(683u16 >> 2, 0xAA);
+    }
+
+    #[test]
+    fn raw10_high8_skips_row_padding() {
+        // 每行实际 10B、stride 12（2B 填充 0xEE）：填充不得被当成像素
+        let mut packed = Vec::new();
+        for row in 0u16..2 {
+            let v = row * 100;
+            for _ in 0..2 {
+                packed.extend_from_slice(&pack_group([v, v, v, v]));
+            }
+            packed.extend_from_slice(&[0xEE, 0xEE]);
+        }
+        let out = raw10_to_gray8(&packed, 8, 2, 12).expect("解包应成功");
+        let mut want = vec![0u8; 8];
+        want.extend_from_slice(&[25u8; 8]); // 100 >> 2 == 25
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn raw10_high8_rejects_bad_geometry() {
+        let packed = vec![0u8; 20];
+        assert!(raw10_to_gray8(&packed, 8, 2, 10).is_ok());
+        assert!(raw10_to_gray8(&packed, 6, 2, 8).is_err(), "width 非 4 的倍数");
+        assert!(raw10_to_gray8(&packed, 8, 2, 9).is_err(), "stride 装不下一行");
+        assert!(raw10_to_gray8(&packed[..19], 8, 2, 10).is_err(), "载荷被截断");
+        assert!(raw10_to_gray8(&packed, 8, 3, 10).is_err(), "行数不够");
+        assert!(raw10_to_gray8(&packed, 0, 2, 10).is_err(), "零宽");
+    }
+
+    #[test]
+    fn r10f_preview_end_to_end() {
+        let payload = ramp_payload();
+        let tail_len = r10f::dma_bytes(payload.len() as u32) as usize
+            - r10f::HDR_BYTES
+            - payload.len();
+        let content = synthetic_r10f(&payload, 8, 2, 10, &vec![0u8; tail_len]);
+        assert_eq!(content.len(), r10f::dma_bytes(payload.len() as u32) as usize);
+
+        let (h, preview) = r10f_gray8(&content, 8, 2)
+            .expect("R10F 应通过严格校验")
+            .expect("应识别为 R10F");
+        assert_eq!((h.width, h.height, h.stride), (8, 2, 10));
+        assert_eq!(preview.len(), 16);
+        assert_eq!(preview, raw10_to_gray8(&payload, 8, 2, 10).unwrap());
+
+        // 已授权几何与头里不一致 → 拒绝
+        assert!(r10f_gray8(&content, 16, 2).is_err());
+        // 载荷改一个字节 → payload CRC 不过 → 拒绝
+        let mut bad = content.clone();
+        bad[r10f::HDR_BYTES] ^= 0xff;
+        assert!(r10f_gray8(&bad, 8, 2).is_err());
+        // 头截断（payload_bytes 超出槽内容）→ 拒绝
+        assert!(r10f_gray8(&content[..140], 8, 2).is_err());
+        // 只截掉尾部 4KiB 对齐零（Python 严格实现也拒）→ 拒绝
+        let no_tail = &content[..r10f::HDR_BYTES + payload.len()];
+        assert!(r10f_gray8(no_tail, 8, 2).is_err(), "缺 transport tail 必须拒绝");
+        // 旧 8bit 槽内容 → Ok(None)，不误判成 R10F
+        let eight = vec![0x5Au8; 64];
+        assert!(r10f_gray8(&eight, 8, 2).expect("不是 R10F").is_none());
+    }
 }

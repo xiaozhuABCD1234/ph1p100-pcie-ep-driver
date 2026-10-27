@@ -15,6 +15,10 @@ modules.order
 # 用户态（Rust 工程 app/rs）构建目录
 /app/rs/target/
 
+# Python 离线工具（tools/、docs/protocol/ 下）的字节码缓存
+__pycache__/
+*.pyc
+
 *.zip
 
 # Local synchronization verification outputs

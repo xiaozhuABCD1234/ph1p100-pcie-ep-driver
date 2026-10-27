@@ -5,6 +5,8 @@
  * 只做 PCI 驱动的注册/探测/移除与错误处理，资源与寄存器访问在 anlogic_pci_hw.c，
  * 字符设备在 anlogic_pci_chrdev.c（注册）与 anlogic_pci_ctrl.c（文件操作）。
  */
+#define pr_fmt(fmt) KBUILD_MODNAME ": [main] " fmt
+
 #include <linux/aer.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -42,7 +44,7 @@ static void anlogic_pci_card_free(struct anlogic_pci_card *card)
 {
     struct anlogic_pci_hw *hw = card->hw;
 
-    pr_info("card 0x%p, destroy_interfaces, hw 0x%p.\n", card, hw);
+    pr_debug("card 0x%p, destroy_interfaces, hw 0x%p.\n", card, hw);
     anlogic_pci_card_destroy_interfaces(card);
     card->hw = NULL;
 
@@ -62,9 +64,6 @@ static int anlogic_pci_probe(struct pci_dev *pdev,
     card = anlogic_pci_card_alloc(pdev);
     if (!card)
         return -ENOMEM;
-
-    pr_info("card->h2c_channel_max %d.\n", card->h2c_channel_max);
-    pr_info("card->c2h_channel_max %d.\n", card->c2h_channel_max);
 
     hw = anlogic_pci_hw_open(ANLOGIC_PCI_DRV_NAME, pdev, &card->user_max,
                              &card->h2c_channel_max, &card->c2h_channel_max);
@@ -114,6 +113,24 @@ static void anlogic_pci_remove(struct pci_dev *pdev)
     dev_set_drvdata(&pdev->dev, NULL);
 }
 
+/*
+ * AER/FLR 之后 FPGA 里的 CTRL、RKA1 session、ARM 都可能已被复位；驱动侧的
+ * link_armed 若继续为 1，link_ctl 会误报“已初始化”，ARM/PUSHCFG 也会基于
+ * 旧状态。这里只清软件状态，不做 MMIO（frozen/reset 上下文里未必可访问）。
+ */
+static void anlogic_pci_mark_link_down(struct anlogic_pci_card *card,
+                                       const char *why)
+{
+    if (!card || !card->hw || !card->hw->link_armed)
+        return;
+
+    card->hw->link_armed = 0;
+    card->hw->link_cam_b = 0;
+    dev_warn(&card->pdev->dev,
+             "%s, link marked down; re-init required (link_ctl push/retrig or reload)\n",
+             why);
+}
+
 static pci_ers_result_t anlogic_pci_error_detected(struct pci_dev *pdev,
                                                    pci_channel_state_t state)
 {
@@ -125,6 +142,7 @@ static pci_ers_result_t anlogic_pci_error_detected(struct pci_dev *pdev,
     case pci_channel_io_frozen:
         pr_warn("dev 0x%p,0x%p, frozen state error, reset controller\n",
                 pdev, card);
+        anlogic_pci_mark_link_down(card, "frozen");
         pci_disable_device(pdev);
         return PCI_ERS_RESULT_NEED_RESET;
     case pci_channel_io_perm_failure:
@@ -149,6 +167,8 @@ static pci_ers_result_t anlogic_pci_slot_reset(struct pci_dev *pdev)
     pci_set_master(pdev);
     pci_restore_state(pdev);
     pci_save_state(pdev);
+    /* slot reset 会清掉 FPGA 的 RKA1/CTRL；软件状态同步清掉，避免假就绪 */
+    anlogic_pci_mark_link_down(card, "slot reset");
 
     return PCI_ERS_RESULT_RECOVERED;
 }
@@ -158,6 +178,7 @@ static void anlogic_pci_error_resume(struct pci_dev *pdev)
     struct anlogic_pci_card *card = dev_get_drvdata(&pdev->dev);
 
     pr_info("dev 0x%p,0x%p.\n", pdev, card);
+    anlogic_pci_mark_link_down(card, "error resume");
 }
 
 static void anlogic_pci_reset_prepare(struct pci_dev *pdev)
@@ -165,6 +186,7 @@ static void anlogic_pci_reset_prepare(struct pci_dev *pdev)
     struct anlogic_pci_card *card = dev_get_drvdata(&pdev->dev);
 
     pr_info("dev 0x%p,0x%p.\n", pdev, card);
+    anlogic_pci_mark_link_down(card, "reset prepare");
 }
 
 static void anlogic_pci_reset_done(struct pci_dev *pdev)
@@ -172,6 +194,7 @@ static void anlogic_pci_reset_done(struct pci_dev *pdev)
     struct anlogic_pci_card *card = dev_get_drvdata(&pdev->dev);
 
     pr_info("dev 0x%p,0x%p.\n", pdev, card);
+    anlogic_pci_mark_link_down(card, "reset done");
 }
 
 static const struct pci_error_handlers anlogic_pci_err_handler = {
@@ -194,32 +217,30 @@ static int __init anlogic_pci_init_module(void)
 {
     int rv;
 
-    pr_info("Hello,Anlogic-pcie\n");
-
     rv = anlogic_pci_chrdev_init();
     if (rv < 0)
         return rv;
 
-    if (pci_register_driver(&anlogic_pci_driver)) {
-        pr_err("no found pcie\n");
-        pci_unregister_driver(&anlogic_pci_driver);
+    /* 没有匹配的 EP 不算错误：模块可以先进来，等设备（或重新枚举）再 probe */
+    rv = pci_register_driver(&anlogic_pci_driver);
+    if (rv < 0) {
+        pr_err("pci_register_driver() failed, %d.\n", rv);
         anlogic_pci_chrdev_cleanup();
-        return -ENODEV;
     }
 
-    return 0;
+    return rv;
 }
 
 static void __exit anlogic_pci_cleanup_module(void)
 {
     pci_unregister_driver(&anlogic_pci_driver);
     anlogic_pci_chrdev_cleanup();
-    pr_info("Goodbye,Anlogic-pcie\n");
 }
 
 module_init(anlogic_pci_init_module);
 module_exit(anlogic_pci_cleanup_module);
 
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_DESCRIPTION("Anlogic PH1P100 PCIe endpoint driver (host/RC side, PIO register access)");
+MODULE_DESCRIPTION("Anlogic PH1P100 PCIe EP driver (RK3588 host side): "
+                   "BAR PIO, frame buffer, camera link, RKA1");
 MODULE_AUTHOR("anlogic");

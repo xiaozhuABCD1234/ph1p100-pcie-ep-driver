@@ -15,11 +15,12 @@
  *   4) 生命周期：卸载/离线先 CANCEL，再等 TX_STATUS 的 busy/draining 清零，最后才
  *      允许释放收帧内存；链路重建必须换新 session，旧门铃/ACK 一律不认。
  */
-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+#define pr_fmt(fmt) KBUILD_MODNAME ": [rka1] " fmt
 
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 
 #include "anlogic_pci.h"
@@ -40,6 +41,43 @@ static int rka1_write(struct anlogic_pci_hw *hw, u32 off, u32 val)
     return anlogic_pci_link_write32(hw, off, val);
 }
 
+/* 把 armed/busy/held/draining 收回 IDLE；定义在 configure 之后 */
+static int rka1_quiesce_to_idle(struct anlogic_pci_hw *hw, u32 st);
+
+/*
+ * 复核 0xB0/0xB4 与 0xB8/0xBC 两对寄存器是否仍是驱动写下去的槽 0/门铃。
+ * link_armed 是软件状态，FPGA 被重新配置后寄存器可能已归零而软件还记着 1；
+ * 每次 ARM 前读回来比对一次，避免把帧打到 0 或旧地址。
+ */
+static int rka1_push_regs_match(struct anlogic_pci_hw *hw)
+{
+    u32 dst_lo = 0, dst_hi = 0, db_lo = 0, db_hi = 0;
+    u64 dst, db;
+    int rv;
+
+    rv = rka1_read(hw, ANLOGIC_BAR_PUSH_DST_LO_OFF, &dst_lo);
+    if (!rv)
+        rv = rka1_read(hw, ANLOGIC_BAR_PUSH_DST_HI_OFF, &dst_hi);
+    if (!rv)
+        rv = rka1_read(hw, ANLOGIC_BAR_PUSH_DB_LO_OFF, &db_lo);
+    if (!rv)
+        rv = rka1_read(hw, ANLOGIC_BAR_PUSH_DB_HI_OFF, &db_hi);
+    if (rv < 0)
+        return rv;
+
+    dst = ((u64)dst_hi << 32) | dst_lo;
+    db = ((u64)db_hi << 32) | db_lo;
+    if (dst != hw->link_push_dst || db != hw->link_push_db) {
+        pr_err("0xB0/0xB4=0x%llx、0xB8/0xBC=0x%llx 与驱动记录 0x%llx/0x%llx 不一致。\n",
+               (unsigned long long)dst, (unsigned long long)db,
+               (unsigned long long)hw->link_push_dst,
+               (unsigned long long)hw->link_push_db);
+        return -EAGAIN;
+    }
+
+    return 0;
+}
+
 /*
  * 探测安全扩展：EXT_MAGIC/EXT_VERSION 必须都对。失败一律 fail closed。
  * 本函数只读，不改任何状态，可以在任何一次 open 里安全调用。
@@ -56,7 +94,7 @@ int anlogic_pci_rka1_probe(struct anlogic_pci_hw *hw)
     if (rv < 0)
         return rv;
     if (magic != ANLOGIC_RKA1_EXT_MAGIC) {
-        pr_err("RKA1：0x118 EXT_MAGIC=0x%08x != 0x%08x（旧映像或被复用寄存器）。"
+        pr_err("0x118 EXT_MAGIC=0x%08x != 0x%08x（旧映像或被复用寄存器）。"
                "本驱动不做旧行为回退，推帧路径关闭。\n",
                magic, ANLOGIC_RKA1_EXT_MAGIC);
         hw->rka1_ext_ok = 0;
@@ -67,7 +105,7 @@ int anlogic_pci_rka1_probe(struct anlogic_pci_hw *hw)
         return rv;
     if (ANLOGIC_RKA1_EXT_VERSION_MAJOR(ver) !=
         ANLOGIC_RKA1_EXT_VERSION_MAJOR(ANLOGIC_RKA1_EXT_VERSION)) {
-        pr_err("RKA1：0x11C EXT_VERSION=0x%08x 主版本不符（要 major %u）。\n",
+        pr_err("0x11C EXT_VERSION=0x%08x 主版本不符（要 major %u）。\n",
                ver, ANLOGIC_RKA1_EXT_VERSION_MAJOR(ANLOGIC_RKA1_EXT_VERSION));
         hw->rka1_ext_ok = 0;
         return -EOPNOTSUPP;
@@ -91,8 +129,10 @@ int anlogic_pci_rka1_status(struct anlogic_pci_hw *hw, u32 *status)
  * 要求：
  *   · cap_bytes >= 本帧 dma_bytes（FPGA 侧逐帧再核一次，两边都要挡）；
  *   · session 非零且与上次不同（每次重连/卸载恢复换新会话，避免旧门铃/旧 ACK 被认）。
- * 注意：busy/held/draining 期间写这两个寄存器会被 FPGA 拒绝（置 0xC8=10），
- * 所以本函数先看 TX_STATUS，有活动就直接返回 -EBUSY，不去踩那个拒绝路径。
+ * 注意：busy/held/draining 期间写这两个寄存器会被 FPGA 拒绝（置 0xC8=10）。
+ * 所以本函数先看 TX_STATUS：若还有活动，先用 ACK/CANCEL 收回 IDLE 再写。
+ * 这样用户态在探测留下的 held 帧之后仍能换新 session 重新授权；收回时
+ * 优先 ACK（不产生 E_CANCEL），ACK 不匹配才退回 CANCEL。
  */
 int anlogic_pci_rka1_configure(struct anlogic_pci_hw *hw, u32 cap_bytes, u32 session)
 {
@@ -105,13 +145,28 @@ int anlogic_pci_rka1_configure(struct anlogic_pci_hw *hw, u32 cap_bytes, u32 ses
         return -EOPNOTSUPP;
     if (!session)
         return -EINVAL;
-    if (cap_bytes < ANLOGIC_FRAME_DMA_BYTES) {
-        pr_err("RKA1：授权容量 %u 小于一帧 dma_bytes %u，拒绝配置。\n",
-               cap_bytes, ANLOGIC_FRAME_DMA_BYTES);
-        return -ERANGE;
+    /*
+     * 容量下限用当前收帧缓冲的实际槽长，而不是 1080p 的固定常量：
+     * 4K R10F 槽（10371072）和 640x480 槽（385024）都必须能通过，同时
+     * 不能授权超过已分配缓冲的容量。
+     */
+    {
+        u32 min_bytes = hw->frame_slot_bytes ? hw->frame_slot_bytes :
+                                                ANLOGIC_FRAME_DMA_BYTES;
+
+        if (cap_bytes < min_bytes) {
+            pr_err("授权容量 %u 小于一帧传输长度 %u，拒绝配置。\n",
+                   cap_bytes, min_bytes);
+            return -ERANGE;
+        }
+        if (hw->frame_size && (u64)cap_bytes > (u64)hw->frame_size) {
+            pr_err("授权容量 %u 超过收帧缓冲 %zu，拒绝配置。\n",
+                   cap_bytes, hw->frame_size);
+            return -ERANGE;
+        }
     }
     if (cap_bytes & 0xfffu) {
-        pr_err("RKA1：授权容量 %u 不是 4KiB 整数倍，拒绝配置。\n", cap_bytes);
+        pr_err("授权容量 %u 不是 4KiB 整数倍，拒绝配置。\n", cap_bytes);
         return -EINVAL;
     }
 
@@ -120,8 +175,13 @@ int anlogic_pci_rka1_configure(struct anlogic_pci_hw *hw, u32 cap_bytes, u32 ses
         return rv;
     if (st & (ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY |
               ANLOGIC_RKA1_ST_HELD   | ANLOGIC_RKA1_ST_DRAINING)) {
-        pr_err("RKA1：活动期间（TX_STATUS=0x%08x）拒绝改授权配置。\n", st);
-        return -EBUSY;
+        pr_debug("配置授权前 TX_STATUS=0x%08x 非空闲，先 ACK/CANCEL 收回 IDLE。\n",
+                 st);
+        rv = rka1_quiesce_to_idle(hw, st);
+        if (rv < 0) {
+            pr_err("收回 IDLE 失败 %d，拒绝改授权配置。\n", rv);
+            return rv;
+        }
     }
 
     rv = rka1_write(hw, ANLOGIC_BAR_TX_CAP_OFF, cap_bytes);
@@ -141,7 +201,7 @@ int anlogic_pci_rka1_configure(struct anlogic_pci_hw *hw, u32 cap_bytes, u32 ses
         if (rv < 0)
             return rv;
         if (rb_cap != cap_bytes || rb_sess != session) {
-            pr_err("RKA1：授权配置回读不符（cap 0x%08x/0x%08x, sess 0x%08x/0x%08x）。\n",
+            pr_err("授权配置回读不符（cap 0x%08x/0x%08x, sess 0x%08x/0x%08x）。\n",
                    rb_cap, cap_bytes, rb_sess, session);
             return -EIO;
         }
@@ -164,7 +224,8 @@ static int rka1_quiesce_to_idle(struct anlogic_pci_hw *hw, u32 st)
 {
     const u32 busy_mask = ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY |
                           ANLOGIC_RKA1_ST_HELD  | ANLOGIC_RKA1_ST_DRAINING;
-    unsigned int waited = 0;
+    ktime_t start = ktime_get();
+    s64 elapsed_ms;
     u32 done = 0;
     int rv;
 
@@ -173,27 +234,38 @@ static int rka1_quiesce_to_idle(struct anlogic_pci_hw *hw, u32 st)
      * 板上实测出现过 st 读到 HELD、几微秒后 ACK 内部再读已经是 ARMED 的竞态，
      * 一次性决策会走错分支（结果 E_CANCEL=7 而 held 没释放，ARM 一直被拒）。
      */
-    while (waited < RKA1_QUIESCE_WAIT_MS) {
+    while (ktime_ms_delta(ktime_get(), start) < RKA1_QUIESCE_WAIT_MS) {
         if (!(st & busy_mask))
             return 0;
         if (st & ANLOGIC_RKA1_ST_HELD) {
             rv = rka1_read(hw, ANLOGIC_BAR_PUSH_DONE_OFF, &done);
-            if (!rv && done)
-                (void)anlogic_pci_rka1_ack_release(hw, done, hw->rka1_session);
-            else
+            if (!rv && done) {
+                rv = anlogic_pci_rka1_ack_release(hw, done,
+                                                  hw->rka1_session);
+                if (rv < 0) {
+                    /*
+                     * held 槽里的 (session,seq) 可能是上一轮遗留的，用当前
+                     * 会话 ACK 不掉；此时不能死等，CANCEL 是更强制的收回。
+                     */
+                    pr_warn("held 的 ACK 未确认（%d），改用 CANCEL 收回。\n",
+                            rv);
+                    (void)anlogic_pci_rka1_cancel(hw);
+                }
+            } else {
                 (void)anlogic_pci_rka1_cancel(hw);
+            }
         } else {
             (void)anlogic_pci_rka1_cancel(hw);
         }
         usleep_range(2000, 3000);
-        waited += 2;
         rv = anlogic_pci_rka1_status(hw, &st);
         if (rv < 0)
             return rv;
     }
     if (st & busy_mask) {
-        pr_err("RKA1：收回 IDLE 超时（%u ms，TX_STATUS=0x%08x）。\n",
-               waited, st);
+        elapsed_ms = ktime_ms_delta(ktime_get(), start);
+        pr_err("收回 IDLE 超时（%lld ms，TX_STATUS=0x%08x）。\n",
+               elapsed_ms, st);
         return -EBUSY;
     }
     return 0;
@@ -217,8 +289,43 @@ int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw)
     if (!hw->rka1_ext_ok)
         return -EOPNOTSUPP;
     if (!hw->rka1_session || !hw->rka1_cap_bytes) {
-        pr_err("RKA1：还没配置授权（cap/session），拒绝 ARM。\n");
+        pr_err("还没配置授权（cap/session），拒绝 ARM。\n");
         return -EINVAL;
+    }
+    /*
+     * 没有完整链路就绪状态时绝不允许 ARM：用户态可以直接发 OP_ARM，
+     * 若 link_arm 在写完授权配置后、写推帧地址前失败，0xB0/0xB8 可能还是
+     * 0 或上一次的旧值。这里把“地址已写、使能位已置、目标在缓冲内”作为硬门槛。
+     */
+    if (!hw->link_armed) {
+        pr_err("链路/推帧尚未初始化（link_armed=0），拒绝 ARM。\n");
+        return -EAGAIN;
+    }
+    if (!hw->frame_virt || !hw->frame_slot_bytes ||
+        hw->link_push_dst != (u64)hw->frame_phys + hw->frame_hdr_bytes ||
+        hw->link_push_db != (u64)hw->frame_phys + hw->frame_mb_off +
+                            offsetof(struct anlogic_frame_mailbox, push_dbell)) {
+        pr_err("推帧目标/门铃地址不是驱动配置的槽 0（dst=0x%llx db=0x%llx），拒绝 ARM。\n",
+               (unsigned long long)hw->link_push_dst,
+               (unsigned long long)hw->link_push_db);
+        return -EINVAL;
+    }
+    if (hw->frame_size &&
+        ((hw->link_push_dst < hw->frame_phys) ||
+         (hw->link_push_dst - hw->frame_phys + hw->frame_slot_bytes >
+          hw->frame_size) ||
+         (hw->link_push_db < hw->frame_phys) ||
+         (hw->link_push_db - hw->frame_phys + 4 > hw->frame_size))) {
+        pr_err("推帧目标/门铃越出收帧缓冲，拒绝 ARM。\n");
+        return -EINVAL;
+    }
+    rv = rka1_push_regs_match(hw);
+    if (rv < 0) {
+        if (rv == -EAGAIN) {
+            pr_err("FPGA 里的推帧地址已被改写（可能重新配置过），拒绝 ARM。\n");
+            hw->link_armed = 0;
+        }
+        return rv;
     }
 
     rv = anlogic_pci_rka1_status(hw, &st);
@@ -231,17 +338,17 @@ int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw)
          * 会让之后所有抓帧都失败（板上实测：第二次抓帧 0xC0 不涨、落盘还是旧缓冲）。
          * 改成先自愈回 IDLE、重写授权，再照常 ARM。
          */
-        pr_info("RKA1：ARM 前 TX_STATUS=0x%08x 不是空闲，先收回 IDLE（幂等）。\n", st);
+        pr_debug("ARM 前 TX_STATUS=0x%08x 不是空闲，先收回 IDLE（幂等）。\n", st);
         rv = rka1_quiesce_to_idle(hw, st);
         if (rv < 0) {
-            pr_err("RKA1：收回 IDLE 失败 %d，拒绝 ARM。\n", rv);
+            pr_err("收回 IDLE 失败 %d，拒绝 ARM。\n", rv);
             return rv;
         }
         /* 活动期的 CONFIGURE 可能被 RTL 以 cfg_reject 拒过（0xC8=10），
-         * 暂存寄存器里还是旧值，这里重写一遍再 ARM。 */
-        rv = rka1_write(hw, ANLOGIC_BAR_TX_CAP_OFF, hw->rka1_cap_bytes);
-        if (!rv)
-            rv = rka1_write(hw, ANLOGIC_BAR_TX_SESSION_OFF, hw->rka1_session);
+         * 暂存寄存器里还是旧值，这里重写一遍并回读复核再 ARM。
+         */
+        rv = anlogic_pci_rka1_configure(hw, hw->rka1_cap_bytes,
+                                        hw->rka1_session);
         if (rv < 0)
             return rv;
         rv = anlogic_pci_rka1_status(hw, &st);
@@ -249,7 +356,7 @@ int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw)
             return rv;
         if (st & (ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY |
                   ANLOGIC_RKA1_ST_HELD   | ANLOGIC_RKA1_ST_DRAINING)) {
-            pr_err("RKA1：收回 IDLE 后 TX_STATUS=0x%08x 仍不空闲，拒绝 ARM。\n", st);
+            pr_err("收回 IDLE 后 TX_STATUS=0x%08x 仍不空闲，拒绝 ARM。\n", st);
             return -EBUSY;
         }
     }
@@ -262,12 +369,22 @@ int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw)
         return rv;
     if (st & ANLOGIC_RKA1_ST_REJECT) {
         rka1_read(hw, ANLOGIC_BAR_PUSH_ERR_OFF, &err);
-        pr_err("RKA1：ARM 被 FPGA 拒绝（TX_STATUS.bit3=1，0xC8=%u）。"
-               "检查 cap/session/dst/db 对齐与链路/MPS 状态。\n", err);
+        /*
+         * E_ARM_REJ 最常见的原因不是配置错，而是「相机还没产出第一帧」：
+         * RTL 的 arm_reject 里有 (ddr_status[0]==0) 一条，DDR 里没有可用
+         * 源帧时必然拒一次。上电流程里 CTRL 刚使能、传感器还在出第一帧，
+         * 这一次拒绝是正常的，调用方（anlogic_pci_link_arm）会等帧重试。
+         * 这里降到 pr_debug 免得重试期间刷屏；配置真错的码仍按 err 打印。
+         */
+        if (err == ANLOGIC_PUSH_ERR_ARM_REJ)
+            pr_debug("ARM 被拒（0xC8=%u E_ARM_REJ，通常是相机还没出第一帧）。", err);
+        else
+            pr_err("ARM 被 FPGA 拒绝（TX_STATUS.bit3=1，0xC8=%u）。"
+                   "检查 cap/session/dst/db 对齐与链路/MPS 状态。", err);
         return -EINVAL;
     }
     if (!(st & ANLOGIC_RKA1_ST_ARMED)) {
-        pr_err("RKA1：写完 0x108 后 TX_STATUS=0x%08x 没有 armed，写入没生效。\n", st);
+        pr_err("写完 0x108 后 TX_STATUS=0x%08x 没有 armed，写入没生效。\n", st);
         return -EIO;
     }
     return 0;
@@ -281,7 +398,8 @@ int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw)
 int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session)
 {
     u32 st = 0, err = 0;
-    unsigned int waited = 0;
+    ktime_t start;
+    s64 elapsed_ms;
     int rv;
 
     if (!hw || !hw->pdev)
@@ -301,10 +419,10 @@ int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session
          * 其余情况直接成功返回，让上层用 0xC0 增量判「这次到底推没推」。
          */
         if (st & ANLOGIC_RKA1_ST_ARMED) {
-            pr_info("RKA1：ACK 时还在 ARMED（该额度未推任何帧），改为 CANCEL 收回。\n");
+            pr_debug("ACK 时还在 ARMED（该额度未推任何帧），改为 CANCEL 收回。\n");
             return anlogic_pci_rka1_cancel(hw);
         }
-        pr_info("RKA1：ACK 时不在 held（TX_STATUS=0x%08x），视为已释放。\n", st);
+        pr_debug("ACK 时不在 held（TX_STATUS=0x%08x），视为已释放。\n", st);
         return 0;
     }
 
@@ -316,18 +434,19 @@ int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session
     if (rv < 0)
         return rv;
 
-    while (waited < RKA1_ACK_WAIT_MS) {
+    start = ktime_get();
+    while (ktime_ms_delta(ktime_get(), start) < RKA1_ACK_WAIT_MS) {
         rv = anlogic_pci_rka1_status(hw, &st);
         if (rv < 0)
             return rv;
         if (!(st & ANLOGIC_RKA1_ST_HELD))
             return 0;
         usleep_range(1000, 2000);
-        waited++;
     }
+    elapsed_ms = ktime_ms_delta(ktime_get(), start);
     rka1_read(hw, ANLOGIC_BAR_PUSH_ERR_OFF, &err);
-    pr_err("RKA1：ACK 后 %u ms 仍 held（TX_STATUS=0x%08x，0xC8=%u）——"
-           "seq/session 与 held 值不匹配？\n", waited, st, err);
+    pr_err("ACK 后 %lld ms 仍 held（TX_STATUS=0x%08x，0xC8=%u）——"
+           "seq/session 与 held 值不匹配？\n", elapsed_ms, st, err);
     return -EAGAIN;
 }
 
@@ -339,7 +458,8 @@ int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session
 int anlogic_pci_rka1_cancel(struct anlogic_pci_hw *hw)
 {
     u32 st = 0;
-    unsigned int waited = 0;
+    ktime_t start;
+    s64 elapsed_ms;
     int rv;
 
     if (!hw || !hw->pdev)
@@ -351,7 +471,8 @@ int anlogic_pci_rka1_cancel(struct anlogic_pci_hw *hw)
     if (rv < 0)
         return rv;
 
-    while (waited < RKA1_CANCEL_WAIT_MS) {
+    start = ktime_get();
+    while (ktime_ms_delta(ktime_get(), start) < RKA1_CANCEL_WAIT_MS) {
         rv = anlogic_pci_rka1_status(hw, &st);
         if (rv < 0)
             return rv;
@@ -359,9 +480,10 @@ int anlogic_pci_rka1_cancel(struct anlogic_pci_hw *hw)
                     ANLOGIC_RKA1_ST_HELD | ANLOGIC_RKA1_ST_ARMED)))
             return 0;
         usleep_range(RKA1_CANCEL_POLL_US, RKA1_CANCEL_POLL_US * 2);
-        waited++;
     }
-    pr_err("RKA1：CANCEL 后 %u ms 仍有活动（TX_STATUS=0x%08x）。\n", waited, st);
+    elapsed_ms = ktime_ms_delta(ktime_get(), start);
+    pr_err("CANCEL 后 %lld ms 仍有活动（TX_STATUS=0x%08x）。\n",
+           elapsed_ms, st);
     return -EAGAIN;
 }
 

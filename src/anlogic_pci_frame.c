@@ -6,11 +6,12 @@
  * 本层只做「缓冲 + 接口」，真正的收帧等 FPGA 侧打通后再验：
  *
  *   1) 分配：dma_alloc_coherent 一块物理连续、页对齐的一致性内存，大小由
- *      module param 决定（默认 1 槽 × 640x480 灰度 = 307200 字节/槽）。
+ *      module param 与几何推导（默认 1 槽 × 1920x1080 R10F = 2592768 字节）。
  *      每槽步长页对齐，推帧目标按 phys_addr + stride * n + hdr_bytes 算（= 像素区起点）。
  *   2) 接口：ANLOGIC_IOCFRAMEINFO 把物理地址、大小、几何与序号/计数报给用户态；
- *      ANLOGIC_IOCFRAMEWAIT 提供「帧就绪」轮询（序号 + 计数）—— 本 EP 目前只有
- *      Legacy 中断、没有 MSI，所以不做中断，只轮询邮箱。
+ *      ANLOGIC_IOCFRAMEWAIT 提供「帧就绪」轮询（序号 + 计数）。当前 RTL 的
+ *      tl_int_msireq 恒 0，驱动默认 use_irq=0，只轮询邮箱；中断路径保留给
+ *      将来真会发 MSI/MSI-X 的位流（use_irq=1）。
  *   3) 推帧门铃：FPGA 推帧引擎只往门铃字写「已推帧数」，不写槽头、不碰
  *      mailbox.seq/count（见 include/anlogic_pci_ioctl.h 的说明）。所以本层在
  *      轮询时盯的是门铃字，见到它变大就把对应槽的槽头与 mailbox.seq/count 补齐
@@ -27,6 +28,8 @@
  * 帧缓冲节点的 mmap 映射的是系统内存（不是 MMIO），但仍按既有的 mmap
  * 溢出安全判据做边界夹紧，并且只允许只读映射（不把 FPGA 的 MWr 目标交给用户态乱写）。
  */
+#define pr_fmt(fmt) KBUILD_MODNAME ": [frame] " fmt
+
 #include <linux/build_bug.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -40,10 +43,10 @@
 
 #include "anlogic_pci.h"
 
-/* Default geometry comes from include/anlogic_pci_ioctl.h (T07: 1920x1080 RAW10,
- * dma_bytes 2592768).  Do not redefine it locally: two different defaults in the
- * same build is exactly how host and FPGA ended up disagreeing before. */
-#define ANLOGIC_FRAME_DEF_SLOTS     1u
+/* 默认几何/槽数一律取 include/anlogic_pci_ioctl.h 里那份（T07：1920x1080 RAW10，
+ * dma_bytes 2592768），本文件不再另定义一套默认值 —— 同一个构建里两套默认值，
+ * 正是之前主机侧与 FPGA 侧对不上的原因。
+ */
 /* 轮询间隔，也是「等帧」时的睡眠粒度 */
 #define ANLOGIC_FRAME_POLL_MS       10u
 /* 一帧像素字节数的合理上限，防止 module param 写出荒唐的分配量 */
@@ -52,22 +55,25 @@
 
 static unsigned int frame_width = ANLOGIC_FRAME_DEF_WIDTH;
 module_param(frame_width, uint, 0444);
-MODULE_PARM_DESC(frame_width, "收帧缓冲的每帧宽度（像素），默认 640");
+MODULE_PARM_DESC(frame_width, "收帧缓冲的每帧宽度（像素），默认 1920");
 
 static unsigned int frame_height = ANLOGIC_FRAME_DEF_HEIGHT;
 module_param(frame_height, uint, 0444);
-MODULE_PARM_DESC(frame_height, "收帧缓冲的每帧高度（像素），默认 480");
+MODULE_PARM_DESC(frame_height, "收帧缓冲的每帧高度（像素），默认 1080");
 
-/* 0 表示用 frame_width * frame_height（T07 默认 1920x1080 = 2592000B packed RAW10，
- * 但主机侧槽字节数是 dma_bytes 2592768，见 frame_slot_bytes 的说明） */
+/* 0 表示按 frame_width/frame_height 推导 R10F 传输长度：
+ *   128B R10F 头 + (width/4*5)*height packed RAW10，再 4KiB 对齐。
+ * 显式给出时必须与推导值完全一致，避免“声明的 4K”实际只分配了 1080p 的槽。
+ */
 static unsigned int frame_slot_bytes;
 module_param(frame_slot_bytes, uint, 0444);
-MODULE_PARM_DESC(frame_slot_bytes, "一帧像素字节数，0 = frame_width*frame_height（默认 307200）");
+MODULE_PARM_DESC(frame_slot_bytes,
+                 "一帧传输字节数，0 = 按 frame_width/frame_height 推导 R10F 长度（1920x1080 时为 2592768）");
 
 static unsigned int frame_slots = ANLOGIC_FRAME_DEF_SLOTS;
 module_param(frame_slots, uint, 0444);
 MODULE_PARM_DESC(frame_slots,
-                 "收帧缓冲的槽位数（1..16），默认 1（推帧目标固定，多槽只有槽 0 有推来的帧）");
+                 "收帧缓冲的槽位数，只支持 1（推帧目标固定，多槽只有槽 0 会收到帧）");
 
 /*
  * mailbox 与槽头的字段偏移是 FPGA / 驱动 / 用户态三方共用的 ABI，偏移算错的话
@@ -109,7 +115,7 @@ static void anlogic_pci_frame_seq_read(struct anlogic_pci_hw *hw, u32 *seq,
  * frame_slots 默认 1，(done-1)%slots 恒为 0。
  * 读门铃用 READ_ONCE + dma_rmb()：先看到门铃，再去看它标记的那一帧。
  */
-static void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
+void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
 {
     struct anlogic_frame_mailbox *mb = hw->frame_mb;
     struct anlogic_frame_slot_hdr *hdr;
@@ -123,6 +129,16 @@ static void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
     dma_rmb();
     if (!done || done == hw->frame_push_done)
         return;
+    /*
+     * 门铃回退只可能来自 FPGA 重新配置/复位（或 32 位回绕），此时 mailbox
+     * 里的 seq/count 不能继续当成单调值发布。重新对齐到下界，让下一帧正常
+     * 发布，同时打一条 warn 供现场确认；用户态看到的 seq 回退属于复位语义。
+     */
+    if ((s32)(done - hw->frame_push_done) < 0) {
+        pr_warn("门铃从 %u 回退到 %u（FPGA 重新配置？），重新对齐。\n",
+                hw->frame_push_done, done);
+        hw->frame_push_done = done - 1;
+    }
 
     slot = (done - 1) % hw->frame_slots;
     hdr = (struct anlogic_frame_slot_hdr *)((u8 *)hw->frame_virt +
@@ -138,8 +154,30 @@ static void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
     dma_wmb();
     hw->frame_push_done = done;
 
-    pr_debug("收帧缓冲：门铃 %u，补齐槽 %u 的槽头与 mailbox.seq/count。\n",
+    pr_debug("门铃 %u，补齐槽 %u 的槽头与 mailbox.seq/count。\n",
              done, slot);
+}
+
+/*
+ * 按几何推导 R10F 的传输长度（dma_bytes）：
+ *   128B 头 + packed RAW10（4px/5B，stride=width/4*5）+ 4KiB 对齐尾。
+ * width 必须是 4 的倍数；返回值已保证 4KiB 对齐。
+ */
+static int anlogic_pci_frame_r10f_bytes(unsigned int width, unsigned int height,
+                                        unsigned int *slot_bytes)
+{
+    u64 row_bytes, content;
+
+    if (!width || (width & 3u))
+        return -EINVAL;
+    row_bytes = (u64)(width / 4u) * 5u;
+    content = (u64)ANLOGIC_FRAME_R10F_HDR + row_bytes * (u64)height;
+    content = (content + 4095u) & ~4095ULL;
+    if (content > ANLOGIC_FRAME_MAX_SLOT_BYTES)
+        return -ERANGE;
+
+    *slot_bytes = (unsigned int)content;
+    return 0;
 }
 
 /*
@@ -155,11 +193,13 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     unsigned int slot_bytes = frame_slot_bytes;
     unsigned int slots = frame_slots;
     unsigned int hdr_bytes = ANLOGIC_FRAME_HDR_BYTES;
+    unsigned int derived_slot = 0;
     unsigned int stride;
     size_t size;
+    int rv;
 
     if (!hw || !hw->pdev) {
-        pr_err("收帧缓冲：hw/pdev 为空。\n");
+        pr_err("hw/pdev 为空。\n");
         return -EINVAL;
     }
 
@@ -171,29 +211,45 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
      * the caller refuses to open the link.
      */
     if (!width || width > ANLOGIC_FRAME_MAX_W) {
-        pr_err("frame buffer: frame_width=%u out of range (max %u).\n",
+        pr_err("frame_width=%u 超出范围（上限 %u）。\n",
                width, ANLOGIC_FRAME_MAX_W);
         return -EINVAL;
     }
     if (!height || height > ANLOGIC_FRAME_MAX_H) {
-        pr_err("frame buffer: frame_height=%u out of range (max %u).\n",
+        pr_err("frame_height=%u 超出范围（上限 %u）。\n",
                height, ANLOGIC_FRAME_MAX_H);
         return -EINVAL;
     }
-    if (!slot_bytes)
-        slot_bytes = ANLOGIC_FRAME_DMA_BYTES;
+    /*
+     * T07：槽长不再用固定的 1080p 常量。先按几何算出 R10F 传输长度，
+     * 再校验 module param；否则 4K 会只分配 2592768 字节，FPGA 推 10371072
+     * 字节时直接越过槽区/邮箱页。
+     */
+    rv = anlogic_pci_frame_r10f_bytes(width, height, &derived_slot);
+    if (rv < 0) {
+        pr_err("%ux%u 无法推导 R10F 长度（%d）：width 必须是非零 4 的倍数，且帧长不超过 %u 字节。\n",
+               width, height, rv, ANLOGIC_FRAME_MAX_SLOT_BYTES);
+        return rv;
+    }
+    if (!slot_bytes) {
+        slot_bytes = derived_slot;
+    } else if (slot_bytes != derived_slot) {
+        pr_err("frame_slot_bytes=%u 与 %ux%u 的 R10F 传输长度 %u 不一致（留 0 让驱动推导）。\n",
+               slot_bytes, derived_slot, width, height);
+        return -EINVAL;
+    }
     if (slot_bytes > ANLOGIC_FRAME_MAX_SLOT_BYTES) {
-        pr_err("frame buffer: frame_slot_bytes=%u over the %u cap.\n",
+        pr_err("frame_slot_bytes=%u 超过上限 %u。\n",
                slot_bytes, ANLOGIC_FRAME_MAX_SLOT_BYTES);
         return -EINVAL;
     }
     if (slot_bytes & 0xfffu) {
-        pr_err("frame buffer: frame_slot_bytes=%u is not a 4KiB multiple.\n",
+        pr_err("frame_slot_bytes=%u 不是 4KiB 的整数倍。\n",
                slot_bytes);
         return -EINVAL;
     }
     if (!slots || slots > ANLOGIC_FRAME_MAX_SLOTS) {
-        pr_err("frame buffer: frame_slots=%u out of range (max %u).\n",
+        pr_err("frame_slots=%u 超出范围（上限 %u）。\n",
                slots, ANLOGIC_FRAME_MAX_SLOTS);
         return -EINVAL;
     }
@@ -203,7 +259,7 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
          * address, so >1 slot would only ever be filled in slot 0.  Refuse
          * instead of pretending a ring exists.
          */
-        pr_err("frame buffer: frame_slots=%u unsupported (single slot only).\n",
+        pr_err("frame_slots=%u 不支持（只支持单槽）。\n",
                slots);
         return -EINVAL;
     }
@@ -220,12 +276,12 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     hw->frame_virt = dma_alloc_coherent(&hw->pdev->dev, size, &hw->frame_phys,
                                         GFP_KERNEL);
     if (!hw->frame_virt) {
-        pr_err("收帧缓冲：dma_alloc_coherent(%zu 字节) 失败。\n", size);
+        pr_err("dma_alloc_coherent(%zu 字节) 失败。\n", size);
         return -ENOMEM;
     }
     /* FPGA 侧按物理地址算 MWr 目标，页对齐是硬要求（DMA API 本来就保证） */
     if (hw->frame_phys & (PAGE_SIZE - 1)) {
-        pr_err("收帧缓冲：物理地址 0x%llx 不是页对齐，放弃。\n",
+        pr_err("物理地址 0x%llx 不是页对齐，放弃。\n",
                (unsigned long long)hw->frame_phys);
         dma_free_coherent(&hw->pdev->dev, size, hw->frame_virt,
                           hw->frame_phys);
@@ -249,10 +305,8 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     hw->frame_width = width;
     hw->frame_height = height;
 
+    /* seq/count/push_dbell 已被上面的 memset 清零，这里只填描述符的静态字段 */
     mb = hw->frame_mb;
-    mb->seq = 0;
-    mb->count = 0;
-    mb->push_dbell = 0;
     mb->slot_bytes = slot_bytes;
     mb->slots = slots;
     mb->stride = stride;
@@ -263,8 +317,8 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
     mb->magic = ANLOGIC_FRAME_MAGIC;
     dma_wmb();
 
-    pr_info("收帧缓冲：phys 0x%llx, size %zu = %u 槽 × 步长 %u + mailbox 页"
-            "（%ux%u, %u 字节/帧，mailbox 偏移 %zu）。\n",
+    pr_info("phys 0x%llx, size %zu = %u 槽 × 步长 %u + mailbox 页"
+            "（%ux%u, R10F %u 字节/帧，mailbox 偏移 %zu）。\n",
             (unsigned long long)hw->frame_phys, size, slots, stride, width,
             height, slot_bytes, (size_t)stride * slots);
 
@@ -277,7 +331,7 @@ void anlogic_pci_frame_free(struct anlogic_pci_hw *hw)
     if (!hw || !hw->frame_virt)
         return;
 
-    pr_debug("收帧缓冲：释放 phys 0x%llx, size %zu。\n",
+    pr_debug("释放 phys 0x%llx, size %zu。\n",
              (unsigned long long)hw->frame_phys, hw->frame_size);
     dma_free_coherent(&hw->pdev->dev, hw->frame_size, hw->frame_virt,
                       hw->frame_phys);
@@ -320,51 +374,115 @@ static void anlogic_pci_frame_fill_info(struct anlogic_pci_hw *hw,
 }
 
 /*
- * 帧就绪轮询：seq 与用户手上的 last_seq 不同就算有新帧。
- * timeout_ms = 0 只查一次（纯轮询语义）；> 0 则最多等这么久，每 ANLOGIC_FRAME_POLL_MS
- * 醒一次看 mailbox。没有新帧**不是错误**：ready 保持 0 返回 0，用户态据此报「无新帧」。
+ * 单次轮询：只在这短短一段里持有 hw->lock，看门铃、读 seq/count、算槽号。
+ * 返回 -ENODEV 表示卸载开始或缓冲已经释放；-ERESTARTSYS 表示取锁被信号打断。
  */
-static long anlogic_pci_frame_wait(struct anlogic_pci_hw *hw,
-                                   struct anlogic_ioc_frame_wait *arg)
+static int anlogic_pci_frame_poll(struct anlogic_pci_hw *hw, u32 *seq,
+                                  u32 *count, u32 *slot)
 {
-    unsigned long deadline = jiffies + msecs_to_jiffies(arg->timeout_ms);
-    u32 seq = 0, count = 0;
-    long rv = 0;
+    int rv;
 
-    arg->ready = 0;
+    if (mutex_lock_interruptible(&hw->lock))
+        return -ERESTARTSYS;
+
+    if (atomic_read(&hw->removed)) {
+        rv = -ENODEV;
+        goto out_unlock;
+    }
+    if (!hw->frame_virt || !hw->frame_slots) {
+        rv = -ENODEV;
+        goto out_unlock;
+    }
+
+    anlogic_pci_frame_push_sync(hw);
+    anlogic_pci_frame_seq_read(hw, seq, count);
+    *slot = *seq ? (*seq - 1) % hw->frame_slots : 0;
+    rv = 0;
+
+out_unlock:
+    mutex_unlock(&hw->lock);
+    return rv;
+}
+
+/*
+ * 帧就绪轮询（ANLOGIC_IOCFRAMEWAIT 的入口）：seq 与用户手上的 last_seq 不同
+ * 就算有新帧。timeout_ms = 0 只查一次；> 0 则最多等这么久，每
+ * ANLOGIC_FRAME_POLL_MS 醒一次看 mailbox。没有新帧**不是错误**：ready 保持 0
+ * 返回 0，用户态据此报「无新帧」。
+ *
+ * 这里**不能**由 ctrl/frame 的 ioctl 包装层持锁调用：一次等帧最长 600 s，持锁
+ * 会把同实例上的其它 ioctl、open、mmap 全堵住。每次轮询只锁住 push_sync 与
+ * seq 读取这一小段，睡眠时锁是放开的；卸载路径每轮都能拿到锁并看到 removed。
+ */
+long anlogic_pci_frame_wait_ioctl(struct anlogic_pci_cdev *cdev,
+                                  void __user *arg)
+{
+    struct anlogic_pci_hw *hw;
+    struct anlogic_ioc_frame_wait wait;
+    unsigned long deadline;
+    u32 seq = 0, count = 0, slot = 0;
+    int rv;
+
+    rv = anlogic_pci_cdev_check(__func__, cdev);
+    if (rv < 0)
+        return rv;
+
+    hw = cdev->hw;
+    if (!hw)
+        return -EINVAL;
+
+    if (!access_ok(arg, sizeof(wait))) {
+        pr_debug("frame wait: bad access %p.\n", arg);
+        return -EFAULT;
+    }
+    if (copy_from_user(&wait, arg, sizeof(wait))) {
+        pr_debug("copy_from_user(frame wait) 失败。\n");
+        return -EFAULT;
+    }
+    if (wait.timeout_ms > ANLOGIC_FRAME_MAX_WAIT_MS) {
+        pr_debug("frame wait: timeout_ms %u 超过上限 %u。\n",
+                 wait.timeout_ms, ANLOGIC_FRAME_MAX_WAIT_MS);
+        return -EINVAL;
+    }
+
+    wait.ready = 0;
+    deadline = jiffies + msecs_to_jiffies(wait.timeout_ms);
+
     for (;;) {
-        /* 卸载已经开始：不要继续等（最长 600 s），尽快把锁让出去 */
-        if (atomic_read(&hw->removed)) {
-            rv = -ENODEV;
+        rv = anlogic_pci_frame_poll(hw, &seq, &count, &slot);
+        if (rv)
+            break;
+        if (seq != wait.last_seq) {
+            wait.ready = 1;
             break;
         }
-        anlogic_pci_frame_push_sync(hw);
-        anlogic_pci_frame_seq_read(hw, &seq, &count);
-        if (seq != arg->last_seq) {
-            arg->ready = 1;
-            break;
-        }
-        if (!arg->timeout_ms)
+        if (!wait.timeout_ms)
             break;                      /* 只查不等 */
+        if (time_after_eq(jiffies, deadline))
+            break;                      /* 等超时：ready 保持 0 */
         if (signal_pending(current)) {
             rv = -EINTR;
             break;
         }
-        if (time_after_eq(jiffies, deadline))
-            break;                      /* 等超时：ready 保持 0 */
-        msleep(ANLOGIC_FRAME_POLL_MS);
+        msleep_interruptible(ANLOGIC_FRAME_POLL_MS);
     }
 
-    arg->seq = seq;
-    arg->count = count;
-    arg->slot = seq ? (seq - 1) % hw->frame_slots : 0;
+    wait.seq = seq;
+    wait.count = count;
+    wait.slot = slot;
+    if (copy_to_user(arg, &wait, sizeof(wait))) {
+        pr_debug("copy_to_user(frame wait) 失败。\n");
+        return -EFAULT;
+    }
 
     return rv;
 }
 
 /*
- * 帧缓冲节点的 ioctl：只认 ANLOGIC_IOCFRAMEINFO / ANLOGIC_IOCFRAMEWAIT。
- * 两条命令都只用 copy_from_user/copy_to_user，绝不解引用用户指针。
+ * 帧缓冲节点的 ioctl：只认 ANLOGIC_IOCFRAMEINFO。
+ * ANLOGIC_IOCFRAMEWAIT 在包装层就被分流到 anlogic_pci_frame_wait_ioctl()，
+ * 不走这里（它需要在轮询之间放开 hw->lock）。
+ * 本函数只用 copy_from_user/copy_to_user，绝不解引用用户指针。
  */
 long anlogic_pci_frame_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
                              void __user *arg)
@@ -378,18 +496,18 @@ long anlogic_pci_frame_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
 
     hw = cdev->hw;
     if (!hw || !hw->frame_virt || !hw->frame_slots || !hw->frame_stride) {
-        pr_err("收帧缓冲没有分配，frame ioctl 不可用。\n");
+        pr_debug("收帧缓冲没有分配，frame ioctl 不可用。\n");
         return -EINVAL;
     }
 
     if (_IOC_TYPE(cmd) != ANLOGIC_IOC_MAGIC) {
-        pr_err("cmd %u, bad magic 0x%x/0x%x.\n", cmd, _IOC_TYPE(cmd),
-               ANLOGIC_IOC_MAGIC);
+        pr_debug("cmd %u, bad magic 0x%x/0x%x.\n", cmd, _IOC_TYPE(cmd),
+                 ANLOGIC_IOC_MAGIC);
         return -ENOTTY;
     }
     if (_IOC_DIR(cmd) & (_IOC_READ | _IOC_WRITE)) {
         if (!access_ok((void __user *)arg, _IOC_SIZE(cmd))) {
-            pr_err("cmd %u, bad access %p.\n", cmd, (void __user *)arg);
+            pr_debug("cmd %u, bad access %p.\n", cmd, (void __user *)arg);
             return -EFAULT;
         }
     }
@@ -401,36 +519,14 @@ long anlogic_pci_frame_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd,
 
             anlogic_pci_frame_fill_info(hw, &info);
             if (copy_to_user((void __user *)arg, &info, sizeof(info))) {
-                pr_err("copy_to_user(frame info) 失败。\n");
+                pr_debug("copy_to_user(frame info) 失败。\n");
                 return -EFAULT;
             }
         }
         break;
 
-    case ANLOGIC_IOCFRAMEWAIT:
-        {
-            struct anlogic_ioc_frame_wait wait;
-
-            if (copy_from_user((void *)&wait, (void __user *)arg,
-                               sizeof(wait))) {
-                pr_err("copy_from_user(frame wait) 失败。\n");
-                return -EFAULT;
-            }
-            if (wait.timeout_ms > ANLOGIC_FRAME_MAX_WAIT_MS) {
-                pr_err("frame wait: timeout_ms %u 超过上限 %u。\n",
-                       wait.timeout_ms, ANLOGIC_FRAME_MAX_WAIT_MS);
-                return -EINVAL;
-            }
-            rv = anlogic_pci_frame_wait(hw, &wait);
-            if (copy_to_user((void __user *)arg, &wait, sizeof(wait))) {
-                pr_err("copy_to_user(frame wait) 失败。\n");
-                return -EFAULT;
-            }
-            return rv;
-        }
-
     default:
-        pr_err("UNKNOWN frame ioctl cmd 0x%x.\n", cmd);
+        pr_debug("UNKNOWN frame ioctl cmd 0x%x.\n", cmd);
         return -ENOTTY;
     }
 
@@ -463,12 +559,12 @@ static int anlogic_pci_frame_mmap(struct file *file, struct vm_area_struct *vma)
     }
 
     if (!hw->frame_virt || !hw->frame_size) {
-        pr_err("mmap(): 收帧缓冲没有分配。\n");
+        pr_debug("mmap(): 收帧缓冲没有分配。\n");
         rv = -EINVAL;
         goto out_unlock;
     }
     if (vma->vm_flags & VM_WRITE) {
-        pr_err("mmap(): 收帧缓冲只允许只读映射（PROT_READ | MAP_SHARED）。\n");
+        pr_debug("mmap(): 收帧缓冲只允许只读映射（PROT_READ | MAP_SHARED）。\n");
         rv = -EACCES;
         goto out_unlock;
     }
@@ -477,14 +573,19 @@ static int anlogic_pci_frame_mmap(struct file *file, struct vm_area_struct *vma)
      * 可写，而这块内存是 FPGA 的 MWr 目标，不能让用户态写进去。
      */
     vm_flags_clear(vma, VM_MAYWRITE);
+    /*
+     * 收帧缓冲是 FPGA 的 MWr 目标：不允许 mremap 扩出原区间（扩出去的部分没有
+     * 对应的 DMA 页），也不进 core dump（几十 MB、且下一帧就会覆盖）。
+     */
+    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
 
     /* mmap 映射长度溢出检查：与 BAR 的 mmap 同样的溢出安全边界判断 */
     off = vma->vm_pgoff << PAGE_SHIFT;
     vsize = vma->vm_end - vma->vm_start;
     if (off >= hw->frame_size ||
         (u64)off + (u64)vsize > (u64)hw->frame_size) {
-        pr_err("mmap(): off 0x%lx + vsize 0x%lx 超出收帧缓冲 0x%zx。\n",
-               off, vsize, hw->frame_size);
+        pr_debug("mmap(): off 0x%lx + vsize 0x%lx 超出收帧缓冲 0x%zx。\n",
+                 off, vsize, hw->frame_size);
         rv = -EINVAL;
         goto out_unlock;
     }
@@ -519,6 +620,13 @@ static long anlogic_pci_frame_fops_ioctl(struct file *filp, unsigned int cmd,
         return rv;
 
     hw = cdev->hw;
+    if (!hw)
+        return -EINVAL;
+
+    /* 等帧的最长 600 s 不能在这把锁下过，见 anlogic_pci_frame_wait_ioctl() */
+    if (cmd == ANLOGIC_IOCFRAMEWAIT)
+        return anlogic_pci_frame_wait_ioctl(cdev, (void __user *)arg);
+
     if (mutex_lock_interruptible(&hw->lock))
         return -ERESTARTSYS;
     if (atomic_read(&hw->removed)) {
