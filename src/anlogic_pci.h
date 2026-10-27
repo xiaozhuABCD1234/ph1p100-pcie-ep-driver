@@ -226,6 +226,9 @@ void anlogic_pci_ctrl_init(struct anlogic_pci_cdev *cdev);
 /* anlogic_pci_link.c（相机链路 / 推帧：探测时初始化、状态查询、重触发、地址复核/重设） */
 int anlogic_pci_link_arm(struct anlogic_pci_hw *hw);
 void anlogic_pci_link_disarm(struct anlogic_pci_hw *hw);
+/* BAR0 32 位访问器（带 0x40 MAGIC 门禁），link.c 与 rka1.c 共用。 */
+int anlogic_pci_link_read32(struct anlogic_pci_hw *hw, u32 off, u32 *val);
+int anlogic_pci_link_write32(struct anlogic_pci_hw *hw, u32 off, u32 val);
 
 /* T07: RKA1 safety extension (anlogic_pci_rka1.c) */
 int anlogic_pci_rka1_probe(struct anlogic_pci_hw *hw);

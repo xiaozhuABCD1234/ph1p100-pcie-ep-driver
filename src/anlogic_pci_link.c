@@ -83,7 +83,8 @@ static int anlogic_pci_link_magic_gate(struct anlogic_pci_hw *hw)
     return 0;
 }
 
-static int anlogic_pci_link_read32(struct anlogic_pci_hw *hw, u32 off, u32 *val)
+/* BAR0 访问器：link.c 与 rka1.c 共用（rka1.c 也要过 0x40 MAGIC 门禁）。 */
+int anlogic_pci_link_read32(struct anlogic_pci_hw *hw, u32 off, u32 *val)
 {
     void __iomem *bar0;
     int rv;
@@ -102,7 +103,7 @@ static int anlogic_pci_link_read32(struct anlogic_pci_hw *hw, u32 off, u32 *val)
     return 0;
 }
 
-static int anlogic_pci_link_write32(struct anlogic_pci_hw *hw, u32 off, u32 val)
+int anlogic_pci_link_write32(struct anlogic_pci_hw *hw, u32 off, u32 val)
 {
     void __iomem *bar0;
     int rv;
