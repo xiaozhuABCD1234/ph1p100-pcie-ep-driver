@@ -223,17 +223,17 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
 	 */
 	rv = anlogic_pci_frame_r10f_bytes(width, height, &derived_slot);
 	if (rv < 0) {
-		pr_err("%ux%u 无法推导 R10F 长度（%d）：width 必须是非零 4 的倍数，且帧长不超过 %u "
-		       "字节。\n",
+		pr_err("%ux%u 无法推导 R10F 长度（%d）：width 必须是非零 4 的倍数，\n"
+		       "且帧长不超过 %u 字节。\n",
 		       width, height, rv, ANLOGIC_FRAME_MAX_SLOT_BYTES);
 		return rv;
 	}
 	if (!slot_bytes) {
 		slot_bytes = derived_slot;
 	} else if (slot_bytes != derived_slot) {
-		pr_err("frame_slot_bytes=%u 与 %ux%u 的 R10F 传输长度 %u 不一致（留 0 "
-		       "让驱动推导）。\n",
-		       slot_bytes, derived_slot, width, height);
+		pr_err("frame_slot_bytes=%u 与 %ux%u 的 R10F 传输长度 %u 不一致，\n"
+		       "留 0 让驱动推导。\n",
+		       slot_bytes, width, height, derived_slot);
 		return -EINVAL;
 	}
 	if (slot_bytes > ANLOGIC_FRAME_MAX_SLOT_BYTES) {
@@ -269,10 +269,8 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
 	size = (size_t)stride * slots + PAGE_SIZE;
 
 	hw->frame_virt = dma_alloc_coherent(&hw->pdev->dev, size, &hw->frame_phys, GFP_KERNEL);
-	if (!hw->frame_virt) {
-		pr_err("dma_alloc_coherent(%zu 字节) 失败。\n", size);
+	if (!hw->frame_virt)
 		return -ENOMEM;
-	}
 	/* FPGA 侧按物理地址算 MWr 目标，页对齐是硬要求（DMA API 本来就保证） */
 	if (hw->frame_phys & (PAGE_SIZE - 1)) {
 		pr_err("物理地址 0x%llx 不是页对齐，放弃。\n", (unsigned long long)hw->frame_phys);
@@ -308,7 +306,7 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
 	mb->magic = ANLOGIC_FRAME_MAGIC;
 	dma_wmb();
 
-	pr_info("phys 0x%llx, size %zu = %u 槽 × 步长 %u + mailbox 页"
+	pr_info("phys 0x%llx, size %zu = %u 槽 × 步长 %u + mailbox 页\n"
 		"（%ux%u, R10F %u 字节/帧，mailbox 偏移 %zu）。\n",
 		(unsigned long long)hw->frame_phys, size, slots, stride, width, height, slot_bytes,
 		(size_t)stride * slots);

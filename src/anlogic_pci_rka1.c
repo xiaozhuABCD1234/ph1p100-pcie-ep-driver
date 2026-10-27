@@ -93,7 +93,8 @@ int anlogic_pci_rka1_probe(struct anlogic_pci_hw *hw)
 	if (rv < 0)
 		return rv;
 	if (magic != ANLOGIC_RKA1_EXT_MAGIC) {
-		pr_err("0x118 EXT_MAGIC=0x%08x != 0x%08x（旧映像或被复用寄存器）。"
+		pr_err("0x118 EXT_MAGIC=0x%08x != 0x%08x\n"
+		       "（旧映像或被复用寄存器）。\n"
 		       "本驱动不做旧行为回退，推帧路径关闭。\n",
 		       magic, ANLOGIC_RKA1_EXT_MAGIC);
 		hw->rka1_ext_ok = 0;
@@ -374,8 +375,8 @@ int anlogic_pci_rka1_arm_one_shot(struct anlogic_pci_hw *hw)
 		if (err == ANLOGIC_PUSH_ERR_ARM_REJ)
 			pr_debug("ARM 被拒（0xC8=%u E_ARM_REJ，通常是相机还没出第一帧）。", err);
 		else
-			pr_err("ARM 被 FPGA 拒绝（TX_STATUS.bit3=1，0xC8=%u）。"
-			       "检查 cap/session/dst/db 对齐与链路/MPS 状态。",
+			pr_err("ARM 被 FPGA 拒绝（TX_STATUS.bit3=1，0xC8=%u）。\n"
+			       "检查 cap/session/dst/db 对齐与链路/MPS 状态。\n",
 			       err);
 		return -EINVAL;
 	}
@@ -441,8 +442,8 @@ int anlogic_pci_rka1_ack_release(struct anlogic_pci_hw *hw, u32 seq, u32 session
 	}
 	elapsed_ms = ktime_ms_delta(ktime_get(), start);
 	rka1_read(hw, ANLOGIC_BAR_PUSH_ERR_OFF, &err);
-	pr_err("ACK 后 %lld ms 仍 held（TX_STATUS=0x%08x，0xC8=%u）——"
-	       "seq/session 与 held 值不匹配？\n",
+	pr_err("ACK 后 %lld ms 仍 held（TX_STATUS=0x%08x，0xC8=%u）\n"
+	       "—— seq/session 与 held 值不匹配？\n",
 	       elapsed_ms, st, err);
 	return -EAGAIN;
 }

@@ -28,7 +28,7 @@ static struct anlogic_pci_card *anlogic_pci_card_alloc(struct pci_dev *pdev)
 {
 	struct anlogic_pci_card *card;
 
-	card = kzalloc(sizeof(*card), GFP_KERNEL);
+	card = kzalloc_obj(*card, GFP_KERNEL);
 	if (!card)
 		return NULL;
 
@@ -236,6 +236,5 @@ module_init(anlogic_pci_init_module);
 module_exit(anlogic_pci_cleanup_module);
 
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_DESCRIPTION("Anlogic PH1P100 PCIe EP driver (RK3588 host side): "
-		   "BAR PIO, frame buffer, camera link, RKA1");
+MODULE_DESCRIPTION("Anlogic PH1P100 PCIe EP driver: BAR PIO, frame, camera, RKA1");
 MODULE_AUTHOR("anlogic");

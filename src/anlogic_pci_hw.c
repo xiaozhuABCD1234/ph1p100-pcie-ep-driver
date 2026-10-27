@@ -501,7 +501,7 @@ void *anlogic_pci_hw_open(const char *mod_name, struct pci_dev *pdev, int *user_
 
 	pr_info("%s device %s, 0x%p.\n", mod_name, dev_name(&pdev->dev), pdev);
 
-	hw = kzalloc(sizeof(*hw), GFP_KERNEL);
+	hw = kzalloc_obj(*hw, GFP_KERNEL);
 	if (!hw)
 		return NULL;
 

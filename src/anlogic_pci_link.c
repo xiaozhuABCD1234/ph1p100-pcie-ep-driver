@@ -222,10 +222,9 @@ static void anlogic_pci_link_print(const struct anlogic_pci_hw *hw, u32 cam_stat
 {
 	u32 lane = ANLOGIC_CAM_LANE_VALID(cam_stat);
 
-	pr_info(
-	    "状态：相机 %s（%s 路 lane_valid=0x%x、状态字 0x%08x）、"
-	    "推帧 %s、目标 0x%llx、门铃 0x%llx、DDR3 %s（状态字 0x%08x，已落 %u 帧）、"
-	    "已推 %u 帧。\n",
+	pr_info("状态：相机 %s（%s 路 lane_valid=0x%x、状态字 0x%08x）\n"
+		"推帧 %s、目标 0x%llx、门铃 0x%llx\n"
+		"DDR3 %s（状态字 0x%08x，已落 %u 帧）、已推 %u 帧。\n",
 	    lane ? "已锁" : "未锁", hw->link_cam_b ? "B" : "A", lane, cam_stat,
 	    armed ? "已初始化" : "**未初始化**", (unsigned long long)hw->link_push_dst,
 	    (unsigned long long)hw->link_push_db,
@@ -291,7 +290,7 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
 	 */
 	rv = anlogic_pci_rka1_probe(hw);
 	if (rv < 0) {
-		pr_err("FPGA 没有 RKA1 安全扩展（fail closed），推帧不授权；"
+		pr_err("FPGA 没有 RKA1 安全扩展（fail closed），推帧不授权；\n"
 		       "采集/DDR 诊断仍可用。\n");
 		return rv;
 	}
@@ -310,8 +309,8 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
 	}
 	if (tx_st & (ANLOGIC_RKA1_ST_ARMED | ANLOGIC_RKA1_ST_BUSY | ANLOGIC_RKA1_ST_HELD |
 		     ANLOGIC_RKA1_ST_DRAINING)) {
-		pr_info("FPGA 还停在 TX_STATUS=0x%08x（上一次没 ACK 就结束了），先 CANCEL 收回 "
-			"IDLE。\n",
+		pr_info("FPGA 还停在 TX_STATUS=0x%08x（上一次没 ACK 就结束了），\n"
+			"先 CANCEL 收回 IDLE。\n",
 			tx_st);
 		rv = anlogic_pci_rka1_cancel(hw);
 		if (rv < 0) {
@@ -437,7 +436,7 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
 			     ANLOGIC_LINK_ARM_RETRY_MS * 1000 + 2000);
 	}
 
-	pr_info("推帧目标 0x%llx、门铃 0x%llx（都在收帧缓冲 0x%llx 里），"
+	pr_info("推帧目标 0x%llx、门铃 0x%llx（都在收帧缓冲 0x%llx 里），\n"
 		"0x44 CTRL=0x%08x。\n",
 		(unsigned long long)dst, (unsigned long long)db, (unsigned long long)hw->frame_phys,
 		ctrl);
@@ -466,8 +465,8 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
 			    "上电初始化已经把它带起来了（lane_valid=0x%x、0x4C=%u），不重触发。\n",
 			    ANLOGIC_CAM_LANE_VALID(cam_stat), frame_cnt);
 		} else {
-			pr_info("等了 %u ms 相机仍没起来（lane_valid=0），翻转 CTRL[2] "
-				"重新初始化传感器。\n",
+			pr_info("等了 %u ms 相机仍没起来（lane_valid=0），\n"
+				"翻转 CTRL[2] 重新初始化传感器。\n",
 				waited);
 			rv = anlogic_pci_link_ctrl_update(hw, ANLOGIC_CTRL_ARM_BITS,
 							  ANLOGIC_CTRL_MCLK_SEL, &ctrl);
@@ -484,15 +483,14 @@ int anlogic_pci_link_arm(struct anlogic_pci_hw *hw)
 				pr_info("重触发后 %u ms 内四条 lane 全部对齐（lane_valid=0xf）。\n",
 					waited);
 			} else if (flowing) {
-				pr_info("重触发后 %u ms 内帧已经在出（0x4C=%u），"
+				pr_info("重触发后 %u ms 内帧已经在出（0x4C=%u），\n"
 					"lane_valid=0x%x（还没全对齐，链路仍在收尾）。\n",
 					waited, frame_cnt, ANLOGIC_CAM_LANE_VALID(cam_stat));
 			} else {
-				pr_warn(
-				    "重触发后等了 %u ms 相机仍未出帧（lane_valid=0x%x、"
-				    "状态字 0x%08x）—— 传感器/接线/供电侧的问题，不在这条通路上；"
-				    "可用 link_ctl retrig / status 复核。\n",
-				    waited, ANLOGIC_CAM_LANE_VALID(cam_stat), cam_stat);
+				pr_warn("重触发后等了 %u ms 相机仍未出帧（lane_valid=0x%x）\n"
+					"状态字 0x%08x —— 传感器/接线/供电侧的问题，\n"
+					"不在这条通路上；可用 link_ctl retrig / status 复核。\n",
+					waited, ANLOGIC_CAM_LANE_VALID(cam_stat), cam_stat);
 			}
 		}
 	}
@@ -911,7 +909,7 @@ long anlogic_pci_link_ioctl(struct anlogic_pci_cdev *cdev, unsigned int cmd, voi
 			pr_debug("ioctl: copy_to_user(推帧地址) 失败。\n");
 			return -EFAULT;
 		}
-		pr_debug("推帧目标复核 0x%08x%08x、门铃 0x%08x%08x，"
+		pr_debug("推帧目标复核 0x%08x%08x、门铃 0x%08x%08x，\n"
 			 "本次写了 0x%x，push_en=%u。\n",
 			 cfg.dst_hi, cfg.dst_lo, cfg.db_hi, cfg.db_lo, applied, cfg.push_en);
 	} break;
