@@ -305,6 +305,15 @@ long anlogic_pci_rka1_ioctl(struct anlogic_pci_hw *hw, unsigned long arg)
         rv = anlogic_pci_rka1_arm_one_shot(hw);
         break;
     case ANLOGIC_RKA1_OP_ACK:
+        /*
+         * ack_session == 0 = 「用驱动在 probe 里配置的那个会话」。会话号只存在于
+         * 内核（anlogic_pci_link_arm 里用 jiffies 生成），用户态无从得知；不给这条
+         * 退路的话，probe 时那次 ARM 推来的帧就永远 ACK 不掉，held 会卡住后续 ARM。
+         * 安全边界不变：RTL 仍按 held 槽里锁存的 (session, seq) 逐位比对，
+         * 传 0 只是让驱动补上自己那份，不会放宽匹配。
+         */
+        if (!rq.ack_session)
+            rq.ack_session = hw->rka1_session;
         rv = anlogic_pci_rka1_ack_release(hw, rq.ack_seq, rq.ack_session);
         break;
     case ANLOGIC_RKA1_OP_CANCEL:

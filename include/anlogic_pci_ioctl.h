@@ -428,7 +428,9 @@ struct anlogic_ioc_rka1 {
     unsigned int cap_bytes;     /* in  OP_CONFIGURE：主机分配容量（>= 帧 dma_bytes） */
     unsigned int session;       /* in  OP_CONFIGURE：非零会话号 */
     unsigned int ack_seq;       /* in  OP_ACK：门铃里收到的完成序号 */
-    unsigned int ack_session;   /* in  OP_ACK：对应的会话号 */
+    unsigned int ack_session;   /* in  OP_ACK：对应的会话号；0 = 用驱动探测时配置的会话
+                                 *    （驱动在 probe 里已经 CONFIGURE 并 ARM 过一次，
+                                 *     会话号不出内核，用户态给 0 才能对上 held 的槽） */
     unsigned int ext_magic;     /* out 0x118 读回（必须 == ANLOGIC_RKA1_EXT_MAGIC） */
     unsigned int ext_version;   /* out 0x11C 读回 */
     unsigned int tx_status;     /* out 0x114 读回 */
