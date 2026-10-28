@@ -420,8 +420,7 @@ def main():
     g.set_defaults(func=cmd_gen)
 
     s = sub.add_parser("selftest", help="复算合同验收向量 + 全部负例 + gen 可复现性")
-    s.add_argument("--run-dir", default=str(Path(__file__).resolve().parents[2] /
-                                            "docs/protocol/rka1-r10f-v1"))
+    s.add_argument("--run-dir", default=str(Path(__file__).resolve().parents[1]))
     s.add_argument("--json-out", default=None)
     s.set_defaults(func=cmd_selftest)
 

@@ -16,7 +16,7 @@
 //! `references/local-inputs/parallel/frame/frame_contract.py` + T11 写者 RTL
 //! (`fpga/csi2/pcie_integration/rtl/ep_side/ddr/cam_r10f_writer.v`) 逐字段一致的正式
 //! 布局（magic "R10F"、version 1.0、header_bytes 128、codec_id=0 …），并补齐
-//! reserved/flags/几何自洽检查；离线对照实现见 `tools/pcie_integration/r10f_strict.py`。
+//! reserved/flags/几何自洽检查；离线对照实现见 `docs/protocol/rka1-r10f-v1/tools/r10f_strict.py`。
 
 use std::ffi::c_void;
 

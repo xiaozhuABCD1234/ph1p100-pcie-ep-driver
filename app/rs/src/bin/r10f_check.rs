@@ -6,7 +6,7 @@
  * 的那段字节：128B 头 + packed 有效载荷 + 4KiB 对齐全 0 尾）。
  *   来源可以是：
  *     · FPGA 实收帧的槽内容 dump（`dd if=/dev/... skip=<槽偏移 + hdr_bytes> count=<dma_bytes>`）；
- *     · PC 侧生成/发布的样例（tools/pcie_integration/r10f_strict.py gen 的输出）。
+ *     · PC 侧生成/发布的样例（docs/protocol/rka1-r10f-v1/tools/r10f_strict.py gen 的输出）。
  *
  * 判据与 `app/rs/src/rka1.rs` 的 `r10f::parse`、Python 对照工具、合同验收向量
  * (`contract/acceptance-vectors.json`) 逐字段一致；任何一项不符 → 退出码 5、不打印 PASS。

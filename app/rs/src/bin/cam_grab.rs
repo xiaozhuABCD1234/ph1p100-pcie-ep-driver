@@ -7,7 +7,7 @@
  * 640×480 通路。当前 T07 RTL 把 CTRL[4] 保留（写 0/读 0），相机整帧走
  * DDR3 + one-shot 推帧；在当前位流上 -s cam 会因 bit4 回读 0 以 EX_DEV 退出。
  * 因此硬件抓帧默认直接拒绝（不碰 BAR），只有显式 --legacy 才走旧路径；
- * 当前收帧请用 frame_grab（R10F 解包）或 tools/r10f_view.py（PNG）。
+ * 当前收帧请用 frame_grab（R10F 解包 → PGM）。
  *
  * --------------------------------------------------------------------------
  * 一、寄存器语义（依据 fpga/rtl/ep_side/img/ep_bar_win.v 的读 mux :215-241）
@@ -788,7 +788,7 @@ fn run() -> i32 {
     if !legacy {
         eprintln!("!! cam_grab 的 640x480 PIO 抓帧是 T07 之前的 LEGACY 通路");
         eprintln!("   当前 RTL 的 CTRL[4] 已保留（读回 0），不会再有 fb[] 帧。");
-        eprintln!("   当前收帧请用 frame_grab（R10F）或 tools/r10f_view.py（PNG）；");
+        eprintln!("   当前收帧请用 frame_grab（R10F → PGM）；");
         eprintln!("   只有确认在老位流上调试才加 --legacy。");
         return EX_DEV;
     }

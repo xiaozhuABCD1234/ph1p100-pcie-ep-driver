@@ -15,21 +15,16 @@ modules.order
 # 用户态（Rust 工程 app/rs）构建目录
 /app/rs/target/
 
-# Python 离线工具（tools/、docs/protocol/ 下）的字节码缓存
+# Python 离线校验（docs/protocol/、handoff/ 下）的字节码缓存
 __pycache__/
 *.pyc
 
 *.zip
 
-# Local synchronization verification outputs
-/out-sync-20261027/
 
-# 双目参考流程（app/reference/stereo 下的 stereo75.py 等）的运行产物：
-# 图像、点云、标定/自检结果、运行日志都可重新生成，不入库；只提交代码与 README。
-/app/reference/stereo/**/out*/
-/app/reference/stereo/**/*.png
-/app/reference/stereo/**/*.jpg
-/app/reference/stereo/**/*.log
+# 一次性实验：脚本与产物都不入库，只保留目录说明
+/experiments/*
+!/experiments/README.md
 
 # 点云与标定文件是二进制产物，一律不入库
 *.ply

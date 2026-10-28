@@ -203,8 +203,8 @@ fn print_info(info: &IocFrame) {
 
 /// packed RAW10（MIPI CSI-2，4 像素/5 字节）→ 8bit 灰度预览。
 ///
-/// 字节序与 `app/reference/stereo/parallel/frame/frame_contract.py::unpack_raw10` /
-/// `tools/pcie_integration/r10f_strict.py` 一致：每组 `P0[9:2] P1[9:2] P2[9:2] P3[9:2]
+/// 字节序与 R10F 合同（`docs/protocol/rka1-r10f-v1/`）及
+/// `docs/protocol/rka1-r10f-v1/tools/r10f_strict.py` 一致：每组 `P0[9:2] P1[9:2] P2[9:2] P3[9:2]
 /// {P3[1:0],P2[1:0],P1[1:0],P0[1:0]}`。预览取每个 10bit 采样的**高 8 位**（`>> 2`，
 /// 截断不四舍五入；也就是每组前 4 个字节）。
 ///
@@ -523,7 +523,7 @@ fn run() -> i32 {
     }
 
     // ---- 6.5 按内容分派：R10F → 严格解析 + 解包预览；否则旧 8bit 直拷 ----
-    //   判据与 `tools/pcie_integration/r10f_strict.py` / contract/acceptance-vectors.json
+    //   判据与 `docs/protocol/rka1-r10f-v1/tools/r10f_strict.py` / contract/acceptance-vectors.json
     //   逐字段一致（magic/version/format/codec/几何三层长度/三 CRC/尾零/flags）。
     //   ⚠ R10F 的载荷是 packed RAW10（4px/5B），不是灰度像素：旧实现把它原样写进 PGM
     //   （图是错的）；现在解成 width*height 的 8bit 预览（每采样高 8 位）再写。
@@ -640,8 +640,8 @@ mod tests {
     use super::{r10f_gray8, raw10_to_gray8};
     use anlogic_pci_tools::rka1::r10f;
 
-    /// 4 个 10bit 样本 → 5 字节（与
-    /// `app/reference/stereo/parallel/frame/frame_contract.py::pack_raw10` 同字节序）
+    /// 4 个 10bit 样本 → 5 字节（与 R10F 合同及
+    /// `docs/protocol/rka1-r10f-v1/tools/r10f_strict.py` 的严格校验同字节序）
     fn pack_group(p: [u16; 4]) -> [u8; 5] {
         [
             (p[0] >> 2) as u8,
