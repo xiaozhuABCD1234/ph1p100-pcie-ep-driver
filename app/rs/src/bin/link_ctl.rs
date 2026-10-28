@@ -3,19 +3,19 @@
  * link_ctl —— 相机链路 / 推帧的查看与手动修补
  *
  * 驱动在探测时已经把「下 bit / 重启之后必须做的初始化」做完了（写 CTRL 使能位、
- * 填推帧目标与门铃地址、按需重触发传感器），这个工具是那三步的用户态出口：
+ * 填推帧目标与门铃地址、按需重触发传感器），这个工具是那几步的用户态出口：
  *   status  查链路与推帧状态（链路是否锁、DDR3 是否就绪、已推帧数、最近错误码、
  *           推帧目标/门铃地址的现值）；
  *   retrig  手动重新触发一次相机初始化（链路掉了之后恢复用）；
- *   push    复核推帧目标与门铃地址；给了地址就是重设。
+ *   push    复核推帧目标与门铃地址；给了地址就是重设；
+ *   arm     选 A/B 路并申请一个 one-shot 额度（写 CTRL 前做 bit1/bit2 门禁与回读复核）；
+ *   ack     匹配当前 HELD 的 push_done 并释放，然后把 CTRL 收回 0x21。
  *
- * 三条命令对应三条 ioctl（编号与结构体在 include/anlogic_pci_ioctl.h，本文件只按
- * 那份 ABI 声明一遍）。驱动侧任何一次寄存器读都先过 BAR0+0x40 的 MAGIC 门禁、
- * 读回 0xffffffff 立即熔断，本工具因此不需要自己再抄一套校验；它只用 ioctl，
- * 不 mmap BAR、也不碰任何寄存器（要单笔读写寄存器用 pci_bar）。
+ * 除 arm/ack 需要写 CTRL(0x44) 外，其余命令只读；寄存器访问仍走控制节点的
+ * single-dw ioctl，不 mmap BAR。驱动侧每次读都先过 BAR0+0x40 的 MAGIC 门禁。
  *
  * 用法：
- *   link_ctl [选项] [status|retrig|push]
+ *   link_ctl [选项] [status|retrig|push|arm|ack]
  *
  * 选项：
  *   -d <节点>      控制节点，默认 /dev/ANLOGIC-PCI0_control
@@ -40,14 +40,16 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use anlogic_pci_tools::getopt::{Getopt, LongOpt};
 use anlogic_pci_tools::ioctl::{
-    IocLinkRetrig, IocLinkStatus, IocPushCfg, ANLOGIC_CAM_LANE_ALL, ANLOGIC_CTRL_CAM_B,
-    ANLOGIC_CTRL_DDR_EN, ANLOGIC_CTRL_ENABLE, ANLOGIC_CTRL_MCLK_SEL, ANLOGIC_CTRL_PUSH_EN,
-    ANLOGIC_CTRL_PUSH_SRC, ANLOGIC_DDR_STATUS_ALIVE, ANLOGIC_DDR_STATUS_CAL_DONE,
-    ANLOGIC_IOCLINKRETRIG, ANLOGIC_IOCLINKSTATUS, ANLOGIC_IOCPUSHCFG, ANLOGIC_PUSH_CFG_SET_DB,
-    ANLOGIC_PUSH_CFG_SET_DST, ANLOGIC_PUSH_ERR_NAMES, ANLOGIC_PUSH_STATUS_BUSY,
-    ANLOGIC_PUSH_STATUS_DB_SENT, ANLOGIC_PUSH_STATUS_LAST_OK,
+    IocBar, IocLinkRetrig, IocLinkStatus, IocPushCfg, ANLOGIC_BAR_CTRL_OFF, ANLOGIC_CAM_LANE_ALL,
+    ANLOGIC_CTRL_CAM_B, ANLOGIC_CTRL_DDR_EN, ANLOGIC_CTRL_ENABLE, ANLOGIC_CTRL_MCLK_SEL,
+    ANLOGIC_CTRL_PUSH_EN, ANLOGIC_CTRL_PUSH_SRC, ANLOGIC_CTRL_TRIGGER, ANLOGIC_DDR_STATUS_ALIVE,
+    ANLOGIC_DDR_STATUS_CAL_DONE, ANLOGIC_IOCLINKRETRIG, ANLOGIC_IOCLINKSTATUS, ANLOGIC_IOCPUSHCFG,
+    ANLOGIC_IOCR, ANLOGIC_IOCW, ANLOGIC_PUSH_CFG_SET_DB, ANLOGIC_PUSH_CFG_SET_DST,
+    ANLOGIC_PUSH_ERR_NAMES, ANLOGIC_PUSH_STATUS_BUSY, ANLOGIC_PUSH_STATUS_DB_SENT,
+    ANLOGIC_PUSH_STATUS_LAST_OK,
 };
 use anlogic_pci_tools::parse::strtoul_base0;
+use anlogic_pci_tools::rka1::Rka1;
 use anlogic_pci_tools::sys;
 
 const DEF_DEV: &str = "/dev/ANLOGIC-PCI0_control";
@@ -62,7 +64,7 @@ const EX_NOT_ARMED: i32 = 4;
 const EX_PUSH_ERR: i32 = 5;
 
 const EXIT_HELP: &str =
-    "退出码：0 正常，1 用法，2 设备不可用，3 链路未锁，4 推帧未初始化，5 推帧报错/DDR 未就绪";
+    "退出码：0 正常，1 用法，2 设备不可用，3 链路未锁，4 推帧未初始化，5 推帧报错/DDR 未就绪或 arm/ack 失败";
 
 /// 一条 64 位地址按「低 32 位在前」拼回来（寄存器里就是 lo/hi 两个字）
 fn addr64(lo: u32, hi: u32) -> u64 {
@@ -81,7 +83,10 @@ fn bit(v: u32, mask: u32) -> u32 {
 fn num32(s: &str, what: &str) -> Result<u32, String> {
     match strtoul_base0(s) {
         Some(v) if v <= u32::MAX as u64 => Ok(v as u32),
-        _ => Err(format!("{} 需要 0..0xffffffff 的数值（收到 '{}'）", what, s)),
+        _ => Err(format!(
+            "{} 需要 0..0xffffffff 的数值（收到 '{}'）",
+            what, s
+        )),
     }
 }
 
@@ -98,8 +103,170 @@ fn link_status(fd: RawFd) -> Result<IocLinkStatus, std::io::Error> {
     Ok(st)
 }
 
+const CTRL_IDLE: u32 = ANLOGIC_CTRL_ENABLE | ANLOGIC_CTRL_DDR_EN;
+const CTRL_WRITE_MASK: u32 = ANLOGIC_CTRL_ENABLE
+    | ANLOGIC_CTRL_TRIGGER
+    | ANLOGIC_CTRL_MCLK_SEL
+    | ANLOGIC_CTRL_CAM_B
+    | ANLOGIC_CTRL_DDR_EN
+    | ANLOGIC_CTRL_PUSH_EN
+    | ANLOGIC_CTRL_PUSH_SRC;
+
+fn rka_err(e: (i32, String)) -> String {
+    e.1
+}
+
+fn ctrl_read(fd: RawFd) -> Result<u32, String> {
+    let mut bar = IocBar {
+        bar_id: 0,
+        bar_type: 0,
+        bar_offaddr: ANLOGIC_BAR_CTRL_OFF,
+        wdata: 0,
+        rdata: 0,
+    };
+    // SAFETY: bar 就是 ANLOGIC_IOCR 对应的结构体
+    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCR, &mut bar as *mut IocBar as *mut c_void) }
+        .map_err(|e| format!("ANLOGIC_IOCR(CTRL) 失败：{}", sys::errno_str(&e)))?;
+    Ok(bar.rdata)
+}
+
+fn ctrl_write_raw(fd: RawFd, val: u32) -> Result<(), String> {
+    let mut bar = IocBar {
+        bar_id: 0,
+        bar_type: 0,
+        bar_offaddr: ANLOGIC_BAR_CTRL_OFF,
+        wdata: val,
+        rdata: 0,
+    };
+    // SAFETY: bar 就是 ANLOGIC_IOCW 对应的结构体
+    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCW, &mut bar as *mut IocBar as *mut c_void) }
+        .map_err(|e| format!("ANLOGIC_IOCW(CTRL) 失败：{}", sys::errno_str(&e)))?;
+    Ok(())
+}
+
+/// 写 CTRL 的唯一入口：bit1 必须为 0、bit2 电平不许变，写后整字回读复核。
+fn safe_ctrl_set(fd: RawFd, target: u32) -> Result<u32, String> {
+    let cur = ctrl_read(fd)?;
+    if cur & ANLOGIC_CTRL_MCLK_SEL != 0 {
+        return Err(format!(
+            "CTRL=0x{:08x} 的 bit2=1（重触发已锁存）：不要再写 CTRL，先重下位流+重启 RK3588",
+            cur
+        ));
+    }
+    if cur & ANLOGIC_CTRL_TRIGGER != 0 {
+        return Err(format!(
+            "CTRL=0x{:08x} 的 bit1=1（单帧触发位）：拒绝继续",
+            cur
+        ));
+    }
+    ctrl_write_raw(fd, target)?;
+    let rb = ctrl_read(fd)?;
+    if (rb ^ target) & CTRL_WRITE_MASK != 0 {
+        return Err(format!(
+            "CTRL 回读不符：写 0x{:08x} 读到 0x{:08x}（mask 0x{:08x}）",
+            target, rb, CTRL_WRITE_MASK
+        ));
+    }
+    if (rb ^ cur) & ANLOGIC_CTRL_MCLK_SEL != 0 {
+        return Err(format!(
+            "CTRL[2] 在写入后变了（0x{:08x} -> 0x{:08x}）：立即停手",
+            cur, rb
+        ));
+    }
+    Ok(rb)
+}
+
+/// 收掉 probe / 上一次抓帧留下的 HELD；HELD 优先 ACK(0xC0)，失败再 CANCEL。
+fn drain_held(rka: &Rka1) -> Result<(), String> {
+    let st = rka.probe().map_err(rka_err)?;
+    if st.held == 0 && st.busy == 0 && st.armed == 0 {
+        return Ok(());
+    }
+    if st.held != 0 && st.push_done != 0 {
+        let _ = rka.ack(st.push_done, 0);
+    }
+    let st2 = rka.probe().map_err(rka_err)?;
+    if st2.held != 0 || st2.busy != 0 || st2.armed != 0 {
+        rka.cancel().map_err(rka_err)?;
+    }
+    Ok(())
+}
+
+fn do_arm(fd: RawFd, route_b: bool) -> Result<(), String> {
+    let rka = Rka1::new(fd);
+    rka.probe().map_err(rka_err)?;
+    drain_held(&rka)?;
+
+    let target = CTRL_IDLE | ANLOGIC_CTRL_PUSH_EN | if route_b { ANLOGIC_CTRL_CAM_B } else { 0 };
+    let rb = safe_ctrl_set(fd, target)?;
+    println!(
+        "CTRL <- 0x{:08x}（{} 路、push_en=1、bit2=0）",
+        rb,
+        if route_b { "B" } else { "A" }
+    );
+
+    let rq = match rka.arm() {
+        Ok(rq) => rq,
+        Err(e) => {
+            let _ = safe_ctrl_set(fd, CTRL_IDLE);
+            return Err(format!("ARM 失败：{}", e.1));
+        }
+    };
+    println!(
+        "ARM ok：TX_STATUS=0x{:08x} armed={} held={} 0xC0={} 0xC8=0x{:x}",
+        rq.tx_status, rq.armed, rq.held, rq.push_done, rq.push_err
+    );
+    println!("下一步：frame_grab -n -o 帧.pgm 取帧，取完执行 link_ctl ack");
+    Ok(())
+}
+
+fn do_ack(fd: RawFd) -> Result<(), String> {
+    let rka = Rka1::new(fd);
+    let st = rka.probe().map_err(rka_err)?;
+    let mut released = false;
+    if st.held != 0 {
+        if st.push_done != 0 {
+            match rka.ack(st.push_done, 0) {
+                Ok(_) => released = true,
+                Err(e) => {
+                    eprintln!("!! ACK {} 失败：{}；改 CANCEL", st.push_done, e.1);
+                    let _ = rka.cancel();
+                }
+            }
+        } else {
+            let _ = rka.cancel();
+        }
+    } else if st.busy != 0 || st.armed != 0 {
+        let _ = rka.cancel();
+    }
+    let rb = safe_ctrl_set(fd, CTRL_IDLE)?;
+    let after = rka.probe().map_err(rka_err)?;
+    if after.held != 0 {
+        return Err(format!(
+            "ACK 后仍 HELD（TX_STATUS=0x{:08x}，0xC0={}，0xC8=0x{:x}）",
+            after.tx_status, after.push_done, after.push_err
+        ));
+    }
+    println!(
+        "{}；CTRL <- 0x{:08x}；TX_STATUS=0x{:08x} held=0 0xC0={}",
+        if released {
+            format!("ACK {} ok", st.push_done)
+        } else {
+            "当前没有 HELD，无需 ACK".to_string()
+        },
+        rb,
+        after.tx_status,
+        after.push_done
+    );
+    Ok(())
+}
+
 fn print_status(st: &IocLinkStatus, quiet: bool) {
-    let cam = if st.ctrl & ANLOGIC_CTRL_CAM_B != 0 { "B" } else { "A" };
+    let cam = if st.ctrl & ANLOGIC_CTRL_CAM_B != 0 {
+        "B"
+    } else {
+        "A"
+    };
     println!(
         "链路    : 相机 {} 路（CTRL[8]）{}（lane_valid=0x{:x}，四条全对齐 = 0x{:x}）  状态字 0x{:08x}  0x4C 帧计数 {}",
         cam,
@@ -155,7 +322,10 @@ fn print_status(st: &IocLinkStatus, quiet: bool) {
             "DDR3 里已发布的那一帧"
         }
     );
-    println!("收帧缓冲: mailbox seq={} count={}（驱动按门铃补齐）", st.seq, st.count);
+    println!(
+        "收帧缓冲: mailbox seq={} count={}（驱动按门铃补齐）",
+        st.seq, st.count
+    );
     if !quiet {
         println!(
             "CTRL    : 0x{:08x}（使能={} 触发={} 重触发电平={} 推帧取B路={} DDR搬运={} 推帧={} 推帧源={}）",
@@ -205,7 +375,13 @@ fn push_cfg(
         cfg.db_hi = hi;
     }
     // SAFETY: cfg 就是 ANLOGIC_IOCPUSHCFG 对应的结构体
-    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCPUSHCFG, &mut cfg as *mut IocPushCfg as *mut c_void) }?;
+    unsafe {
+        sys::ioctl_ptr(
+            fd,
+            ANLOGIC_IOCPUSHCFG,
+            &mut cfg as *mut IocPushCfg as *mut c_void,
+        )
+    }?;
     Ok(cfg)
 }
 
@@ -224,7 +400,11 @@ fn print_push_cfg(cfg: &IocPushCfg) {
     );
     println!(
         "本次写入: {}（applied=0x{:x}）  推帧使能={}  推帧源={}  驱动初始化过={}",
-        if cfg.applied == 0 { "无（只复核）" } else { "已写并回读复核通过" },
+        if cfg.applied == 0 {
+            "无（只复核）"
+        } else {
+            "已写并回读复核通过"
+        },
         cfg.applied,
         cfg.push_en,
         cfg.push_src,
@@ -237,16 +417,19 @@ fn print_push_cfg(cfg: &IocPushCfg) {
 
 fn usage(prog: &str) {
     eprint!(
-        "用法: {} [选项] [status|retrig|push]\n\
+        "用法: {} [选项] [status|retrig|push|arm|ack]\n\
          \n\
-         查/改 PH1P100 的相机链路与推帧通路（都走驱动 ioctl，本工具不 mmap BAR）。\n\
+         查/改 PH1P100 的相机链路与推帧通路（除 arm/ack 写 CTRL 外只读；不 mmap BAR）。\n\
          \x20 status  查链路与推帧状态（默认）\n\
          \x20 retrig  手动重新触发一次相机初始化（链路掉了之后恢复用）\n\
          \x20 push    复核推帧目标/门铃地址；--dst/--db 必须与驱动分配的槽 0/门铃完全一致\n\
+         \x20 arm     选 A/B 路并申请一个 one-shot 额度（-r B 选 B 路）\n\
+         \x20 ack     释放当前 HELD（ACK 0xC0），并把 CTRL 收回 0x21\n\
          \n\
          选项:\n\
          \x20 -d <节点>     控制节点，默认 {}\n\
          \x20 -t <毫秒>     retrig 后最多等多久等锁定，默认 {}（0..{}，0 = 不等）\n\
+         \x20 -r <A|B>      arm 选路，默认 A\n\
          \x20 --dst-lo <v>  推帧目标低 32 位（= 驱动槽 0 数据起点）\n\
          \x20 --dst-hi <v>  推帧目标地址高 32 位\n\
          \x20 --db-lo <v>   门铃低 32 位（= mailbox.push_dbell）\n\
@@ -265,17 +448,54 @@ fn run() -> i32 {
         .collect();
 
     let longopts = [
-        LongOpt { name: "dev", has_arg: true, val: b'd' as u32 },
-        LongOpt { name: "timeout", has_arg: true, val: b't' as u32 },
-        LongOpt { name: "dst-lo", has_arg: true, val: 2 },
-        LongOpt { name: "dst-hi", has_arg: true, val: 3 },
-        LongOpt { name: "db-lo", has_arg: true, val: 4 },
-        LongOpt { name: "db-hi", has_arg: true, val: 5 },
-        LongOpt { name: "quiet", has_arg: false, val: b'q' as u32 },
-        LongOpt { name: "help", has_arg: false, val: b'h' as u32 },
+        LongOpt {
+            name: "dev",
+            has_arg: true,
+            val: b'd' as u32,
+        },
+        LongOpt {
+            name: "timeout",
+            has_arg: true,
+            val: b't' as u32,
+        },
+        LongOpt {
+            name: "dst-lo",
+            has_arg: true,
+            val: 2,
+        },
+        LongOpt {
+            name: "dst-hi",
+            has_arg: true,
+            val: 3,
+        },
+        LongOpt {
+            name: "db-lo",
+            has_arg: true,
+            val: 4,
+        },
+        LongOpt {
+            name: "db-hi",
+            has_arg: true,
+            val: 5,
+        },
+        LongOpt {
+            name: "route",
+            has_arg: true,
+            val: b'r' as u32,
+        },
+        LongOpt {
+            name: "quiet",
+            has_arg: false,
+            val: b'q' as u32,
+        },
+        LongOpt {
+            name: "help",
+            has_arg: false,
+            val: b'h' as u32,
+        },
     ];
 
-    let mut getopt = Getopt::new(&argv, "d:t:qh", &longopts);
+    let mut getopt = Getopt::new(&argv, "d:t:qhr:", &longopts);
 
     let mut dev_path = DEF_DEV.to_string();
     let mut wait_ms = DEF_WAIT_MS;
@@ -284,6 +504,7 @@ fn run() -> i32 {
     let mut dst_hi: Option<u32> = None;
     let mut db_lo: Option<u32> = None;
     let mut db_hi: Option<u32> = None;
+    let mut route = "A".to_string();
 
     while let Some(item) = getopt.next() {
         let (id, arg) = match item {
@@ -306,12 +527,24 @@ fn run() -> i32 {
                         wait_ms = v as u32;
                         Ok(())
                     }
-                    _ => Err(format!("--timeout 需要 0..{} 的毫秒数（收到 '{}'）", MAX_WAIT_MS, s)),
+                    _ => Err(format!(
+                        "--timeout 需要 0..{} 的毫秒数（收到 '{}'）",
+                        MAX_WAIT_MS, s
+                    )),
                 }
             }
             b'q' => {
                 quiet = true;
                 Ok(())
+            }
+            b'r' => {
+                let s = arg.unwrap_or_default();
+                if s.eq_ignore_ascii_case("A") || s.eq_ignore_ascii_case("B") {
+                    route = s.to_uppercase();
+                    Ok(())
+                } else {
+                    Err(format!("--route 只接受 A 或 B（收到 '{}'）", s))
+                }
             }
             b'h' => {
                 usage(&argv[0]);
@@ -349,8 +582,11 @@ fn run() -> i32 {
         usage(&argv[0]);
         return EX_USAGE;
     }
-    if cmd != "status" && cmd != "retrig" && cmd != "push" {
-        eprintln!("!! 不认识的动作 '{}'（只有 status / retrig / push）", cmd);
+    if cmd != "status" && cmd != "retrig" && cmd != "push" && cmd != "arm" && cmd != "ack" {
+        eprintln!(
+            "!! 不认识的动作 '{}'（只有 status / retrig / push / arm / ack）",
+            cmd
+        );
         usage(&argv[0]);
         return EX_USAGE;
     }
@@ -374,6 +610,28 @@ fn run() -> i32 {
         }
     };
     let fd = file.as_raw_fd();
+
+    if cmd == "arm" {
+        println!("=== ARM one-shot（{} 路）===", route);
+        return match do_arm(fd, route == "B") {
+            Ok(()) => EX_OK,
+            Err(msg) => {
+                eprintln!("!! {}", msg);
+                EX_PUSH_ERR
+            }
+        };
+    }
+
+    if cmd == "ack" {
+        println!("=== ACK / 释放 HELD ===");
+        return match do_ack(fd) {
+            Ok(()) => EX_OK,
+            Err(msg) => {
+                eprintln!("!! {}", msg);
+                EX_PUSH_ERR
+            }
+        };
+    }
 
     if cmd == "retrig" {
         let mut rt = IocLinkRetrig::default();
@@ -399,12 +657,20 @@ fn run() -> i32 {
         );
         println!(
             "  {} 路状态字 0x{:08x}，lane_valid=0x{:x}（四条全对齐 = 0x{:x}）、0x4C 帧计数 {}{}",
-            if rt.ctrl & ANLOGIC_CTRL_CAM_B != 0 { "B" } else { "A" },
+            if rt.ctrl & ANLOGIC_CTRL_CAM_B != 0 {
+                "B"
+            } else {
+                "A"
+            },
             rt.cam_stat,
             rt.lane_valid,
             ANLOGIC_CAM_LANE_ALL,
             rt.frame_cnt,
-            if rt.frames_flowing != 0 { "（相对开始等时变过 ⇒ 帧已经在出）" } else { "（没动）" }
+            if rt.frames_flowing != 0 {
+                "（相对开始等时变过 ⇒ 帧已经在出）"
+            } else {
+                "（没动）"
+            }
         );
         if rt.lane_valid == ANLOGIC_CAM_LANE_ALL {
             println!("  ⇒ 四条 lane 全部对齐，链路已锁");
@@ -428,8 +694,7 @@ fn run() -> i32 {
                  * 且 0x4C 帧计数相对 ioctl 返回时没有再增加，就说明这次
                  * 重触发没有把链路救回来，别用 0 骗脚本。
                  */
-                if st.lane_valid != ANLOGIC_CAM_LANE_ALL &&
-                    st.frame_cnt == rt.frame_cnt {
+                if st.lane_valid != ANLOGIC_CAM_LANE_ALL && st.frame_cnt == rt.frame_cnt {
                     eprintln!("!! 重触发后链路仍未锁，且 0x4C 帧计数没有再增加");
                     eprintln!("   （传感器/接线/供电/参考时钟侧；可再跑 retrig 或 status 复核）");
                     return EX_NO_LOCK;
