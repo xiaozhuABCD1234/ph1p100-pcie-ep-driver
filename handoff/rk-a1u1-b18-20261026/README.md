@@ -1,30 +1,44 @@
-# RK A1U1 历史真样例交接（2026-10-26）
+# A1U1 历史样例解码包（2026-10-26）
 
-目标：RK 可独立并行适配，配合 10/27 FPGA 功能闭环。旧真实收图/解码已通过，不重做旧驱动。本包仅依赖 Python 3 标准库，无需 FPGA。
+本包只用于离线复现一份 A1U1 文件样例，不连接 FPGA、不访问设备、不做 PCIe 收帧。
+解码器只依赖 Python 3 标准库。
 
-材料：`samples/b18_b_1080p.a1u1`、`reference/a1_ref.py`、`reference/a1_inflate_strict.py`、`decode_sample.py`、`expected.json`、`SHA256SUMS`。
+## 材料
 
-在本包目录执行，并记录耗时：
+| 文件 | 说明 |
+|---|---|
+| `samples/b18_b_1080p.a1u1` | 输入样例，2,594,750 B |
+| `decode_sample.py` | 文件输入解码入口 |
+| `reference/a1_ref.py`、`reference/a1_inflate_strict.py` | 两份独立解码参考 |
+| `expected.json` | 几何、CRC、SHA、来源信息 |
+| `provenance.json` | 样例抽取来源与偏移 |
+| `SHA256SUMS` | 包内文件校验和 |
+
+## 运行
+
+在本包目录执行：
 
 ```sh
 python3 -B decode_sample.py --input samples/b18_b_1080p.a1u1 --out-dir out
 ```
 
-脚本检查四项 CRC、严格 DEFLATE 和逆变换，输出 `out/frame.raw10`、`out/result.json`。参数：1920×1080，stride=2400，prep=1、pred=1（flags=3）。
+输出：
 
-| 文件 | 字节数 | SHA-256 |
-| --- | ---: | --- |
-| 输入 A1U1 | 2594750 | `2892b3fb66654aa68e4a10609e97bc8737c3b5fb86a9fc4d5cdffc4ae5349d05` |
-| 输出 RAW10 | 2592000 | `4f97a0d5ab9973b45d3e20fd56667deea50df857f2dd14496b5218abfc1ddfd7` |
+- `out/frame.raw10`：2,592,000 B，SHA-256
+  `4f97a0d5ab9973b45d3e20fd56667deea50df857f2dd14496b5218abfc1ddfd7`；
+- `out/result.json`：解码统计与校验结果。
 
-RK 按优先级完成：
+输入 SHA-256：
+`2892b3fb66654aa68e4a10609e97bc8737c3b5fb86a9fc4d5cdffc4ae5349d05`。
 
-1. 跑真样例，核对 SHA、结果和耗时。
-2. 给现有 RK 程序增加 A1U1 输入，保留旧 RAW/R10F 入口。
-3. 输出 RAW，可选生成预览；物理 Bayer 相位尚未验证，暂记未知。
-4. 对截断、CRC 错误、非法长度作基本拒绝。
-5. 新建 `results/rk-<date>-<name>/`，将成功版本、完整命令和结果回存主仓库，不放秘密或环境 dump。
+脚本会检查四项 CRC、严格 DEFLATE 和逆变换。参数：1920×1080、stride 2400、
+prep=1、pred=1（flags=3），44 B 头。
 
-A1U1 是当前 UART 导出封装，尚非冻结的 PCIe 承载；后续替换设备输入并补 camera/session/mode 元数据。样例由真抓包提取 44B 头和 zlib；source B 由 b18 候选及 status bit12 确认，头本身没有 A/B 字段。
+## 边界
 
-此样例使用 540 个 stored 回退块，无压缩收益，只用于历史样例复现；不证明 30fps、实际 PCIe 或双路同步，也不证明入口 packed 像素已正确对应 CSI。源像素正确性仍由 FPGA 集成修复。
+- 样例是历史 UART 抓取，不是冻结的 PCIe 承载；
+- A1U1 头没有相机字段；`source_camera=B` 来自 b18 候选与 sysstat bit12，
+  不是头部自带信息；
+- 540 个 stored 回退块，无压缩收益；
+- `sensor_pixel_oracle_verified=false`，物理 Bayer 相位未知；
+- 不证明 30 fps、实际 PCIe 收帧、双路同步或 CSI 像素正确性。
