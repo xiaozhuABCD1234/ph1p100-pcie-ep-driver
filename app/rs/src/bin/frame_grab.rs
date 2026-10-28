@@ -180,6 +180,16 @@ fn bar_rd(fd: RawFd, off: u32) -> Result<u32, String> {
         .map_err(|e| format!("读 BAR 0x{off:03x} 失败：{}", sys::errno_str(&e)))
 }
 
+/// 读 FPGA 的自由运行时间戳计数器（0x238/0x23C，clk_ddr 域）。
+/// 打开失败/寄存器不存在都返回 None —— 延迟是诊断信息，不能因为它让取帧失败。
+fn ts_now(ctrl_path: &str) -> Option<u64> {
+    let f = std::fs::OpenOptions::new().read(true).write(true).open(ctrl_path).ok()?;
+    let fd = f.as_raw_fd();
+    let lo = bar_rd(fd, 0x238).ok()? as u64;
+    let hi = bar_rd(fd, 0x23C).ok()? as u64;
+    Some(lo | (hi << 32))
+}
+
 fn wr64(lo_off: u32, hi_off: u32, v: u64, fd: RawFd) -> Result<(), String> {
     bar_wr(fd, lo_off, v as u32)?;
     bar_wr(fd, hi_off, (v >> 32) as u32)
@@ -774,6 +784,10 @@ fn run() -> i32 {
         wait.seq, wait.count, slot, hdr_seq, hdr_len, hdr_flags
     );
 
+    // 端到端延迟：在"刚发现新帧、还没开始搬"的这一刻读 FPGA 计数器，
+    // 之后和帧头里的 SOF 时间戳相减，就只扣掉主机侧搬运用时。
+    let ts_at_wait = ts_now(&ctrl_path);
+
     let mut rc = EX_OK;
     if hdr_seq != wait.seq {
         eprintln!(
@@ -860,6 +874,21 @@ fn run() -> i32 {
                 "  R10F 预览 : packed {}B → 8bit {}x{} = {}B（每采样取高 8 位 >>2）",
                 h.payload_bytes, h.width, h.height, preview.len()
             );
+            if h.timestamp_hz > 0 {
+                match ts_at_wait {
+                    Some(now) => {
+                        let ticks = now.wrapping_sub(h.sof_timestamp);
+                        let ms = ticks as f64 * 1000.0 / h.timestamp_hz as f64;
+                        println!(
+                            "  端到端延迟: {:.2} ms（SOF→发现新帧；计时器 {} Hz；4K 一帧读出约 33.3 ms 包含在内）",
+                            ms, h.timestamp_hz
+                        );
+                    }
+                    None => println!("  端到端延迟: 读不到 0x238/0x23C（控制节点不可用），跳过"),
+                }
+            } else {
+                println!("  端到端延迟: 该位流没有时间戳（R10F 头 16/17/18 字为 0）");
+            }
             gray = Cow::Owned(preview);
         }
         Ok(None) => {

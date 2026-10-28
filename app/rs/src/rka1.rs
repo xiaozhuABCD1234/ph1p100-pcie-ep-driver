@@ -213,6 +213,10 @@ pub mod r10f {
         pub raw_bytes: u32,
         pub payload_bytes: u32,
         pub block_count: u32,
+        /// FPGA 侧 SOF 到达时刻（clk_ddr 自由计数），0 = 该位流没打开时间戳
+        pub sof_timestamp: u64,
+        /// sof_timestamp 的计数频率（Hz），0 = 未知
+        pub timestamp_hz: u32,
         pub flags: u32,
         pub raw_crc32: u32,
         pub payload_crc32: u32,
@@ -293,6 +297,8 @@ pub mod r10f {
             raw_bytes: le32(hdr, 0x2C),
             payload_bytes: le32(hdr, 0x30),
             block_count: le32(hdr, 0x34),
+            sof_timestamp: (le32(hdr, 0x40) as u64) | ((le32(hdr, 0x44) as u64) << 32),
+            timestamp_hz: le32(hdr, 0x48),
             flags: le32(hdr, 0x4C),
             raw_crc32: le32(hdr, 0x50),
             payload_crc32: le32(hdr, 0x54),
