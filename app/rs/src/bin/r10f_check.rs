@@ -13,6 +13,7 @@
  *
  * 用法：
  *   r10f_check <文件> [--session 0x20261017] [--width 1920 --height 1080]
+ *   4K: r10f_check <文件> --width 3840 --height 2160
  * 退出码：0 校验通过；1 用法错；2 文件读不了；5 严格校验不过。
  */
 use std::io::Read;

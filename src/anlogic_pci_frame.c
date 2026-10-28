@@ -6,8 +6,10 @@
  * 本层只做「缓冲 + 接口」，真正的收帧等 FPGA 侧打通后再验：
  *
  *   1) 分配：dma_alloc_coherent 一块物理连续、页对齐的一致性内存，大小由
- *      module param 与几何推导（默认 1 槽 × 1920x1080 R10F = 2592768 字节）。
- *      每槽步长页对齐，推帧目标按 phys_addr + stride * n + hdr_bytes 算（= 像素区起点）。
+ *      module param 与几何推导（默认 2 槽 × 1920x1080 R10F = 2,592,768 字节/槽）。
+ *      推导公式：行字节 = width/4*5（packed RAW10），槽长 = align4k(128 + 行字节*height)，
+ *      每槽步长 = PAGE_ALIGN(hdr_bytes + 槽长)；推帧目标按
+ *      phys_addr + stride * n + hdr_bytes 算（= 像素区起点）。
  *   2) 接口：ANLOGIC_IOCFRAMEINFO 把物理地址、大小、几何与序号/计数报给用户态；
  *      ANLOGIC_IOCFRAMEWAIT 提供「帧就绪」轮询（序号 + 计数）。当前 RTL 的
  *      tl_int_msireq 恒 0，驱动默认 use_irq=0，只轮询邮箱；中断路径保留给
@@ -61,19 +63,29 @@ static unsigned int frame_height = ANLOGIC_FRAME_DEF_HEIGHT;
 module_param(frame_height, uint, 0444);
 MODULE_PARM_DESC(frame_height, "收帧缓冲的每帧高度（像素），默认 1080");
 
-/* 0 表示按 frame_width/frame_height 推导 R10F 传输长度：
- *   128B R10F 头 + (width/4*5)*height packed RAW10，再 4KiB 对齐。
- * 显式给出时必须与推导值完全一致，避免“声明的 4K”实际只分配了 1080p 的槽。
+/* 每行 packed RAW10 字节数：0 = 按 width/4*5 推导；非 0 时必须等于该值
+ * （R10F 合同要求 stride == width*5/4，不接受行尾 padding）。
+ * 注意这是**行 stride**，不是 ioctl 报的槽步长；槽步长由
+ * PAGE_ALIGN(hdr_bytes + slot_bytes) 推出，不能直接配。
+ */
+static unsigned int frame_stride;
+module_param(frame_stride, uint, 0444);
+MODULE_PARM_DESC(frame_stride, "每行 packed RAW10 字节数；0 = frame_width/4*5（4K 为 4800）");
+
+/* 0 表示按 frame_width/frame_height/frame_stride 推导 R10F 传输长度：
+ *   128B R10F 头 + 行字节*height packed RAW10，再 4KiB 对齐。
+ * 显式给出时只作交叉校验，必须与推导值完全一致，避免“声明的 4K”实际只分配了
+ * 1080p 的槽。
  */
 static unsigned int frame_slot_bytes;
 module_param(frame_slot_bytes, uint, 0444);
 MODULE_PARM_DESC(
 	frame_slot_bytes,
-	"一帧传输字节数，0 = 按 frame_width/frame_height 推导 R10F 长度（1920x1080 时为 2592768）");
+	"一帧传输字节数，0 = 按 frame_width/frame_height/frame_stride 推导（1080p 为 2592768，4K 为 10371072）");
 
 static unsigned int frame_slots = ANLOGIC_FRAME_DEF_SLOTS;
 module_param(frame_slots, uint, 0444);
-MODULE_PARM_DESC(frame_slots, "收帧缓冲的槽位数，只支持 1（推帧目标固定，多槽只有槽 0 会收到帧）");
+MODULE_PARM_DESC(frame_slots, "收帧缓冲的槽位数：1 = 单路，2 = A/B 双路（默认 2）");
 
 /*
  * mailbox 与槽头的字段偏移是 FPGA / 驱动 / 用户态三方共用的 ABI，偏移算错的话
@@ -111,7 +123,7 @@ static void anlogic_pci_frame_seq_read(struct anlogic_pci_hw *hw, u32 *seq, u32 
  *   ③ **最后**才更新 mailbox.seq —— 与头文件里给 FPGA 定的是同一个顺序：
  *      用户态看到序号变化时，槽头一定已经在内存里了（序号是最后一笔写）。
  * 推帧目标地址由驱动在探测时写好且不逐帧轮换，所以推来的帧都在同一个槽里；
- * frame_slots 默认 1，(done-1)%slots 恒为 0。
+ * frame_slots 默认 2；A 路固定槽 0，B 路固定槽 1。
  * 读门铃用 READ_ONCE + dma_rmb()：先看到门铃，再去看它标记的那一帧。
  */
 void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
@@ -124,6 +136,7 @@ void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
 	if (!mb || !hw->frame_slots || !hw->frame_stride)
 		return;
 
+	/* 双路时槽 0 固定给 A 路；B 路直接写槽 1，门铃/槽头由用户态双路工具处理。 */
 	done = READ_ONCE(mb->push_dbell);
 	dma_rmb();
 	if (!done || done == hw->frame_push_done)
@@ -139,7 +152,7 @@ void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
 		hw->frame_push_done = done - 1;
 	}
 
-	slot = (done - 1) % hw->frame_slots;
+	slot = 0; /* A 路固定槽 0；B 路不经过本函数 */
 	hdr = (struct anlogic_frame_slot_hdr *)((u8 *)hw->frame_virt +
 						(size_t)slot * hw->frame_stride);
 	WRITE_ONCE(hdr->seq, done);
@@ -158,17 +171,20 @@ void anlogic_pci_frame_push_sync(struct anlogic_pci_hw *hw)
 
 /*
  * 按几何推导 R10F 的传输长度（dma_bytes）：
- *   128B 头 + packed RAW10（4px/5B，stride=width/4*5）+ 4KiB 对齐尾。
- * width 必须是 4 的倍数；返回值已保证 4KiB 对齐。
+ *   128B 头 + packed RAW10（4px/5B，行字节 = width/4*5）+ 4KiB 对齐尾。
+ * width 必须是 4 的倍数；line_stride 非 0 时必须等于 width/4*5（R10F 合同
+ * 不接受行尾 padding）；返回值已保证 4KiB 对齐。
  */
 static int anlogic_pci_frame_r10f_bytes(unsigned int width, unsigned int height,
-					unsigned int *slot_bytes)
+					unsigned int line_stride, unsigned int *slot_bytes)
 {
 	u64 row_bytes, content;
 
-	if (!width || (width & 3u))
+	if (!width || !height || (width & 3u))
 		return -EINVAL;
 	row_bytes = (u64)(width / 4u) * 5u;
+	if (line_stride && (u64)line_stride != row_bytes)
+		return -EINVAL;
 	content = (u64)ANLOGIC_FRAME_R10F_HDR + row_bytes * (u64)height;
 	content = (content + 4095u) & ~4095ULL;
 	if (content > ANLOGIC_FRAME_MAX_SLOT_BYTES)
@@ -188,10 +204,12 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
 	struct anlogic_frame_mailbox *mb;
 	unsigned int width = frame_width;
 	unsigned int height = frame_height;
+	unsigned int line_stride = frame_stride;
 	unsigned int slot_bytes = frame_slot_bytes;
 	unsigned int slots = frame_slots;
 	unsigned int hdr_bytes = ANLOGIC_FRAME_HDR_BYTES;
 	unsigned int derived_slot = 0;
+	unsigned int row_bytes;
 	unsigned int stride;
 	size_t size;
 	int rv;
@@ -217,17 +235,19 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
 		return -EINVAL;
 	}
 	/*
-	 * T07：槽长不再用固定的 1080p 常量。先按几何算出 R10F 传输长度，
-	 * 再校验 module param；否则 4K 会只分配 2592768 字节，FPGA 推 10371072
-	 * 字节时直接越过槽区/邮箱页。
+	 * 槽长不再用固定的 1080p 常量。先按几何（width/height/行 stride）算出
+	 * R10F 传输长度，再校验 module param；否则 4K 会只分配 2592768 字节，
+	 * FPGA 推 10371072 字节时直接越过槽区/邮箱页。
 	 */
-	rv = anlogic_pci_frame_r10f_bytes(width, height, &derived_slot);
+	rv = anlogic_pci_frame_r10f_bytes(width, height, line_stride, &derived_slot);
 	if (rv < 0) {
-		pr_err("%ux%u 无法推导 R10F 长度（%d）：width 必须是非零 4 的倍数，\n"
+		pr_err("%ux%u（frame_stride=%u）无法推导 R10F 长度（%d）：width 必须是\n"
+		       "非零 4 的倍数，frame_stride 非 0 时必须等于 width*5/4（packed RAW10），\n"
 		       "且帧长不超过 %u 字节。\n",
-		       width, height, rv, ANLOGIC_FRAME_MAX_SLOT_BYTES);
+		       width, height, line_stride, rv, ANLOGIC_FRAME_MAX_SLOT_BYTES);
 		return rv;
 	}
+	row_bytes = line_stride ? line_stride : width / 4u * 5u;
 	if (!slot_bytes) {
 		slot_bytes = derived_slot;
 	} else if (slot_bytes != derived_slot) {
@@ -249,13 +269,8 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
 		pr_err("frame_slots=%u 超出范围（上限 %u）。\n", slots, ANLOGIC_FRAME_MAX_SLOTS);
 		return -EINVAL;
 	}
-	if (slots != 1) {
-		/*
-		 * One-shot safety slot: the FPGA pusher writes every frame to the same
-		 * address, so >1 slot would only ever be filled in slot 0.  Refuse
-		 * instead of pretending a ring exists.
-		 */
-		pr_err("frame_slots=%u 不支持（只支持单槽）。\n", slots);
+	if (slots > 2) {
+		pr_err("frame_slots=%u 不支持（只支持 1 或 2）。\n", slots);
 		return -EINVAL;
 	}
 
@@ -307,9 +322,9 @@ int anlogic_pci_frame_alloc(struct anlogic_pci_hw *hw)
 	dma_wmb();
 
 	pr_info("phys 0x%llx, size %zu = %u 槽 × 步长 %u + mailbox 页\n"
-		"（%ux%u, R10F %u 字节/帧，mailbox 偏移 %zu）。\n",
-		(unsigned long long)hw->frame_phys, size, slots, stride, width, height, slot_bytes,
-		(size_t)stride * slots);
+		"（%ux%u, 行 stride %u, R10F %u 字节/帧，mailbox 偏移 %zu）。\n",
+		(unsigned long long)hw->frame_phys, size, slots, stride, width, height, row_bytes,
+		slot_bytes, (size_t)stride * slots);
 
 	return 0;
 }
@@ -382,7 +397,8 @@ static int anlogic_pci_frame_poll(struct anlogic_pci_hw *hw, u32 *seq, u32 *coun
 
 	anlogic_pci_frame_push_sync(hw);
 	anlogic_pci_frame_seq_read(hw, seq, count);
-	*slot = *seq ? (*seq - 1) % hw->frame_slots : 0;
+	/* A 路固定槽 0；B 路由双路工具直接读槽 1（不经过 wait ioctl）。 */
+	*slot = 0;
 	rv = 0;
 
 out_unlock:

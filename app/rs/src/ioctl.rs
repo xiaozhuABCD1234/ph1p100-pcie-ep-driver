@@ -106,8 +106,10 @@ pub struct FrameMailbox {
     pub stride: u32,
     pub width: u32,
     pub height: u32,
+    /// A 路推帧门铃；B 路门铃紧跟在 +36（见 header 的 push_dbell_b）。
     pub push_dbell: u32,
-    pub reserved: [u32; 7],
+    pub push_dbell_b: u32,
+    pub reserved: [u32; 6],
 }
 
 /// `struct anlogic_frame_slot_hdr`（16 字节）
@@ -324,6 +326,7 @@ const _: () = {
     assert!(std::mem::offset_of!(FrameMailbox, count) == 8);
     assert!(std::mem::offset_of!(FrameMailbox, stride) == 20);
     assert!(std::mem::offset_of!(FrameMailbox, push_dbell) == 32);
+    assert!(std::mem::offset_of!(FrameMailbox, push_dbell_b) == 36);
     assert!(std::mem::offset_of!(FrameSlotHdr, len) == 4);
     assert!(std::mem::offset_of!(FrameSlotHdr, flags) == 8);
     assert!(std::mem::offset_of!(IocFrame, phys_addr) == 0);

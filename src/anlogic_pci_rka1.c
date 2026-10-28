@@ -148,13 +148,17 @@ int anlogic_pci_rka1_configure(struct anlogic_pci_hw *hw, u32 cap_bytes, u32 ses
 		return -EINVAL;
 	/*
 	 * 容量下限用当前收帧缓冲的实际槽长，而不是 1080p 的固定常量：
-	 * 4K R10F 槽（10371072）和 640x480 槽（385024）都必须能通过，同时
-	 * 不能授权超过已分配缓冲的容量。
+	 * 4K R10F 槽（10,371,072）和 640x480 槽（385,024）都必须能通过，同时
+	 * 不能授权超过已分配缓冲的容量。frame_slot_bytes=0 说明分配还没完成，
+	 * 直接拒绝，绝不回退到某个固定几何。
 	 */
 	{
-		u32 min_bytes =
-		    hw->frame_slot_bytes ? hw->frame_slot_bytes : ANLOGIC_FRAME_DMA_BYTES;
+		u32 min_bytes = hw->frame_slot_bytes;
 
+		if (!min_bytes) {
+			pr_err("收帧缓冲槽长未知（frame_slot_bytes=0），拒绝配置授权。\n");
+			return -ENODEV;
+		}
 		if (cap_bytes < min_bytes) {
 			pr_err("授权容量 %u 小于一帧传输长度 %u，拒绝配置。\n", cap_bytes,
 			       min_bytes);

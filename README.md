@@ -15,9 +15,10 @@
 | BAR0 | 1 MiB，+0x40 读回 `0x50434946` |
 | 收帧 | 1920×1080 R10F，2,592,768 B/帧，三层 CRC 通过 |
 | 取帧 | `frame_grab` 输出 1920×1080 PGM，2,073,600 B 像素数据 |
-| ARM/ACK | `link_ctl arm -r A` → 推帧 → `link_ctl ack` 完整通过 |
+| ARM/ACK | `link_ctl arm -r A/B` → 推帧 → `link_ctl ack` 完整通过 |
+| 硬件同步 | `link_ctl sync start` 后 9 对锁定，skew 2~3 tick，abort/restart 通过 |
 
-未在本轮验证：B 路实收、4K 几何、MSI 中断、100 帧/10 min 长稳。
+双路已实现：`frame_grab --pair`、两槽、`ARM_PAIR/ACK_PAIR`；未在本轮验证：4K 几何、MSI 中断、故障注入。
 
 ## 目录
 
@@ -65,8 +66,28 @@ ls /dev/ANLOGIC-PCI0_*
 模块参数：
 
 - `frame_width` / `frame_height`：默认 1920×1080；
-- `frame_slot_bytes`：0 = 按几何推导 R10F 长度；
-- `frame_slots`：只支持 1，推帧目标固定为槽 0。
+- `frame_stride`：每行 packed RAW10 字节数，0 = `frame_width/4*5`；非 0 时必须等于该值
+  （R10F 合同不接受行尾 padding）。1080p 为 2400，4K 为 4800；
+- `frame_slot_bytes`：0 = 按 `frame_width/frame_height/frame_stride` 推导 R10F 传输长度；
+  非 0 只作交叉校验，必须与推导值一致；
+- `frame_slots`：1 或 2，默认 2；槽 0=A，槽 1=B。A 路仍由驱动补槽头/mailbox，B 路由双路工具直接读。
+
+### 1080p 双路（已验）
+
+```sh
+insmod ./anlogic_pci.ko
+# 等价于 frame_width=1920 frame_height=1080 frame_stride=0 frame_slots=2
+```
+
+### 4K 单路（几何/分配已实现，未在板实收）
+
+```sh
+insmod ./anlogic_pci.ko frame_width=3840 frame_height=2160
+# 可显式写全：frame_width=3840 frame_height=2160 frame_stride=4800 frame_slots=2
+```
+
+4K 推导：行 4800B，payload 10,368,000B，R10F 槽长 10,371,072B（2532×4KiB），
+槽步长 10,375,168B（4KiB 页），两槽 + mailbox 页共 20,754,432B。
 
 ## 使用
 
@@ -89,6 +110,11 @@ ls /dev/ANLOGIC-PCI0_*
 # 释放 HELD，CTRL 收回 0x21
 ./link_ctl ack
 
+# 硬件同步（A 主/B 从）：状态 / 启动 / 中止
+./link_ctl sync status
+./link_ctl sync start -t 5000
+./link_ctl sync abort -t 5000
+
 # 对一份 R10F 文件做严格校验
 ./r10f_check frame.dma
 ```
@@ -99,8 +125,9 @@ ls /dev/ANLOGIC-PCI0_*
 
 驱动在 probe 时用 `dma_alloc_coherent` 分配一块一致性内存：
 
-- 每帧 R10F 传输长度：2,592,768 B = 128 B 头 + 2,592,000 B packed RAW10 + 640 B 尾零；
-- 槽步长：2,596,864 B（4 KiB 对齐）；
+- 每帧 R10F 传输长度：align4k(128 B 头 + packed RAW10)。1080p = 2,592,768 B
+  （128 + 2,592,000 + 640 尾零）；4K = 10,371,072 B（128 + 10,368,000 + 2,944 尾零）；
+- 槽步长：PAGE_ALIGN(128 + 每帧传输长度)。1080p = 2,596,864 B；4K（4KiB 页）= 10,375,168 B；
 - 槽内数据偏移：128 B；
 - 缓冲末尾一页是 mailbox，位置由 ioctl 报出的 `mb_off` 决定，不要按常量猜；
 - FPGA 的 MWr 目标是槽 0 数据起点，门铃写 mailbox 的 `push_dbell`。

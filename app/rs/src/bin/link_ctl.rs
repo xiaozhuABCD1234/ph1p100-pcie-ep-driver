@@ -15,7 +15,7 @@
  * single-dw ioctl，不 mmap BAR。驱动侧每次读都先过 BAR0+0x40 的 MAGIC 门禁。
  *
  * 用法：
- *   link_ctl [选项] [status|retrig|push|arm|ack]
+ *   link_ctl [选项] [status|retrig|push|arm|ack|sync [start|abort|status]]
  *
  * 选项：
  *   -d <节点>      控制节点，默认 /dev/ANLOGIC-PCI0_control
@@ -130,6 +130,98 @@ fn ctrl_read(fd: RawFd) -> Result<u32, String> {
     Ok(bar.rdata)
 }
 
+fn bar_read(fd: RawFd, off: u32) -> Result<u32, String> {
+    let mut bar = IocBar {
+        bar_id: 0,
+        bar_type: 0,
+        bar_offaddr: off,
+        wdata: 0,
+        rdata: 0,
+    };
+    // SAFETY: bar 就是 ANLOGIC_IOCR 对应的结构体
+    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCR, &mut bar as *mut IocBar as *mut c_void) }
+        .map_err(|e| format!("ANLOGIC_IOCR(0x{:x}) 失败：{}", off, sys::errno_str(&e)))?;
+    Ok(bar.rdata)
+}
+
+fn bar_write(fd: RawFd, off: u32, val: u32) -> Result<(), String> {
+    let mut bar = IocBar {
+        bar_id: 0,
+        bar_type: 0,
+        bar_offaddr: off,
+        wdata: val,
+        rdata: 0,
+    };
+    // SAFETY: bar 就是 ANLOGIC_IOCW 对应的结构体
+    unsafe { sys::ioctl_ptr(fd, ANLOGIC_IOCW, &mut bar as *mut IocBar as *mut c_void) }
+        .map_err(|e| format!("ANLOGIC_IOCW(0x{:x}) 失败：{}", off, sys::errno_str(&e)))?;
+    Ok(())
+}
+
+fn sync_status(fd: RawFd) -> Result<(), String> {
+    let st = bar_read(fd, 0x1e4)?;
+    let skew = bar_read(fd, 0x1e8)? as i32;
+    let pairs = bar_read(fd, 0x1ec)?;
+    let warmup = bar_read(fd, 0x1f0)?;
+    let timestamp = bar_read(fd, 0x1f4)?;
+    let miss_a = bar_read(fd, 0x1f8)?;
+    let miss_b = bar_read(fd, 0x1fc)?;
+    let overrun = bar_read(fd, 0x200)?;
+    let relock = bar_read(fd, 0x204)?;
+    let seq_a = bar_read(fd, 0x208)?;
+    let seq_b = bar_read(fd, 0x20c)?;
+    println!("=== 硬件同步曝光状态 ===");
+    println!(
+        "  ready={} locked={} busy={} stopped={} pair_valid={} error={}",
+        bit(st, 1 << 0),
+        bit(st, 1 << 2),
+        bit(st, 1 << 3),
+        bit(st, 1 << 4),
+        bit(st, 1 << 5),
+        (st >> 8) & 0xf
+    );
+    println!(
+        "  warmup={} pair_count={} skew={} tick={}",
+        warmup, pairs, skew, timestamp
+    );
+    println!(
+        "  pair_seq A/B={}/{} miss A/B={}/{} overrun A/B={}/{} relock={}",
+        seq_a,
+        seq_b,
+        miss_a,
+        miss_b,
+        overrun & 0xffff,
+        overrun >> 16,
+        relock
+    );
+    Ok(())
+}
+
+fn sync_cmd(fd: RawFd, start: bool, wait_ms: u32) -> Result<(), String> {
+    bar_write(fd, 0x1e0, if start { 1 } else { 2 })?;
+    println!("=== SYNC {} ===", if start { "START" } else { "ABORT" });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms as u64);
+    loop {
+        let st = bar_read(fd, 0x1e4)?;
+        let ready = bit(st, 1 << 0) != 0;
+        let locked = bit(st, 1 << 2) != 0;
+        let busy = bit(st, 1 << 3) != 0;
+        if start && ready && locked {
+            println!("  ⇒ pair 已锁定");
+            return sync_status(fd);
+        }
+        if !start && !busy {
+            println!("  ⇒ 已停止/清理");
+            return sync_status(fd);
+        }
+        if std::time::Instant::now() >= deadline {
+            println!("  超时：ready={} locked={} busy={}", ready, locked, busy);
+            return sync_status(fd);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 fn ctrl_write_raw(fd: RawFd, val: u32) -> Result<(), String> {
     let mut bar = IocBar {
         bar_id: 0,
@@ -204,6 +296,10 @@ fn do_arm(fd: RawFd, route_b: bool) -> Result<(), String> {
         rb,
         if route_b { "B" } else { "A" }
     );
+
+    // probe 早于相机首帧时 link_armed 会停在 0；这里只复核地址并让驱动
+    // 重新置位，不改变任何寄存器值。
+    push_cfg(fd, None, None).map_err(|e| format!("复核推帧地址失败：{}", e))?;
 
     let rq = match rka.arm() {
         Ok(rq) => rq,
@@ -295,16 +391,31 @@ fn print_status(st: &IocLinkStatus, quiet: bool) {
         st.ddr_base,
         st.ddr_len
     );
+    // TLP 数由帧长推导：RTL 每笔 MWr 128B。1080p = 20,256，4K = 81,024。
+    // 0xAC 是 FPGA 发布的每帧字节数；这里不写死任何几何。
+    let expect_tlp = if st.ddr_len != 0 && st.ddr_len % 128 == 0 {
+        st.ddr_len / 128
+    } else {
+        0
+    };
     println!(
-        "推帧    : {}  0xC0 已推 {} 帧，最近一帧 {} 笔 MWr，0xC4=0x{:08x}（busy={} last_ok={} 门铃已发={}）",
+        "推帧    : {}  0xC0 已推 {} 帧，最近一帧 {} 笔 MWr（0xAC={}B / 128B = {}），0xC4=0x{:08x}（busy={} last_ok={} 门铃已发={}）",
         if st.push_en != 0 { "已初始化（CTRL bit6=1）" } else { "**未初始化**（CTRL bit6=0）" },
         st.pushed,
         st.push_tlp_cnt,
+        st.ddr_len,
+        expect_tlp,
         st.push_status,
         bit(st.push_status, ANLOGIC_PUSH_STATUS_BUSY),
         bit(st.push_status, ANLOGIC_PUSH_STATUS_LAST_OK),
         bit(st.push_status, ANLOGIC_PUSH_STATUS_DB_SENT)
     );
+    if st.pushed != 0 && expect_tlp != 0 && st.push_tlp_cnt != expect_tlp {
+        eprintln!(
+            "!! 最近一帧 {} 笔 MWr != 0xAC/128 = {}：检查 FPGA 的帧长与 128B MWr 约定",
+            st.push_tlp_cnt, expect_tlp
+        );
+    }
     println!(
         "推帧错误: {}（0xC8=0x{:08x} = {}）",
         if st.push_err == 0 { "无" } else { "**有**" },
@@ -417,7 +528,7 @@ fn print_push_cfg(cfg: &IocPushCfg) {
 
 fn usage(prog: &str) {
     eprint!(
-        "用法: {} [选项] [status|retrig|push|arm|ack]\n\
+        "用法: {} [选项] [status|retrig|push|arm|ack|sync [start|abort|status]]\n\
          \n\
          查/改 PH1P100 的相机链路与推帧通路（除 arm/ack 写 CTRL 外只读；不 mmap BAR）。\n\
          \x20 status  查链路与推帧状态（默认）\n\
@@ -425,6 +536,7 @@ fn usage(prog: &str) {
          \x20 push    复核推帧目标/门铃地址；--dst/--db 必须与驱动分配的槽 0/门铃完全一致\n\
          \x20 arm     选 A/B 路并申请一个 one-shot 额度（-r B 选 B 路）\n\
          \x20 ack     释放当前 HELD（ACK 0xC0），并把 CTRL 收回 0x21\n\
+         \x20 sync    硬件同步曝光：status（默认）/ start / abort（0x1E0..0x20C）\n\
          \n\
          选项:\n\
          \x20 -d <节点>     控制节点，默认 {}\n\
@@ -577,14 +689,15 @@ fn run() -> i32 {
 
     let positional: Vec<String> = getopt.positional();
     let cmd = positional.first().map(|s| s.as_str()).unwrap_or("status");
-    if positional.len() > 1 {
-        eprintln!("!! 多余的参数：'{}'", positional[1]);
+    let max_pos = if cmd == "sync" { 2 } else { 1 };
+    if positional.len() > max_pos {
+        eprintln!("!! 多余的参数：'{}'", positional[max_pos]);
         usage(&argv[0]);
         return EX_USAGE;
     }
-    if cmd != "status" && cmd != "retrig" && cmd != "push" && cmd != "arm" && cmd != "ack" {
+    if !matches!(cmd, "status" | "retrig" | "push" | "arm" | "ack" | "sync") {
         eprintln!(
-            "!! 不认识的动作 '{}'（只有 status / retrig / push / arm / ack）",
+            "!! 不认识的动作 '{}'（只有 status / retrig / push / arm / ack / sync）",
             cmd
         );
         usage(&argv[0]);
@@ -610,6 +723,27 @@ fn run() -> i32 {
         }
     };
     let fd = file.as_raw_fd();
+
+    if cmd == "sync" {
+        let action = positional.get(1).map(|s| s.as_str()).unwrap_or("status");
+        let res = match action {
+            "status" => sync_status(fd),
+            "start" => sync_cmd(fd, true, wait_ms),
+            "abort" => sync_cmd(fd, false, wait_ms),
+            _ => {
+                eprintln!("!! sync 只接受 status / start / abort（收到 '{}'）", action);
+                usage(&argv[0]);
+                return EX_USAGE;
+            }
+        };
+        return match res {
+            Ok(()) => EX_OK,
+            Err(msg) => {
+                eprintln!("!! {}", msg);
+                EX_DEV
+            }
+        };
+    }
 
     if cmd == "arm" {
         println!("=== ARM one-shot（{} 路）===", route);

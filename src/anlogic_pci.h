@@ -127,8 +127,8 @@ struct anlogic_pci_hw {
 	size_t frame_size;
 	struct anlogic_frame_mailbox *frame_mb; /* = frame_virt + stride*slots（槽区之后的页） */
 	unsigned int frame_mb_off; /* mailbox 在缓冲内的字节偏移（页对齐） */
-	unsigned int frame_stride; /* 槽位步长（页对齐） */
-	unsigned int frame_slot_bytes; /* 一帧像素字节数 */
+	unsigned int frame_stride; /* 槽位步长（页对齐）；不是 module param frame_stride（那是行 stride） */
+	unsigned int frame_slot_bytes; /* 一帧传输字节数（R10F 槽长，不是灰度像素数） */
 	unsigned int frame_hdr_bytes; /* 槽头字节数 */
 	unsigned int frame_slots; /* 槽位数 */
 	unsigned int frame_width;

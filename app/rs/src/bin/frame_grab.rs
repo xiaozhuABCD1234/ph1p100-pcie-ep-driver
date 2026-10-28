@@ -33,6 +33,7 @@
  *   6 输出文件或内存错误
  *
  * 用法：frame_grab [-d /dev/ANLOGIC-PCI0_frame] [-t 超时ms] [-n] [-o 输出.pgm] [--info]
+ *       frame_grab --pair [--ctrl /dev/ANLOGIC-PCI0_control] -o A.pgm --out-b B.pgm
  *       -o        输出 PGM 文件名（默认 dma_frame.pgm），也可以直接写成位置参数
  *       -n        只在出现比当前更新的帧时返回（默认：缓冲里已有帧就直接取最新一帧）
  *       --info    只打印缓冲的物理地址与几何，不取帧（空转自检用）
@@ -44,16 +45,49 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use anlogic_pci_tools::getopt::{Getopt, LongOpt};
 use anlogic_pci_tools::ioctl::{
-    FrameMailbox, FrameSlotHdr, IocFrame, IocFrameWait, ANLOGIC_FRAME_FLAG_COMPLETE,
+    FrameMailbox, FrameSlotHdr, IocBar, IocFrame, IocFrameWait, ANLOGIC_FRAME_FLAG_COMPLETE,
     ANLOGIC_FRAME_MAGIC, ANLOGIC_FRAME_MAX_WAIT_MS, ANLOGIC_IOCFRAMEINFO, ANLOGIC_IOCFRAMEWAIT,
+    ANLOGIC_IOCR, ANLOGIC_IOCW,
 };
 use anlogic_pci_tools::parse::strtoul_base0;
 use anlogic_pci_tools::rka1::r10f;
 use anlogic_pci_tools::sys::{self, Mmap, PROT_READ};
 
 const DEF_DEV: &str = "/dev/ANLOGIC-PCI0_frame";
+const DEF_CTRL: &str = "/dev/ANLOGIC-PCI0_control";
 const DEF_OUT: &str = "dma_frame.pgm";
+const DEF_OUT_B: &str = "dma_frame_b.pgm";
 const DEF_TIMEOUT_MS: u32 = 3000;
+
+/// BAR0 双路推帧寄存器（与驱动头文件、ep_bar_win.v 同步）
+const BAR_CTRL: u32 = 0x44;
+const BAR_TX_CAP: u32 = 0x100;
+const BAR_TX_SESSION: u32 = 0x104;
+const BAR_TX_CMD: u32 = 0x108;
+const BAR_TX_ACK_SEQ: u32 = 0x10C;
+const BAR_PUSH_DST_LO: u32 = 0xB0;
+const BAR_PUSH_DST_HI: u32 = 0xB4;
+const BAR_PUSH_DB_LO: u32 = 0xB8;
+const BAR_PUSH_DB_HI: u32 = 0xBC;
+const BAR_PUSH_DONE: u32 = 0xC0;
+const BAR_PUSH_STATUS: u32 = 0xC4;
+const BAR_PUSH_ERR: u32 = 0xC8;
+const BAR_PAIR_ACK_SEQ: u32 = 0x220;
+const BAR_PAIR_DST_LO: u32 = 0x224;
+const BAR_PAIR_DST_HI: u32 = 0x228;
+const BAR_PAIR_DB_LO: u32 = 0x22C;
+const BAR_PAIR_DB_HI: u32 = 0x230;
+const BAR_PAIR_DONE: u32 = 0x210;
+const BAR_PAIR_STATUS: u32 = 0x214;
+const BAR_PAIR_ERR: u32 = 0x218;
+const CTRL_PAIR_BITS: u32 = 0x261; // bit0 enable + bit5 ddr_en + bit6 push_en + bit9 pair_en
+const TX_CMD_ARM_PAIR: u32 = 8;
+const TX_CMD_ACK_PAIR: u32 = 16;
+const TX_CMD_CANCEL_PAIR: u32 = 32;
+const PAIR_SESSION: u32 = 0xA1B2_C3D4;
+const MAILBOX_DBELL_A_OFF: u32 = 32;
+const MAILBOX_DBELL_B_OFF: u32 = 36;
+
 
 /// Linux EINTR
 const EINTR: i32 = 4;
@@ -82,14 +116,17 @@ const _: () = {
 
 fn usage(prog: &str) {
     eprint!(
-        "用法：{} [-d 设备节点] [-t 超时ms] [-n] [-o 输出.pgm] [--info] [输出.pgm]\n\
+        "用法：{} [-d 设备节点] [-t 超时ms] [-n] [-o 输出.pgm] [--info] [--pair] [--ctrl 节点] [--out-b B.pgm] [输出.pgm]\n\
          \x20 -d  收帧缓冲节点，默认 {}\n\
          \x20 -t  等帧超时（毫秒，1..600000），默认 {}\n\
          \x20 -n  只在出现更新的帧时返回（默认：缓冲里已有帧就直接取最新一帧）\n\
          \x20 -o  输出 PGM 文件名，默认 {}\n\
+         \x20 --pair 双路同步取帧：A 写 -o，B 写 --out-b；需要 frame_slots=2\n\
+         \x20 --ctrl 控制节点，默认 {}\n\
+         \x20 --out-b 双路时 B 路 PGM，默认 {}\n\
          \x20 --info 只打印缓冲物理地址/几何/序号，不取帧\n\
          退出码：0 成功，2 设备不可用，3 描述符不符，4 无新帧，5 一致性不过，6 输出错误\n",
-        prog, DEF_DEV, DEF_TIMEOUT_MS, DEF_OUT
+        prog, DEF_DEV, DEF_TIMEOUT_MS, DEF_OUT, DEF_CTRL, DEF_OUT_B
     );
 }
 
@@ -109,6 +146,59 @@ fn frame_info(fd: RawFd, info: &mut IocFrame) -> Result<(), ()> {
         return Err(());
     }
     Ok(())
+}
+
+
+fn bar_rw(fd: RawFd, off: u32, wdata: Option<u32>) -> Result<u32, std::io::Error> {
+    let mut b = IocBar {
+        bar_id: 0,
+        bar_type: 0,
+        bar_offaddr: off,
+        wdata: wdata.unwrap_or(0),
+        rdata: 0,
+    };
+    let req = if wdata.is_some() { ANLOGIC_IOCW } else { ANLOGIC_IOCR };
+    // SAFETY: b 就是 anlogic_ioc_bar，编号与驱动头文件一致
+    unsafe {
+        sys::ioctl_ptr(
+            fd,
+            req,
+            &mut b as *mut IocBar as *mut c_void,
+        )?;
+    }
+    Ok(b.rdata)
+}
+
+fn bar_wr(fd: RawFd, off: u32, v: u32) -> Result<(), String> {
+    bar_rw(fd, off, Some(v))
+        .map(|_| ())
+        .map_err(|e| format!("写 BAR 0x{off:03x}=0x{v:08x} 失败：{}", sys::errno_str(&e)))
+}
+
+fn bar_rd(fd: RawFd, off: u32) -> Result<u32, String> {
+    bar_rw(fd, off, None)
+        .map_err(|e| format!("读 BAR 0x{off:03x} 失败：{}", sys::errno_str(&e)))
+}
+
+fn wr64(lo_off: u32, hi_off: u32, v: u64, fd: RawFd) -> Result<(), String> {
+    bar_wr(fd, lo_off, v as u32)?;
+    bar_wr(fd, hi_off, (v >> 32) as u32)
+}
+
+/// 等一个 32 位门铃从 old 变成新值；超时返回 None。
+fn wait_dbell(map: &Mmap, off: usize, old: u32, timeout_ms: u32) -> Option<u32> {
+    let p = (map.as_ptr() as usize + off) as *const u32;
+    let t0 = std::time::Instant::now();
+    loop {
+        let v = mb_field(p);
+        if v != old {
+            return Some(v);
+        }
+        if t0.elapsed() >= std::time::Duration::from_millis(timeout_ms as u64) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 
 /// 描述符自检：驱动刚分配完就会把几何写进 mailbox（magic 最后写），
@@ -161,6 +251,19 @@ fn descriptor_check(info: &IocFrame) -> bool {
         eprintln!("!! mailbox 偏移 {} + 64 字节超出缓冲 {}", info.mb_off, info.size);
         return false;
     }
+    // 槽长必须与几何推导一致：align4k(128B R10F 头 + width/4*5 * height)。
+    // 1080p = 2,592,768；4K = 10,371,072。驱动按 module param 现算，这里复核。
+    if info.width % 4 == 0 {
+        let payload = (info.width as u64 / 4 * 5) * info.height as u64;
+        let expect_slot = (payload + r10f::HDR_BYTES as u64 + 4095) & !4095u64;
+        if expect_slot != info.slot_bytes as u64 {
+            eprintln!(
+                "!! 槽长 {} 与 {}x{} 的 R10F 推导值 {} 不一致（128B 头+packed RAW10，4KiB 对齐）",
+                info.slot_bytes, info.width, info.height, expect_slot
+            );
+            return false;
+        }
+    }
     if info.slot_bytes < info.width * info.height {
         eprintln!(
             "!! 警告：一帧只有 {} 字节，小于 {}x{} 灰度需要的 {}",
@@ -208,7 +311,7 @@ fn print_info(info: &IocFrame) {
 /// {P3[1:0],P2[1:0],P1[1:0],P0[1:0]}`。预览取每个 10bit 采样的**高 8 位**（`>> 2`，
 /// 截断不四舍五入；也就是每组前 4 个字节）。
 ///
-/// `stride` 是 R10F 头里的**行字节数**（1920 宽时 2400）；行尾填充不会进图。
+/// `stride` 是 R10F 头里的**行字节数**（1080p 为 2400，4K 为 4800）；行尾填充不会进图。
 /// 返回恰好 `width*height` 字节；长度/几何不符一律 `Err`，不越界读、不静默夹紧。
 fn raw10_to_gray8(
     packed: &[u8],
@@ -300,9 +403,208 @@ fn r10f_gray8(
     }
     let (hdr, rest) = content.split_at(r10f::HDR_BYTES);
     let (payload, tail) = rest.split_at(pb);
+    let t0 = std::time::Instant::now();
     let h = r10f::parse(hdr, payload, tail, expect_w as u16, expect_h as u16, None)?;
+    let t1 = std::time::Instant::now();
     let preview = raw10_to_gray8(payload, h.width as usize, h.height as usize, h.stride as usize)?;
+    if std::env::var_os("FRAME_DEBUG_TIMING").is_some() {
+        eprintln!("  [timing] parse {:?}, decode {:?}", t1.duration_since(t0), t1.elapsed());
+    }
     Ok(Some((h, preview)))
+}
+
+
+fn write_pgm(path: &str, width: u32, height: u32, gray: &[u8]) -> Result<(), String> {
+    let mut fp = std::fs::File::create(path)
+        .map_err(|e| format!("打不开输出文件 {path}：{}", sys::errno_str(&e)))?;
+    let header = format!("P5\n{width} {height}\n255\n");
+    fp.write_all(header.as_bytes())
+        .and_then(|_| fp.write_all(gray))
+        .and_then(|_| fp.flush())
+        .map_err(|e| format!("写 {path} 失败：{}", sys::errno_str(&e)))
+}
+
+fn pair_run(
+    map: &Mmap,
+    info: &IocFrame,
+    ctrl_path: &str,
+    out_a: &str,
+    out_b: &str,
+    timeout_ms: u32,
+) -> i32 {
+    if info.slots < 2 {
+        eprintln!("!! --pair 需要 frame_slots=2（当前 {}）：先 rmmod/insmod 驱动", info.slots);
+        return EX_NOT_READY;
+    }
+    let ctrl = match std::fs::OpenOptions::new().read(true).write(true).open(ctrl_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("!! 打不开控制节点 {ctrl_path}：{}", sys::errno_str(&e));
+            return EX_DEV;
+        }
+    };
+    let cfd = ctrl.as_raw_fd();
+
+    // 清掉可能残留的 single/pair one-shot；只发一次取消，等 20ms 让状态机回到 IDLE。
+    // 不能把 0xC4 的 bit2（db_sent）当成 held 轮询，否则每轮都要空等 500ms。
+    let _ = bar_wr(cfd, BAR_TX_CMD, TX_CMD_CANCEL_PAIR);
+    let _ = bar_wr(cfd, BAR_TX_CMD, 4);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // 模式位：enable + ddr_en + push_en + pair_en；清掉 CAM_B/PUSH_SRC。
+    let ctrl_v = (bar_rd(cfd, BAR_CTRL).unwrap_or(0) | CTRL_PAIR_BITS) & !0x180;
+    if let Err(e) = bar_wr(cfd, BAR_CTRL, ctrl_v) {
+        eprintln!("!! {e}");
+        return EX_DEV;
+    }
+    let cap = info.stride * 2;
+    let dst_a = info.phys_addr + info.hdr_bytes as u64;
+    let dst_b = info.phys_addr + info.stride as u64 + info.hdr_bytes as u64;
+    let db_a = info.phys_addr + info.mb_off as u64 + MAILBOX_DBELL_A_OFF as u64;
+    let db_b = info.phys_addr + info.mb_off as u64 + MAILBOX_DBELL_B_OFF as u64;
+    let cfg = (|| -> Result<(), String> {
+        bar_wr(cfd, BAR_TX_CAP, cap)?;
+        bar_wr(cfd, BAR_TX_SESSION, PAIR_SESSION)?;
+        // ACK_RELEASE 比对的是 TX_ACK_SESSION（0x110），不是 SESSION_ID（0x104）。
+        // 只写 0x104 会让 ACK 永远 BAD_ACK，两片 pusher 停在 HELD。
+        bar_wr(cfd, 0x110, PAIR_SESSION)?;
+        wr64(BAR_PUSH_DST_LO, BAR_PUSH_DST_HI, dst_a, cfd)?;
+        wr64(BAR_PUSH_DB_LO, BAR_PUSH_DB_HI, db_a, cfd)?;
+        wr64(BAR_PAIR_DST_LO, BAR_PAIR_DST_HI, dst_b, cfd)?;
+        wr64(BAR_PAIR_DB_LO, BAR_PAIR_DB_HI, db_b, cfd)?;
+        bar_wr(cfd, BAR_TX_ACK_SEQ, 0)?;
+        bar_wr(cfd, BAR_PAIR_ACK_SEQ, 0)?;
+        Ok(())
+    })();
+    if let Err(e) = cfg {
+        eprintln!("!! {e}");
+        return EX_DEV;
+    }
+
+    // ARM 前必须等两路 DDR 都发布过完整帧：RTL 的 arm_reject 要求 ddr_status[0]=1。
+    let mut ddr_ok = false;
+    for _ in 0..(timeout_ms / 2).max(1) {
+        let sa = bar_rd(cfd, 0xA8).unwrap_or(0);
+        let sb = bar_rd(cfd, 0xE8).unwrap_or(0);
+        if sa & 1 != 0 && sb & 1 != 0 {
+            ddr_ok = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    if !ddr_ok {
+        let sa = bar_rd(cfd, 0xA8).unwrap_or(0);
+        let sb = bar_rd(cfd, 0xE8).unwrap_or(0);
+        eprintln!("!! 两路 DDR 还没发布完整帧（A=0x{sa:x} B=0x{sb:x}），不 ARM");
+        return EX_NO_FRAME;
+    }
+
+    let sync_pairs0 = bar_rd(cfd, 0x1EC).unwrap_or(0);
+    let old_a = mb_field((map.as_ptr() as usize + info.mb_off as usize + MAILBOX_DBELL_A_OFF as usize) as *const u32);
+    let old_b = mb_field((map.as_ptr() as usize + info.mb_off as usize + MAILBOX_DBELL_B_OFF as usize) as *const u32);
+    let t_cfg = std::time::Instant::now();
+    println!("=== 双路同步取帧（A 槽 0 / B 槽 1，超时 {timeout_ms} ms）===");
+    println!("  A dst=0x{dst_a:x} db=0x{db_a:x}  B dst=0x{dst_b:x} db=0x{db_b:x}");
+    if let Err(e) = bar_wr(cfd, BAR_TX_CMD, TX_CMD_ARM_PAIR) {
+        eprintln!("!! {e}");
+        return EX_DEV;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let tx_a = bar_rd(cfd, 0x114).unwrap_or(0);
+    if tx_a & 0x8 != 0 {
+        eprintln!("!! ARM_PAIR 被拒（A TX_STATUS=0x{tx_a:x}）：检查 DDR/session/cap");
+        return EX_DEV;
+    }
+
+    let db_a_off = info.mb_off as usize + MAILBOX_DBELL_A_OFF as usize;
+    let db_b_off = info.mb_off as usize + MAILBOX_DBELL_B_OFF as usize;
+    let new_a = wait_dbell(map, db_a_off, old_a, timeout_ms);
+    let new_b = wait_dbell(map, db_b_off, old_b, timeout_ms);
+    let (Some(new_a), Some(new_b)) = (new_a, new_b) else {
+        let sa = bar_rd(cfd, BAR_PUSH_STATUS).unwrap_or(0);
+        let sb = bar_rd(cfd, BAR_PAIR_STATUS).unwrap_or(0);
+        let ea = bar_rd(cfd, BAR_PUSH_ERR).unwrap_or(0xff);
+        let eb = bar_rd(cfd, BAR_PAIR_ERR).unwrap_or(0xff);
+        eprintln!("!! 双路等门铃超时：A {old_a}->{:?} B {old_b}->{:?} status A=0x{sa:x} B=0x{sb:x} err A={ea} B={eb}",
+                  new_a, new_b);
+        return EX_NO_FRAME;
+    };
+    let t_done = std::time::Instant::now();
+    let sync_pairs1 = bar_rd(cfd, 0x1EC).unwrap_or(sync_pairs0);
+    println!("  门铃：A {old_a}->{new_a}，B {old_b}->{new_b}；sync pair_count {sync_pairs0}->{sync_pairs1}");
+
+    println!("  时间：配置+等门铃 {:?}", t_done.duration_since(t_cfg));
+    let t_parse = std::time::Instant::now();
+    // 两槽的 R10F 内容直接从 mmap 读；槽头由驱动补 A 路，B 路不依赖槽头。
+    let mut raws = Vec::with_capacity(2);
+    for slot in 0..2u32 {
+        let off = slot as u64 * info.stride as u64 + info.hdr_bytes as u64;
+        // 先搬进普通内存再验 CRC：驱动这块 DMA 是 Normal-NC，直接对 mmap
+        // 做 2.6MB 的 CRC 会跑在非缓存访问上（实测一帧 ~350ms）。
+        let mut raw = vec![0u8; info.slot_bytes as usize];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (map.as_ptr() as usize + off as usize) as *const u8,
+                raw.as_mut_ptr(),
+                raw.len(),
+            );
+        }
+        match r10f_gray8(&raw, info.width, info.height) {
+            Ok(Some((h, preview))) => {
+                println!("  槽 {slot}: R10F session=0x{:08x} seq={} {}x{} stride={}",
+                         h.session_id, h.capture_seq, h.width, h.height, h.stride);
+                raws.push(preview);
+            }
+            Ok(None) => {
+                eprintln!("!! 槽 {slot} 不是 R10F：拒绝发布");
+                return EX_INCONSISTENT;
+            }
+            Err(e) => {
+                eprintln!("!! 槽 {slot} R10F 校验失败：{e}");
+                return EX_INCONSISTENT;
+            }
+        }
+    }
+    println!("  时间：两帧解析+解包 {:?}", t_parse.elapsed());
+    if let Err(e) = write_pgm(out_a, info.width, info.height, &raws[0]) {
+        eprintln!("!! {e}");
+        return EX_OUTPUT;
+    }
+    if let Err(e) = write_pgm(out_b, info.width, info.height, &raws[1]) {
+        eprintln!("!! {e}");
+        return EX_OUTPUT;
+    }
+
+    // ACK 两路：A 用 0x10C，B 用 0x220；随后 pair ACK 同时释放两片。
+    let done_a = bar_rd(cfd, BAR_PUSH_DONE).unwrap_or(new_a);
+    let done_b = bar_rd(cfd, BAR_PAIR_DONE).unwrap_or(new_b);
+    let ack = (|| -> Result<(), String> {
+        bar_wr(cfd, BAR_TX_ACK_SEQ, done_a)?;
+        bar_wr(cfd, BAR_PAIR_ACK_SEQ, done_b)?;
+        bar_wr(cfd, BAR_TX_CMD, TX_CMD_ACK_PAIR)
+    })();
+    if let Err(e) = ack {
+        eprintln!("!! {e}（图已写出；两路可能停在 HELD）");
+        return EX_DEV;
+    }
+    // 门铃先于 g_st→HELD，刚发完 ACK 时 B 可能还没进 HELD；补一拍 CANCEL 兜底。
+    // 主机数据已拷到槽里，CANCEL 只释放源块，不会改已收到的两帧。
+    let _ = bar_wr(cfd, BAR_TX_CMD, TX_CMD_CANCEL_PAIR);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // ACK 释放可能晚于 20ms 才在状态字上稳定；轮询到两片都退出 HELD。
+    let mut ps = 0xffu32;
+    for _ in 0..500 {
+        ps = bar_rd(cfd, BAR_PAIR_STATUS).unwrap_or(0xff);
+        if ps & 0x3 == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    println!("  ACK：A seq={done_a} B seq={done_b}；status A=0x{:x} B=0x{:x} pair=0x{:x}",
+             bar_rd(cfd, BAR_PUSH_STATUS).unwrap_or(0),
+             bar_rd(cfd, BAR_PAIR_STATUS).unwrap_or(0), ps);
+    println!("  输出：{out_a}（A）、{out_b}（B）");
+    EX_OK
 }
 
 fn run() -> i32 {
@@ -316,16 +618,22 @@ fn run() -> i32 {
         LongOpt { name: "new", has_arg: false, val: b'n' as u32 },
         LongOpt { name: "output", has_arg: true, val: b'o' as u32 },
         LongOpt { name: "info", has_arg: false, val: 1 },
+        LongOpt { name: "pair", has_arg: false, val: 2 },
+        LongOpt { name: "ctrl", has_arg: true, val: 3 },
+        LongOpt { name: "out-b", has_arg: true, val: 4 },
         LongOpt { name: "help", has_arg: false, val: b'h' as u32 },
     ];
 
     let mut getopt = Getopt::new(&argv, "d:t:no:h", &longopts);
 
     let mut dev_path = DEF_DEV.to_string();
+    let mut ctrl_path = DEF_CTRL.to_string();
     let mut out_path: Option<String> = None;
+    let mut out_b_path = DEF_OUT_B.to_string();
     let mut timeout_ms: u32 = DEF_TIMEOUT_MS;
     let mut wait_new = false;
     let mut want_info = false;
+    let mut want_pair = false;
 
     while let Some(item) = getopt.next() {
         let (id, arg) = match item {
@@ -351,6 +659,9 @@ fn run() -> i32 {
             b'n' => wait_new = true,
             b'o' => out_path = Some(arg.unwrap_or_default()),
             1 => want_info = true,
+            2 => want_pair = true,
+            3 => ctrl_path = arg.unwrap_or_default(),
+            4 => out_b_path = arg.unwrap_or_default(),
             b'h' => {
                 usage(&argv[0]);
                 return EX_OK;
@@ -364,6 +675,8 @@ fn run() -> i32 {
     for a in getopt.positional() {
         if out_path.is_none() {
             out_path = Some(a);
+        } else if want_pair && out_b_path == DEF_OUT_B {
+            out_b_path = a;
         } else {
             eprintln!("!! 多余的参数：'{}'", a);
             return EX_USAGE;
@@ -416,6 +729,10 @@ fn run() -> i32 {
             info.mb_off, ANLOGIC_FRAME_MAGIC
         );
         return EX_NOT_READY;
+    }
+
+    if want_pair {
+        return pair_run(&map, &info, &ctrl_path, &out_path, &out_b_path, timeout_ms);
     }
 
     // ---- 4. 等帧：默认只要缓冲里有帧就取最新那帧；-n 则等一帧更新的 ----
@@ -476,7 +793,8 @@ fn run() -> i32 {
     // ---- 6. 搬槽内容（长度 = slot_bytes，不是 width*height）----
     /*
      * T07 R10F 的槽内容 = 128B 头 + packed RAW10（5B/4px）+ 4KiB 对齐零尾：
-     * 1920x1080 时是 2,592,768 字节，而 width*height 只有 2,073,600。
+     * 1080p 是 2,592,768 字节、4K 是 10,371,072 字节，而 4K 的 width*height
+     * 只有 8,294,400（灰度预览）。
      * 旧代码按 npix 分配、却按槽头 len（= slot_bytes）拷贝，两者不等就写穿堆。
      * 现在**分配长度 = 拷贝长度 = slot_bytes**，再把「槽基址 + 槽头 + 内容」钉在映射内。
      * width/height 来自 module param，最大分别可到 65535；分配失败一律按 EX_OUTPUT 返回
@@ -637,7 +955,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{r10f_gray8, raw10_to_gray8};
+    use super::{descriptor_check, r10f_gray8, raw10_to_gray8};
+    use anlogic_pci_tools::ioctl::IocFrame;
     use anlogic_pci_tools::rka1::r10f;
 
     /// 4 个 10bit 样本 → 5 字节（与 R10F 合同及
@@ -692,6 +1011,11 @@ mod tests {
             }
         }
         payload
+    }
+
+    #[test]
+    fn crc32_known_vector() {
+        assert_eq!(r10f::crc32_ieee(b"123456789"), 0xCBF4_3926);
     }
 
     #[test]
@@ -777,5 +1101,34 @@ mod tests {
         // 旧 8bit 槽内容 → Ok(None)，不误判成 R10F
         let eight = vec![0x5Au8; 64];
         assert!(r10f_gray8(&eight, 8, 2).expect("不是 R10F").is_none());
+    }
+
+    /// 1080p/4K 的槽长与槽步长必须和驱动推导一致；4K 单路两槽 + mailbox
+    /// 的分配量 = 20,754,432B。槽长写错（例如 10,370,112）必须被拒绝。
+    #[test]
+    fn descriptor_check_1080p_and_4k() {
+        let mut info = IocFrame::default();
+        info.phys_addr = 0x1000_0000;
+        info.hdr_bytes = 128;
+        info.slots = 2;
+
+        info.width = 1920;
+        info.height = 1080;
+        info.slot_bytes = 2_592_768;
+        info.stride = 2_596_864;
+        info.mb_off = 5_193_728;
+        info.size = 5_197_824;
+        assert!(descriptor_check(&info), "1080p 布局必须通过");
+
+        info.width = 3840;
+        info.height = 2160;
+        info.slot_bytes = 10_371_072;
+        info.stride = 10_375_168;
+        info.mb_off = 20_750_336;
+        info.size = 20_754_432;
+        assert!(descriptor_check(&info), "4K 布局必须通过");
+
+        info.slot_bytes = 10_370_112;
+        assert!(!descriptor_check(&info), "非 4KiB 对齐的槽长必须拒绝");
     }
 }

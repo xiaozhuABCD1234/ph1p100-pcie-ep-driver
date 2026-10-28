@@ -80,7 +80,7 @@ typedef struct cfgwrite {
  *   偏移 mb_off（页对齐）       struct anlogic_frame_mailbox（64 字节，独占一页）
  * FPGA 侧的 MWr 目标 = phys_addr + stride * 槽位号 + hdr_bytes（= 该槽**像素区起点**，
  * 槽头那 16 字节由驱动写，不能被推来的帧盖掉），像素从槽头之后开始；
- * 本板推帧引擎不逐帧轮换目标地址，所以推来的帧永远落在槽 0。
+ * 本板 A 路推帧固定写槽 0；双路时 B 路写槽 1（B 门铃在 mailbox +36，由双路工具直接读）。
  * ioctl 把 mb_off 一并报给用户态，用户态靠它定位 mailbox（不要自己按固定偏移猜）。
  *
  * 握手约定：
@@ -103,7 +103,7 @@ typedef struct cfgwrite {
  *   所以那三项由驱动在看门铃时补齐：门铃写进 mailbox 页里的 push_dbell 字，
  *   驱动见到它变大就把对应槽的槽头、mailbox.seq/count 一并写好，用户态照旧
  *   只轮询 mailbox.seq。推帧目标地址是固定的一块（推帧引擎不做逐帧轮换），
- *   因此多槽下只有槽 0 会收到推来的帧 —— frame_slots 默认取 1。
+ *   因此 A 路固定槽 0、B 路固定槽 1；frame_slots 默认取 2。
  */
 #define ANLOGIC_FRAME_MAGIC 0x4D524641u /* 小端字节序为 'A','F','R','M' */
 
@@ -121,14 +121,20 @@ typedef struct cfgwrite {
 #define ANLOGIC_FRAME_R10F_HDR 128u /* R10F 头长度（与 host 前缀是两层 128B） */
 #define ANLOGIC_FRAME_DEF_WIDTH 1920u
 #define ANLOGIC_FRAME_DEF_HEIGHT 1080u
-#define ANLOGIC_FRAME_RAW_BYTES 2592000u /* 1920x1080 packed RAW10（stride 2400B/行） */
+#define ANLOGIC_FRAME_RAW_BYTES 2592000u /* 1920x1080 packed RAW10（行 stride 2400B） */
 #define ANLOGIC_FRAME_PAYLOAD_BYTES ANLOGIC_FRAME_RAW_BYTES
-/* 1920x1080 的参考值；驱动现在按 frame_width/height 现算，其他几何不要用这个常量。 */
+/*
+ * 1920x1080 的参考值，**只用于说明**；驱动按 frame_width/frame_height/frame_stride
+ * 现算，其他几何不要用这些常量。4K 的推导值：
+ *   行 stride 4800B，payload 10,368,000B，槽长 ceil((128+10368000)/4096)*4096
+ *   = 10,371,072B（2532×4KiB）。
+ */
 #define ANLOGIC_FRAME_DMA_BYTES 2592768u /* ceil((128+2592000)/4096)*4096 = 633*4096 */
 #define ANLOGIC_FRAME_TAIL_PAD                                                                                         \
 	(ANLOGIC_FRAME_DMA_BYTES - (ANLOGIC_FRAME_R10F_HDR + ANLOGIC_FRAME_PAYLOAD_BYTES)) /* 640B */
 #define ANLOGIC_FRAME_DEF_SLOT_BYTES ANLOGIC_FRAME_DMA_BYTES
-#define ANLOGIC_FRAME_DEF_SLOTS 1u
+/* 双路：槽 0 = A，槽 1 = B。单路只用槽 0；两槽共用同一块 mailbox。 */
+#define ANLOGIC_FRAME_DEF_SLOTS 2u
 
 /* 4KiB 对齐工具（stride/slot 计算都要求无溢出） */
 #define ANLOGIC_FRAME_ALIGN4K(x) (((x) + 4095u) & ~4095u)
@@ -147,8 +153,9 @@ struct anlogic_frame_mailbox {
 	unsigned int stride; /* 槽位步长（字节，页对齐） */
 	unsigned int width; /* 每帧宽度（像素） */
 	unsigned int height; /* 每帧高度（像素） */
-	unsigned int push_dbell; /* 推帧门铃：EP 写本帧的已推帧数（1 起），驱动见它变大就补 seq/count/槽头 */
-	unsigned int reserved[7]; /* 补齐到 64 字节 */
+	unsigned int push_dbell; /* A 路推帧门铃：EP 写本帧的已推帧数（1 起），驱动见它变大就补 seq/count/槽头 */
+	unsigned int push_dbell_b; /* B 路推帧门铃：同上，B 路目标槽固定为槽 1 */
+	unsigned int reserved[6]; /* 补齐到 64 字节 */
 };
 
 struct anlogic_frame_slot_hdr {
@@ -214,13 +221,48 @@ struct anlogic_ioc_frame_wait {
 #define ANLOGIC_BAR_PUSH_DONE_OFF 0xC0u /* 已推帧数（1 起） */
 #define ANLOGIC_BAR_PUSH_STATUS_OFF 0xC4u /* 推帧状态 */
 #define ANLOGIC_BAR_PUSH_ERR_OFF 0xC8u /* 最近一次推帧错误码 */
-#define ANLOGIC_BAR_PUSH_TLP_OFF 0xCCu /* 最近一帧发出的 MWr 数（正常 2400） */
+#define ANLOGIC_BAR_PUSH_TLP_OFF 0xCCu /* 最近一帧发出的 MWr 数 = slot_bytes/128（1080p 20256，4K 81024） */
 
 /* 本驱动要读写的寄存器里偏移最大的那个（+1），用来判 BAR0 映射长度够不够。
  * T07：RKA1 安全扩展把窗口推到 0x12C（0x100..0x11C 合同寄存器 + 0x120..0x12C
  * CSI 诊断），所以这里必须 >= 0x130。旧值 0xD0 会让扩展寄存器读写全部越界。
  */
-#define ANLOGIC_BAR_LINK_WIN_END 0x130u
+#define ANLOGIC_BAR_LINK_WIN_END 0x270u /* sync 0x1E0..0x20C + 双路 0x210..0x234 */
+
+#define ANLOGIC_BAR_SYNC_CMD_OFF 0x1E0u /* W1：1=START，2=ABORT */
+#define ANLOGIC_BAR_SYNC_STATUS_OFF 0x1E4u /* RO：ready/locked/busy/error/warmup */
+#define ANLOGIC_BAR_SYNC_SKEW_OFF 0x1E8u /* RO：signed，SOF 数字配对差 */
+#define ANLOGIC_BAR_SYNC_PAIRS_OFF 0x1ECu /* RO：累计配对帧数 */
+#define ANLOGIC_BAR_SYNC_WARMUP_OFF 0x1F0u
+#define ANLOGIC_BAR_SYNC_TICK_OFF 0x1F4u
+#define ANLOGIC_BAR_SYNC_MISS_A_OFF 0x1F8u
+#define ANLOGIC_BAR_SYNC_MISS_B_OFF 0x1FCu
+#define ANLOGIC_BAR_SYNC_OVERRUN_OFF 0x200u /* {B[15:0],A[15:0]} */
+#define ANLOGIC_BAR_SYNC_RELOCK_OFF 0x204u
+#define ANLOGIC_BAR_SYNC_SEQ_A_OFF 0x208u
+#define ANLOGIC_BAR_SYNC_SEQ_B_OFF 0x20Cu
+
+/* 双路推帧 B 路寄存器（0x210..0x234；A 路沿用 0xB0..0xCC） */
+#define ANLOGIC_BAR_PUSH_DONE_B_OFF 0x210u
+#define ANLOGIC_BAR_PUSH_STATUS_B_OFF 0x214u
+#define ANLOGIC_BAR_PUSH_ERR_B_OFF 0x218u
+#define ANLOGIC_BAR_PUSH_TLP_B_OFF 0x21Cu
+#define ANLOGIC_BAR_PAIR_ACK_SEQ_B_OFF 0x220u
+#define ANLOGIC_BAR_PAIR_DST_LO_OFF 0x224u
+#define ANLOGIC_BAR_PAIR_DST_HI_OFF 0x228u
+#define ANLOGIC_BAR_PAIR_DB_LO_OFF 0x22Cu
+#define ANLOGIC_BAR_PAIR_DB_HI_OFF 0x230u
+#define ANLOGIC_BAR_PAIR_STATUS_OFF 0x234u
+#define ANLOGIC_FRAME_PUSH_DBELL_OFF 32u
+#define ANLOGIC_FRAME_PUSH_DBELL_B_OFF 36u
+
+#define ANLOGIC_SYNC_READY 0x00000001u
+#define ANLOGIC_SYNC_LOCKED 0x00000004u
+#define ANLOGIC_SYNC_BUSY 0x00000008u
+#define ANLOGIC_SYNC_STOPPED 0x00000010u
+#define ANLOGIC_SYNC_PAIR_VALID 0x00000020u
+#define ANLOGIC_SYNC_ERROR(v) (((v) >> 8) & 0xfu)
+#define ANLOGIC_SYNC_WARMUP(v) (((v) >> 16) & 0xffffu)
 
 /* ---- T07：RKA1 安全扩展窗口（contract/registers.json，0x100..0x11C）---- */
 #define ANLOGIC_BAR_TX_CAP_OFF 0x100u /* DMA_CAP_BYTES：主机分配容量（字节） */
@@ -265,7 +307,8 @@ struct anlogic_ioc_frame_wait {
 #define ANLOGIC_CTRL_DDR_EN 0x00000020u /* bit5  每完成一帧自动搬进 DDR3 */
 #define ANLOGIC_CTRL_PUSH_EN 0x00000040u /* bit6  推帧模式使能（**不授权发包**，授权靠 RKA1 ARM） */
 #define ANLOGIC_CTRL_PUSH_SRC 0x00000080u /* bit7  推帧数据源：0 = DDR3，1 = 片内 ERAM */
-#define ANLOGIC_CTRL_CAM_B 0x00000100u /* bit8  推帧取哪一路（0 = A，1 = B） */
+#define ANLOGIC_CTRL_CAM_B 0x00000100u /* bit8  单路推帧取哪一路（0 = A，1 = B） */
+#define ANLOGIC_CTRL_PAIR_EN 0x00000200u /* bit9  双路同时推帧（A/B 各一片 pusher） */
 
 /*
  * 探测/初始化链路时使用的位：总使能 + DDR 搬运 + 推帧模式。
@@ -329,7 +372,7 @@ struct anlogic_ioc_link_status {
 	unsigned int pushed; /* 0xC0 已推帧数（1 起） */
 	unsigned int push_status; /* 0xC4 原始值 */
 	unsigned int push_err; /* 0xC8 最近一次推帧错误码 */
-	unsigned int push_tlp_cnt; /* 0xCC 最近一帧发出的 MWr 数（正常 2400） */
+	unsigned int push_tlp_cnt; /* 0xCC 最近一帧发出的 MWr 数 = slot_bytes/128（1080p 20256，4K 81024） */
 	unsigned int push_en; /* 1 = CTRL bit6 已置位（推帧使能） */
 	unsigned int push_src; /* CTRL bit7（0 = 从 DDR3 推，1 = 从片内 ERAM 推） */
 	unsigned int armed; /* 1 = 推帧目标/门铃地址与使能位都已由驱动写好 */
