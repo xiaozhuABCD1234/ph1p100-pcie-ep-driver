@@ -285,7 +285,7 @@ int anlogic_pci_card_create_interfaces(struct anlogic_pci_card *card)
 
 fail:
 	anlogic_pci_card_destroy_interfaces(card);
-	return -1;
+	return rv;
 }
 
 void anlogic_pci_card_destroy_interfaces(struct anlogic_pci_card *card)

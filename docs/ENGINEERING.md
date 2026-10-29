@@ -7,26 +7,25 @@
 - 内核模块：`src/`、`include/`、`Makefile`，只写 C。
 - 产品用户态：`app/rs/`，只写 Rust。
 - 合同校验：`docs/protocol/*/tools/`，只留能复跑的脚本，Python 标准库优先。
-- 合同与交付：`docs/protocol/`、`handoff/`。
-- 一次性实验：`experiments/`，本地用，不提交。
+- 合同与交付：`docs/protocol/`。
 
-算法研究、板测编排、dump、截图、点云都不进本仓。
+算法研究、板测编排、dump、截图、点云都不进本仓；一次性实验也不入库。
 
 ## 2. 脚本准入
 
-一个脚本只有同时满足下面三条，才允许留在 `docs/protocol/` 或 `handoff/`：
+一个脚本只有同时满足下面三条，才允许留在 `docs/protocol/`：
 
 1. README 或 CI 明确引用；
 2. 干净机器能按文档复跑；
 3. 输入、输出、退出码明确。
 
-否则放 `experiments/`。实验结束：结论写进 `docs/`，脚本随实验一起删除。
+实验结束：结论写进 `docs/`，脚本随实验一起删除。
 
 ## 3. 语言与依赖
 
 - 内核：C，遵守内核风格，`checkpatch` 无新增告警。
 - 产品用户态：Rust，交叉编译到 aarch64，静态链接。
-- Python：只做离线校验，放在 `docs/protocol/`、`handoff/`；
+- Python：只做离线校验，放在 `docs/protocol/`；
   标准库优先，numpy/cv2 只允许主机侧，不要求板上安装。
 
 ## 4. 不提交的东西
@@ -36,7 +35,6 @@
 app/rs/target/
 __pycache__/ *.pyc
 *.ply *.npz *.log
-experiments/ 下的一切
 ```
 
 单文件超过 1 MiB 的二进制必须说明来源和用途；

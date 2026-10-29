@@ -643,6 +643,10 @@ void anlogic_pci_hw_close(struct pci_dev *pdev, void *dev_hndl)
 	if (hw->pdev != pdev)
 		pr_info("pci_dev mismatch: hw 0x%p, pdev 0x%p.\n", hw->pdev, pdev);
 
+	if (!hw->got_regions || !hw->enabled)
+		pr_warn("hw 0x%p: close with got_regions=%d enabled=%d\n", hw, hw->got_regions,
+			hw->enabled);
+
 	anlogic_pci_irq_teardown(hw);
 	anlogic_pci_disable_msi_msix(hw, pdev);
 	anlogic_pci_remove_engines(hw);
@@ -651,8 +655,14 @@ void anlogic_pci_hw_close(struct pci_dev *pdev, void *dev_hndl)
 	anlogic_pci_frame_free(hw);
 	anlogic_pci_unmap_bars(hw, pdev);
 
-	pci_release_regions(pdev);
-	pci_disable_device(pdev);
+	if (hw->got_regions) {
+		pci_release_regions(pdev);
+		hw->got_regions = 0;
+	}
+	if (hw->enabled) {
+		pci_disable_device(pdev);
+		hw->enabled = 0;
+	}
 
 	ida_free(&anlogic_pci_instance_ida, hw->idx);
 	kfree(hw);

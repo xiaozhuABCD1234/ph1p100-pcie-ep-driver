@@ -15,16 +15,11 @@ modules.order
 # 用户态（Rust 工程 app/rs）构建目录
 /app/rs/target/
 
-# Python 离线校验（docs/protocol/、handoff/ 下）的字节码缓存
+# Python 离线校验（docs/protocol/ 下）的字节码缓存
 __pycache__/
 *.pyc
 
 *.zip
-
-
-# 一次性实验：脚本与产物都不入库，只保留目录说明
-/experiments/*
-!/experiments/README.md
 
 # 点云与标定文件是二进制产物，一律不入库
 *.ply

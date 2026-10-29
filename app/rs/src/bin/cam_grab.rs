@@ -304,7 +304,7 @@ fn msleep(ms: u32) {
 
 /// 逐位打印（位定义 ph1p_pcie_ep_top.v:1036-1038），out 可以是 stdout 或 stderr
 fn cam_stat_decode(s: u32, tag: &str, out: &mut dyn Write) {
-    let bclk = (s >> 0) & 1;
+    let bclk = s & 1;
     let lane = (s >> 1) & 0xf;
     let cfg = (s >> 5) & 1;
     let buse = (s >> 6) & 1;
@@ -370,7 +370,7 @@ fn cam_stat_decode(s: u32, tag: &str, out: &mut dyn Write) {
 /// 必死项按任务要求：字节时钟没跳 / lane_valid==0 / cfg_done==0；
 /// bus_err、部分 lane、没收到过像素组只告警（帧号与一致性校验还会兜底）。
 fn cam_stat_verdict(s: u32, tag: &str, out: &mut dyn Write) -> i32 {
-    let bclk = (s >> 0) & 1;
+    let bclk = s & 1;
     let lane = (s >> 1) & 0xf;
     let cfg = (s >> 5) & 1;
     let buse = (s >> 6) & 1;

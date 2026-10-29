@@ -1,4 +1,3 @@
-# Frozen protocol fixtures and the historical A1U1 handoff are hashed as bytes.
+# Frozen protocol fixtures are hashed as bytes.
 # Existing driver and Rust source paths keep their current Git text behavior.
 /docs/protocol/rka1-r10f-v1/** -text
-/handoff/rk-a1u1-b18-20261026/** -text

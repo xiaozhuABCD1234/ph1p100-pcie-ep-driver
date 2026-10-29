@@ -140,6 +140,9 @@ static pci_ers_result_t anlogic_pci_error_detected(struct pci_dev *pdev, pci_cha
 		pr_warn("dev 0x%p,0x%p, frozen state error, reset controller\n", pdev, card);
 		anlogic_pci_mark_link_down(card, "frozen");
 		pci_disable_device(pdev);
+		/* 与 anlogic_pci_hw_close() 的 enabled 记账保持一致，避免重复 disable */
+		if (card && card->hw)
+			card->hw->enabled = 0;
 		return PCI_ERS_RESULT_NEED_RESET;
 	case pci_channel_io_perm_failure:
 		pr_warn("dev 0x%p,0x%p, failure state error, req. disconnect\n", pdev, card);
@@ -162,6 +165,8 @@ static pci_ers_result_t anlogic_pci_slot_reset(struct pci_dev *pdev)
 	pci_set_master(pdev);
 	pci_restore_state(pdev);
 	pci_save_state(pdev);
+	if (card && card->hw)
+		card->hw->enabled = 1;
 	/* slot reset 会清掉 FPGA 的 RKA1/CTRL；软件状态同步清掉，避免假就绪 */
 	anlogic_pci_mark_link_down(card, "slot reset");
 
