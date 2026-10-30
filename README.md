@@ -96,10 +96,11 @@ mailbox 在槽区之后独立一页。FPGA 每推完一帧写门铃，驱动补�
 | `use_irq` | 0 | 当前 RTL 不发 MSI，收帧走 mailbox 轮询 |
 | `interrupt_mode` | 1 | 仅 `use_irq=1` 时有效：0=MSI-X，1=MSI，2=Legacy |
 
-## 已知限制
+## 现状与已知限制
 
-- 当前 JPEG 位流是 1920×1088 单路；4K 几何/分配已实现但未在板实收。
-- A 路已实测；B 路代码路径存在，本轮未做板级实收。
+- 4K 采集位流已按 3840×2160 上板实收（29.9 fps、丢组 0，见 [TEST_REPORT §3](../docs/TEST_REPORT.md)）；
+  当前 JPEG 位流是 1920×1088 单路。
+- A/B 双路均已随 1080p 位流上板（600/600 pair，见 [evidence/pair.md](../docs/evidence/pair.md)）；4K 只跑单路。
 - MSI 中断路径未验证；`lane_valid` 是瞬时采样，以 `0x4C frame_cnt` 是否增长为准。
 - RKA1 是 fail-closed：旧位流没有 `RKA1` 扩展时推帧不可用，采集/诊断仍可用。
 - FPGA 位流是 SRAM 配置，重下/掉电后必须重启 RK3588 才能重新枚举 Gen2 ×2。
